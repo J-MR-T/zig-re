@@ -294,6 +294,91 @@ const RegExDFA = struct{
     }
 };
 
+const RegExNFA = struct {
+    const TransitionsOfAState = std.AutoHashMap(?u8, std.ArrayList(u32));
+    const FinalStates = std.AutoHashMap(u32,void);
+
+    startState:u32,
+    // alphabet will be implicit
+    numStates:u32,
+    // an insert-first-lookup-later sorted vector like map would be preferable here for performance (like https://www.llvm.org/docs/ProgrammersManual.html recommends), but this will do for now
+    transitions:[]TransitionsOfAState, // ?u8 for eps transitions
+    finalStates:FinalStates, // saw this online, but i kinda doubt there is a good specialization for void...
+
+    pub fn init() !@This() {
+        return RegExNFA{
+            .startState  = 0,
+            .numStates   = 0,
+            .transitions = try allocer.alloc(TransitionsOfAState, 0),
+            .finalStates = FinalStates.init(allocer)
+        };
+    }
+
+    pub fn addState(self:*@This()) !u32{
+        try self.addStates(1);
+        return self.numStates - 1;
+    }
+
+    pub fn addStates(self:*@This(), comptime n:comptime_int) !void{
+        self.numStates += n;
+        self.transitions = try allocer.realloc(self.transitions, self.numStates);
+        for(self.numStates-n..self.numStates) |i| {
+            self.transitions[i] = TransitionsOfAState.init(allocer);
+        }
+    }
+
+    pub fn addTransition(self:*@This(), from:u32, with:?u8, to:u32) !void {
+        var entry = try self.transitions[from].getOrPut(with);
+        if(!entry.found_existing)
+            entry.value_ptr.* = std.ArrayList(u32).init(allocer);
+
+        try entry.value_ptr.append(to);
+    }
+
+    pub fn designateStatesFinal(self:*@This(), states:[]const u32) !void{
+        for (states) |state| {
+            try self.finalStates.put(state, {});
+        }
+    }
+
+    pub fn addAllTransitionsFromOtherState(self:*@This(), transitionToCopyTo:*TransitionsOfAState, stateToCopyFrom:u32) !void{
+        // there doesn't seem to be a 'put all', so I guess we'll loop...
+        var it = self.transitions[stateToCopyFrom].iterator();
+        while(it.next()) |transition| {
+            var entry = try transitionToCopyTo.getOrPut(transition.key_ptr.*);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = try transition.value_ptr.clone();
+            }else{
+                try entry.value_ptr.*.appendSlice(transition.value_ptr.*.items);
+            }
+        }
+    }
+
+    // does not eliminate, but 'fill' epsilon transitions, so that they can be ignored from now on (because the language of the NFA after this function is the same with or without them)
+    pub fn backUpEpsTransitions(self:*@This()) !void {
+        for(0.., self.transitions) |state,*transitionsFromState| {
+            if(transitionsFromState.get(null)) |epsTransitionsFromState| {
+                // solution: copy all transitions of the targeted states (epsTransitionTargetsFromState) to the current state
+                // also if the target is a final state, make this one final too
+                for(epsTransitionsFromState.items) |epsTargetState|{
+                    try self.addAllTransitionsFromOtherState(transitionsFromState, epsTargetState);
+
+                    // make final if target is final
+                    if(self.finalStates.contains(epsTargetState))
+                        try self.designateStatesFinal(&[1]u32{@truncate(state)});
+                }
+            }
+        }
+    }
+
+    // this function assumes backUpEpsTransitions has been called before!
+    //pub fn powersetConstruction(self:*@This()) !void{
+        // TODO
+    //}
+};
+
+// TODO (eps-)NFA, removing eps transitions, powerset construction, then we can simply construct the eps-NFA from the regex and then convert it to a DFA
+
 const expect = std.testing.expect;
 
 test "tokenizer" {
@@ -305,10 +390,11 @@ test "tokenizer" {
 }
 
 test "ab* DFA" {
-    var abStarDFA = try RegExDFA.init();
-    var dfa = &abStarDFA;
-    var a = try dfa.addState();
-    var b = try dfa.addState();
+    var dfa = try RegExDFA.init();
+    try dfa.addStates(2);
+    const a = 0;
+    const b = 1;
+
     try dfa.transitions[a].put('a', b);
     try dfa.transitions[b].put('b', b);
     try dfa.designateStatesFinal(&[1]u32{b});
@@ -321,6 +407,33 @@ test "ab* DFA" {
     try expect(!dfa.isInLanguage("ba"));
     try expect(!dfa.isInLanguage("aba"));
     try expect(!dfa.isInLanguage("abbbbbbbbbbbbbbbbbbbbbbbbbba"));
+}
+
+test "ab|aaa NFA" {
+    var nfa = try RegExNFA.init();
+    try nfa.addStates(6);
+    try nfa.addTransition(0, 'a', 1);
+    try nfa.addTransition(0, 'a', 2);
+    try nfa.addTransition(1, 'b', 3);
+    try nfa.addTransition(2, 'a', 4);
+    try nfa.addTransition(4, 'a', 5);
+    try nfa.designateStatesFinal(&[_]u32{3,5});
+}
+
+test "NFA eps removal" {
+    var nfa = try RegExNFA.init();
+    try nfa.addStates(2);
+    try nfa.addTransition(0, null, 1);
+    try nfa.addTransition(1, 'a', 1);
+    try nfa.designateStatesFinal(&[_]u32{1});
+
+    try expect(!nfa.finalStates.contains(0));
+    try expect(nfa.transitions[0].get('a') == null);
+
+    try nfa.backUpEpsTransitions();
+
+    try expect(nfa.finalStates.contains(0));
+    try expect((nfa.transitions[0].get('a') orelse unreachable).items[0] == 1);
 }
 
 pub fn main() !void {
