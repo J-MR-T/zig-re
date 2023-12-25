@@ -149,16 +149,17 @@ const Tokenizer = struct {
         allocer.free(self.tokens);
     }
 
-    fn debugLog(self:@This()) void {
+    fn debugFmt(self:@This()) !std.ArrayList(u8) {
+        var buf = try std.ArrayList(u8).initCapacity(allocer, self.tokens.len);
+        const writer = buf.writer();
         for (self.tokens) |tok| {
-            std.debug.print("{?c}", .{tok.char});
+            try writer.print("{?c}", .{tok.char});
         }
-        std.debug.print("\n", .{});
+        return buf;
     }
 };
 
 const RegEx = struct {
-
     left:?*const RegEx,
     right:?*const RegEx,
     kind:Token.Kind,
@@ -230,11 +231,11 @@ const RegEx = struct {
         // depth above 127 is undefined for now
         try writer.print("n{}[label=\"{?c}\"];", .{num,self.char});
         if (self.left) |left| {
-            try writer.print("n{} -> n{};",      .{num,     num << 1});
+            try writer.print("n{} -> n{};",   .{num,     num << 1});
             try left.printDOTInternal(writer, num << 1);
         }
         if (self.right) |right| {
-            try writer.print("n{} -> n{};",       .{num,           (num << 1) + 1});
+            try writer.print("n{} -> n{};",    .{num,           (num << 1) + 1});
             try right.printDOTInternal(writer, (num << 1) + 1);
         }
     }
@@ -245,6 +246,82 @@ const RegEx = struct {
         try writer.print("}}\n", .{});
     }
 };
+
+const RegExDFA = struct{
+    startState:u32,
+    // alphabet will be implicit
+    numStates:u32,
+    // an insert-first-lookup-later sorted vector like map would be preferable here for performance (like https://www.llvm.org/docs/ProgrammersManual.html recommends), but this will do for now
+    transitions:[]std.AutoHashMap(u8, u32),
+    finalStates:std.AutoHashMap(u32,void), // saw this online, but i kinda doubt there is a good specialization for void...
+                                           // a sorted vector would again be better
+
+    pub fn init() !@This() {
+        return RegExDFA{
+            .startState  = 0,
+            .numStates   = 0,
+            .transitions = try allocer.alloc(std.AutoHashMap(u8, u32), 0),
+            .finalStates = std.AutoHashMap(u32, void).init(allocer)
+        };
+    }
+
+    pub fn addState(self:*@This()) !u32{
+        try self.addStates(1);
+        return self.numStates - 1;
+    }
+
+    pub fn addStates(self:*@This(), comptime n:comptime_int) !void{
+        self.numStates += n;
+        self.transitions = try allocer.realloc(self.transitions, self.numStates);
+        for(self.numStates-n..self.numStates) |i| {
+            self.transitions[i] = std.AutoHashMap(u8, u32).init(allocer);
+        }
+    }
+
+    pub fn designateStatesFinal(self:*@This(), states:[]const u32) !void{
+        for (states) |state| {
+            try self.finalStates.put(state, {});
+        }
+    }
+
+
+    pub fn isInLanguage(self:@This(), word:[]const u8) bool{
+        var curState:u32 = self.startState;
+        for(word) |c| {
+            curState = self.transitions[curState].get(c) orelse return false;
+        }
+        return self.finalStates.contains(curState);
+    }
+};
+
+const expect = std.testing.expect;
+
+test "tokenizer" {
+    const input = "xyz|w*(abc)*de*f";
+    var tok = try Tokenizer.init(input);
+    defer tok.deinit();
+    const buf = try tok.debugFmt();
+    try expect(std.mem.eql(u8, buf.items, "x y z|w* (a b c)* d e* f"));
+}
+
+test "ab* DFA" {
+    var abStarDFA = try RegExDFA.init();
+    var dfa = &abStarDFA;
+    var a = try dfa.addState();
+    var b = try dfa.addState();
+    try dfa.transitions[a].put('a', b);
+    try dfa.transitions[b].put('b', b);
+    try dfa.designateStatesFinal(&[1]u32{b});
+
+    try expect(dfa.isInLanguage("a"));
+    try expect(dfa.isInLanguage("ab"));
+    try expect(dfa.isInLanguage("abb"));
+    try expect(dfa.isInLanguage("abbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    try expect(!dfa.isInLanguage("b"));
+    try expect(!dfa.isInLanguage("ba"));
+    try expect(!dfa.isInLanguage("aba"));
+    try expect(!dfa.isInLanguage("abbbbbbbbbbbbbbbbbbbbbbbbbba"));
+}
 
 pub fn main() !void {
     const writer = std.io.getStdOut().writer();
@@ -259,7 +336,6 @@ pub fn main() !void {
 
     var tok = try Tokenizer.init(input);
     defer tok.deinit();
-    tok.debugLog();
     const regex = try RegEx.parseExpr(0, &tok);
     assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
     try regex.printDOTRoot(writer);
