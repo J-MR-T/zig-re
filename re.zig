@@ -10,6 +10,15 @@ const debugLog = std.debug.print;
 
 const Tuple = std.meta.Tuple;
 
+fn initArrayListLikeWithElements(allocator:std.mem.Allocator, comptime ArrayListType:type, elementsSlice:anytype) !ArrayListType{
+    var arrayListLike = try ArrayListType.initCapacity(allocator, elementsSlice.len);
+    errdefer arrayListLike.deinit();
+
+    try arrayListLike.appendSlice(elementsSlice);
+
+    return arrayListLike;
+}
+
 const Token = struct {
     char:u8,
     kind:Kind,
@@ -247,12 +256,17 @@ const RegEx = struct {
     }
 };
 
+// (eps-)NFA, removing eps transitions, powerset construction, then we can simply construct the eps-NFA from the regex and then convert it to a DFA to perform checks
+// TODO constructing the eps-NFA from a regex is the only thing left to do
+
 const RegExDFA = struct{
+    const TransitionsOfAState = std.AutoHashMap(u8, u32);
+
     startState:u32,
     // alphabet will be implicit
     numStates:u32,
     // an insert-first-lookup-later sorted vector like map would be preferable here for performance (like https://www.llvm.org/docs/ProgrammersManual.html recommends), but this will do for now
-    transitions:[]std.AutoHashMap(u8, u32),
+    transitions:[]TransitionsOfAState,
     finalStates:std.AutoHashMap(u32,void), // saw this online, but i kinda doubt there is a good specialization for void...
                                            // a sorted vector would again be better
 
@@ -260,7 +274,7 @@ const RegExDFA = struct{
         return RegExDFA{
             .startState  = 0,
             .numStates   = 0,
-            .transitions = try allocer.alloc(std.AutoHashMap(u8, u32), 0),
+            .transitions = try allocer.alloc(TransitionsOfAState, 0),
             .finalStates = std.AutoHashMap(u32, void).init(allocer)
         };
     }
@@ -274,7 +288,7 @@ const RegExDFA = struct{
         self.numStates += n;
         self.transitions = try allocer.realloc(self.transitions, self.numStates);
         for(self.numStates-n..self.numStates) |i| {
-            self.transitions[i] = std.AutoHashMap(u8, u32).init(allocer);
+            self.transitions[i] = TransitionsOfAState.init(allocer);
         }
     }
 
@@ -294,24 +308,95 @@ const RegExDFA = struct{
     }
 };
 
+// TODO make sure that this doesn't work by copying -> do i need pointers here? would that still work?
+const FiniteAutomaton = union(enum){
+    dfa:RegExDFA,
+    nfa:RegExNFA,
+
+    pub fn printDOT(self:FiniteAutomaton, writer:anytype) !void {
+        try writer.print("digraph FiniteAutomaton {{ node[shape=circle];", .{});
+
+        const startState = switch(self){
+            inline else => |case| case.startState
+        };
+
+        const states = switch(self){
+            inline else => |case| case.numStates
+        };
+
+        const finalStates = switch(self){
+            inline else => |case| case.finalStates
+        };
+
+        var curState = startState;
+        for(0..states) |_| {
+            try writer.print("n{}[label=\"{}\"", .{curState, curState});
+            if(finalStates.contains(curState)){
+                try writer.print(",shape=doublecircle", .{});
+            }
+            try writer.print("]; ", .{});
+
+            switch(self){
+                FiniteAutomaton.dfa => |dfa| {
+                    var it = dfa.transitions[curState].iterator();
+                    while(it.next()) |transition| {
+                        try writer.print("n{} -> n{}[label=\"{c}\"]; ", .{curState, transition.value_ptr.*, transition.key_ptr.*});
+                    }
+                },
+                FiniteAutomaton.nfa => |nfa| {
+                    var it = nfa.transitions[curState].iterator();
+                    // could also put the same transitions on the same edge, reduce clutter a bit, but this is only for debugging anyway
+                    while(it.next()) |transitions| {
+                        for(transitions.value_ptr.items) |targetState| {
+                            if(transitions.key_ptr.*) |c| {
+                                try writer.print("n{} -> n{}[label=\"{c}\"]; ", .{curState, targetState, c});
+                            }else{
+                                try writer.print("n{} -> n{}[label=\"&epsilon;\"]; ", .{curState, targetState});
+                            }
+                        }
+                    }
+                },
+            }
+
+            curState += 1;
+        }
+
+        // for start state
+        try writer.print("n{}[label=\"\",style=\"invis\"];n{} -> n{}; ", .{curState, curState, startState});
+
+        try writer.print("}}\n", .{});
+    }
+};
+
 const RegExNFA = struct {
-    const TransitionsOfAState = std.AutoHashMap(?u8, std.ArrayList(u32));
-    const FinalStates = std.AutoHashMap(u32,void);
+    // an insert-first-lookup-later sorted vector like map would be preferable here for performance (like https://www.llvm.org/docs/ProgrammersManual.html recommends), but this will do for now
+    const TransitionsOfAState = std.AutoHashMap(?u8, std.ArrayList(u32)); // ?u8 for eps transitions
+    const FinalStates = std.AutoHashMap(u32,void);// saw this online, but i kinda doubt there is a good specialization for void...
 
     startState:u32,
     // alphabet will be implicit
     numStates:u32,
-    // an insert-first-lookup-later sorted vector like map would be preferable here for performance (like https://www.llvm.org/docs/ProgrammersManual.html recommends), but this will do for now
-    transitions:[]TransitionsOfAState, // ?u8 for eps transitions
-    finalStates:FinalStates, // saw this online, but i kinda doubt there is a good specialization for void...
+    transitions:[]TransitionsOfAState,
+    finalStates:FinalStates, 
+
+    internalArena:std.heap.ArenaAllocator,
+    internalAllocator:std.mem.Allocator,
 
     pub fn init() !@This() {
-        return RegExNFA{
-            .startState  = 0,
-            .numStates   = 0,
-            .transitions = try allocer.alloc(TransitionsOfAState, 0),
-            .finalStates = FinalStates.init(allocer)
+        var nfa                = RegExNFA{
+            .startState        = 0,
+            .numStates         = 0,
+            .transitions       = undefined,
+            .finalStates       = undefined,
+            .internalArena     = std.heap.ArenaAllocator.init(allocer),
+            .internalAllocator = undefined,
         };
+        // TODO panics for some reason (doesnt seem to be a recoverable Error), so im just using the allocer again for now. That will leak like crazy, so this definitely needs to be fixed
+        //nfa.internalAllocator = nfa.internalArena.allocator();
+        nfa.internalAllocator = allocer;
+        nfa.transitions       = try nfa.internalAllocator.alloc(TransitionsOfAState, 0);
+        nfa.finalStates       = FinalStates.init(nfa.internalAllocator);
+        return nfa;
     }
 
     pub fn addState(self:*@This()) !u32{
@@ -321,16 +406,16 @@ const RegExNFA = struct {
 
     pub fn addStates(self:*@This(), comptime n:comptime_int) !void{
         self.numStates += n;
-        self.transitions = try allocer.realloc(self.transitions, self.numStates);
+        self.transitions = try self.internalAllocator.realloc(self.transitions, self.numStates);
         for(self.numStates-n..self.numStates) |i| {
-            self.transitions[i] = TransitionsOfAState.init(allocer);
+            self.transitions[i] = TransitionsOfAState.init(self.internalAllocator);
         }
     }
 
     pub fn addTransition(self:*@This(), from:u32, with:?u8, to:u32) !void {
         var entry = try self.transitions[from].getOrPut(with);
         if(!entry.found_existing)
-            entry.value_ptr.* = std.ArrayList(u32).init(allocer);
+            entry.value_ptr.* = try std.ArrayList(u32).initCapacity(self.internalAllocator, 1);
 
         try entry.value_ptr.append(to);
     }
@@ -371,13 +456,127 @@ const RegExNFA = struct {
         }
     }
 
-    // this function assumes backUpEpsTransitions has been called before!
-    //pub fn powersetConstruction(self:*@This()) !void{
-        // TODO
-    //}
-};
+    // this function assumes backUpEpsTransitions has been called just before!
+    // this also deinitializes the NFA, so it can't be used afterwards
+    // TODO handle different allocator for DFA, currently that just does malloc
+    pub fn toPowersetConstructedDFA(self:*@This()) !RegExDFA{
+        // combine all transitions into new states (if they don't exist yet), add them to the worklist
 
-// TODO (eps-)NFA, removing eps transitions, powerset construction, then we can simply construct the eps-NFA from the regex and then convert it to a DFA
+        // maps input array list of nfa states to dfa state
+        var nfaToDfaStates = std.HashMap([]u32, u32, struct {
+            // just a simple hashing of slice *content*
+            pub fn hash(_: @This(), key: []u32) u64 {
+                var h = std.hash.Wyhash.init(0);
+                for(key) |state| {
+                    h.update(std.mem.asBytes(&state));
+                }
+                return h.final();
+            }
+
+            pub fn eql(_: @This(), a: []u32, b: []u32) bool {
+                return std.mem.eql(u32, a, b);
+            }
+        }, std.hash_map.default_max_load_percentage).init(self.internalAllocator);
+        
+        var dfa = try RegExDFA.init();
+        // worklist of nfa (and generated i.e. powerset-) states to visit
+        var worklist = try std.ArrayList(std.ArrayList(u32)).initCapacity(self.internalAllocator, 8);
+
+        // add start state to new DFA
+        dfa.startState = try dfa.addState();
+        var startStateList = try initArrayListLikeWithElements(self.internalAllocator, std.ArrayList(u32), &[1]u32{self.startState});
+        try nfaToDfaStates.putNoClobber(startStateList.items, dfa.startState);
+
+        // used like a stack
+        try worklist.append(startStateList);
+
+
+        // TODO 'curNfaState(s)' is not named perfectly, because it can also be a 'powerset state' that doesnt exist in the original NFA, just implicitly
+        while(worklist.popOrNull()) |curNfaStates| {
+            // get the state, has to be in there (but not visited yet) if its in the worklist
+            const curDfaState = nfaToDfaStates.get(curNfaStates.items) orelse unreachable;
+
+            // if any of the current nfa states is final, make the dfa state final
+            loop: for(curNfaStates.items) |curNfaState| {
+                if(self.finalStates.contains(curNfaState)){
+                    try dfa.designateStatesFinal(&[1]u32{@truncate(curDfaState)});
+                    break :loop;
+                }
+            }
+
+            // then go through the transitions of the states, and construct a transition map for the state step by step
+            // after the transition map is complete, the actual dfa states can be created and the dfa transitions can be added
+            var combinedTransitionsForCurNfaState = std.AutoHashMap(u8, std.ArrayList(u32)).init(self.internalAllocator);
+            // the transition lists in here are kept sorted, for deduplication (as they represent sets)
+
+            for(curNfaStates.items) |curNfaState| {
+                var it = self.transitions[curNfaState].iterator();
+
+                while(it.next()) |transition| {
+                    // ignore empty, because eps transitions are already handled
+                    if(transition.key_ptr.*) |c| {
+                        var entry = try combinedTransitionsForCurNfaState.getOrPut(c);
+                        // either create or append (keep sorted)
+                        if(!entry.found_existing){
+                            entry.value_ptr.* = try transition.value_ptr.clone();
+                            std.sort.pdq(u32, entry.value_ptr.items, {}, std.sort.asc(u32));
+                        }else{
+                            // add all targets of the transition to the combined state set, but only if they are not already in there
+                            targetStateLoop: for(transition.value_ptr.items) |targetState| {
+                                // binary search, but we can't use the std.sort one, because we need to insert if not found
+                                // so just copy that one and change it :)
+                                var left: usize = 0;
+                                var right: usize = entry.value_ptr.items.len;
+
+                                while (left < right) {
+                                    // Avoid overflowing in the midpoint calculation
+                                    const mid = left + (right - left) / 2;
+                                    // Compare the key with the midpoint element
+                                    if(targetState < entry.value_ptr.items[mid]){
+                                        right = mid;
+                                    }else if(targetState > entry.value_ptr.items[mid]){
+                                        left = mid + 1;
+                                    }else{
+                                        // go to next, the state already exists in the combined state set
+                                        continue :targetStateLoop;
+                                    }
+                                }
+
+                                // if it didn't find anything, the next bigger value is at index left=right
+                                assert(left == right, "binary search behaved weirdly", .{});
+
+                                // so insert right before there
+                                try entry.value_ptr.insert(left, targetState);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // now we have the combined transitions for the current state, so we can create the actual states and add the transitions in the dfa
+
+            var it = combinedTransitionsForCurNfaState.iterator();
+            while(it.next()) |transition| {
+                // create or get state
+                var targetStateEntry = try nfaToDfaStates.getOrPut(transition.value_ptr.*.items);
+                if(!targetStateEntry.found_existing){
+                    targetStateEntry.value_ptr.* = try dfa.addState();
+
+                    // add (the possibly combined state of the nfa) to worklist, because its new -> we haven't visited it yet
+                    try worklist.append(transition.value_ptr.*);
+                }
+
+                // add transition
+                try dfa.transitions[curDfaState].putNoClobber(transition.key_ptr.*, targetStateEntry.value_ptr.*);
+            }
+
+        }
+
+        // TODO when the arena allocator works call deinit etc.
+
+        return dfa;
+    }
+};
 
 const expect = std.testing.expect;
 
@@ -436,6 +635,58 @@ test "NFA eps removal" {
     try expect((nfa.transitions[0].get('a') orelse unreachable).items[0] == 1);
 }
 
+test "NFA simple powerset construction" {
+    var nfa = try RegExNFA.init();
+    try nfa.addStates(6);
+    try nfa.addTransition(0, 'a', 1);
+    try nfa.addTransition(0, 'a', 2);
+    try nfa.addTransition(1, 'b', 3);
+    try nfa.addTransition(2, 'a', 4);
+    try nfa.addTransition(4, 'a', 5);
+    try nfa.designateStatesFinal(&[_]u32{3,5});
+
+    var dfa = try nfa.toPowersetConstructedDFA();
+    try expect(dfa.isInLanguage("ab"));
+    try expect(dfa.isInLanguage("aaa"));
+
+    // nothing else should be in the language
+    // lets just test a bunch of random strings
+
+    var rnd = std.rand.DefaultPrng.init(0);
+    for(0..10000) |_| {
+        var length = rnd.random().int(u8);
+        var buf = try std.testing.allocator.allocSentinel(u8, length, 0);
+        defer std.testing.allocator.free(buf);
+        for(buf) |*c| {
+            c.* = rnd.random().int(u8);
+        }
+        try expect(!dfa.isInLanguage(buf));
+    }
+}
+
+test "complex eps-NFA powerset construction" {
+    var nfa = try RegExNFA.init();
+    try nfa.addStates(4);
+    try nfa.addTransition(0, null, 2);
+    try nfa.addTransition(0, 'a', 1);
+    try nfa.addTransition(1, 'b', 1);
+    try nfa.addTransition(2, 'c', 1);
+    try nfa.addTransition(2, 'd', 3);
+    try nfa.addTransition(2, 'd', 1);
+    try nfa.addTransition(1, 'e', 0);
+    try nfa.addTransition(1, 'e', 3);
+    try nfa.addTransition(3, null, 1);
+
+    try nfa.designateStatesFinal(&[_]u32{3});
+
+    try nfa.backUpEpsTransitions();
+    var dfa = try nfa.toPowersetConstructedDFA();
+    try expect(dfa.isInLanguage("abed"));
+    try expect(dfa.isInLanguage("abbbbbed"));
+    try expect(dfa.isInLanguage("dbbbbbeceecebbbed"));
+    // TODO more words
+}
+
 pub fn main() !void {
     const writer = std.io.getStdOut().writer();
     //const a = RegEx.initLiteralChar('a');
@@ -444,12 +695,33 @@ pub fn main() !void {
     //const aOrB = RegEx.initOperator(Token.Kind.Union, &a, &b);
     //try aOrB.printDOTRoot(writer);
 
-    const input = "xyz|w*(abc)*de*f";
-    //const input = "xyz";
+    //const input = "xyz|w*(abc)*de*f";
 
-    var tok = try Tokenizer.init(input);
-    defer tok.deinit();
-    const regex = try RegEx.parseExpr(0, &tok);
-    assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
-    try regex.printDOTRoot(writer);
+    //var tok = try Tokenizer.init(input);
+    //defer tok.deinit();
+    //const regex = try RegEx.parseExpr(0, &tok);
+    //assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
+    //try regex.printDOTRoot(writer);
+
+    var nfa = try RegExNFA.init();
+    try nfa.addStates(4);
+    try nfa.addTransition(0, null, 2);
+    try nfa.addTransition(0, 'a', 1);
+    try nfa.addTransition(1, 'b', 1);
+    try nfa.addTransition(2, 'c', 1);
+    try nfa.addTransition(2, 'd', 3);
+    try nfa.addTransition(2, 'd', 1);
+    try nfa.addTransition(1, 'e', 0);
+    try nfa.addTransition(1, 'e', 3);
+    try nfa.addTransition(3, null, 1);
+
+    try nfa.designateStatesFinal(&[_]u32{3});
+    //var nfaAsFA = FiniteAutomaton{.nfa = nfa};
+    //try nfaAsFA.printDOT(writer);
+
+    try nfa.backUpEpsTransitions();
+    var dfa = try nfa.toPowersetConstructedDFA();
+    var dfaAsFA = FiniteAutomaton{.dfa = dfa};
+    try dfaAsFA.printDOT(writer);
+
 }
