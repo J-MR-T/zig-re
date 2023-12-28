@@ -409,8 +409,6 @@ const RegEx = struct {
         try nfa.designateStatesFinal(&[1]u32{self.nfaEndState orelse unreachable});
 
 
-    try (FiniteAutomaton{.nfa = nfa}).printDOT(std.io.getStdOut().writer());
-
         try nfa.backUpEpsTransitions();
         return try nfa.toPowersetConstructedDFA();
     }
