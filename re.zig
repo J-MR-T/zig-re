@@ -25,7 +25,8 @@ const Token = struct {
 
     pub const Kind = enum {
         Char,
-        AnyChar,
+        // TODO implement
+        //AnyChar,
         Concat,
         Union,
         Kleen,
@@ -36,7 +37,7 @@ const Token = struct {
         pub fn precedenceAndChar(self:@This()) struct{prec:u8, char:u8} {
             return switch(self){
                 Kind.Char    => .{.prec = 0, .char = 'x'},
-                Kind.AnyChar => .{.prec = 0, .char = '.'},
+                //Kind.AnyChar => .{.prec = 0, .char = '.'},
                 Kind.Union   => .{.prec = 1, .char = '|'},
                 Kind.Concat  => .{.prec = 2, .char = ' '},
                 Kind.Kleen   => .{.prec = 3, .char = '*'},
@@ -48,7 +49,7 @@ const Token = struct {
         pub fn fromChar(theChar:u8) @This() {
             // this seems to get compiled into smth proper
             return switch(theChar){
-                Kind.AnyChar.precedenceAndChar().char => Kind.AnyChar,
+                //Kind.AnyChar.precedenceAndChar().char => Kind.AnyChar,
                 Kind.Union.precedenceAndChar().char   => Kind.Union,
                 Kind.Kleen.precedenceAndChar().char   => Kind.Kleen,
                 Kind.LParen.precedenceAndChar().char  => Kind.LParen,
@@ -60,7 +61,7 @@ const Token = struct {
         pub fn canConcatToRight(self:@This()) bool {
             return switch(self){
                 Kind.Char    => true,
-                Kind.AnyChar => true,
+                //Kind.AnyChar => true,
                 Kind.Kleen   => true,
                 Kind.RParen  => true,
                 else         => false
@@ -69,7 +70,7 @@ const Token = struct {
         pub fn canConcatToLeft(self:@This()) bool {
             return switch(self){
                 Kind.Char    => true,
-                Kind.AnyChar => true,
+                //Kind.AnyChar => true,
                 Kind.LParen  => true,
                 else         => false
             };
@@ -169,10 +170,14 @@ const Tokenizer = struct {
 };
 
 const RegEx = struct {
-    left:?*const RegEx,
-    right:?*const RegEx,
+    left:?*RegEx,
+    right:?*RegEx,
     kind:Token.Kind,
     char:u8,
+
+    // for DFA conversion
+    nfaStartState:?u32,
+    nfaEndState:?u32,
 
     pub fn initLiteralChar(char:u8) @This() {
         return RegEx{
@@ -180,15 +185,19 @@ const RegEx = struct {
             .right = null,
             .kind = Token.Kind.Char,
             .char = char,
+            .nfaStartState = null,
+            .nfaEndState = null,
         };
     }
 
-    pub fn initOperator(kind:Token.Kind, left:*const RegEx, right:?*const RegEx) @This() {
+    pub fn initOperator(kind:Token.Kind, left:*RegEx, right:?*RegEx) @This() {
         return RegEx{
             .left = left,
             .right = right,
             .kind = kind,
             .char = kind.precedenceAndChar().char,
+            .nfaStartState = null,
+            .nfaEndState = null,
         };
     }
 
@@ -213,10 +222,8 @@ const RegEx = struct {
     pub fn parseExpr(minPrec:u32, tok:*Tokenizer) ParseError!*@This() {
         var lhs = try parsePrimaryExpr(tok);
         while (tok.hasNext()) {
-            debugLog("lhs: {c}, minPrec: {d}, next token: {c}\n", .{lhs.char, minPrec, tok.peek().char});
             // let the upper level parse 'unknown operators' (in this case anything but the binary operators)
             var operatorKind = tok.peek().kind; // we peek, because if we return inside the loop, the upper level needs to consume that token
-            assert(operatorKind != Token.Kind.Char and operatorKind != Token.Kind.AnyChar, "unexpected token: {c}", .{operatorKind.precedenceAndChar().char});
             if(operatorKind != Token.Kind.Union and operatorKind != Token.Kind.Concat)
                 return lhs;
 
@@ -249,10 +256,173 @@ const RegEx = struct {
         }
     }
 
+    pub fn isOperator(self:RegEx) bool {
+        // if left is null (i.e. this is a leaf), right must be null too
+        assert(self.left != null or self.right == null, "regex has no left operand, but right operand is not null", .{});
+        return self.left != null;
+    }
+
     pub fn printDOTRoot(self:RegEx, writer:anytype) !void {
         try writer.print("digraph RegEx {{", .{});
         try self.printDOTInternal(writer, 1);
         try writer.print("}}\n", .{});
+    }
+
+    pub fn toDFA(self:*@This()) !RegExDFA {
+        // broad overview: convert regex to eps-nfa to nfa to dfa.
+        // vague idea (mostly my own, no idea if this is good): 
+        // 1. iterate in post order over the AST, create and save start and end states for each operator node (all except the leafs), and connect the with the transitions. Distinguish between whether the operator has leaf- (i.e. char-) operands or other operator operands
+        //    -> this implies the construction will not be that efficient, as we sometimes need to create new states + transitions to be able to save only one start/end state (for example for |)
+        // 2. designate full start/end states for the whole regex
+        // 3. back up eps transitions
+        // 4. convert to dfa
+
+        // edge case: no operators, just a single char
+        if(!self.isOperator()) {
+            assert(self.right == null, "regex has no left operand, but right operand is not null", .{});
+
+            var dfa = try RegExDFA.init();
+            dfa.startState = try dfa.addState();
+            try dfa.designateStatesFinal(&[1]u32{@truncate(dfa.startState)});
+            try dfa.transitions[dfa.startState].put(self.char, dfa.startState);
+
+            // TODO handle AnyChar here as soon as it's implemented
+
+            return dfa;
+        }
+
+        var nfa = try RegExNFA.init();
+
+        const VisitKind = enum{WAY_DOWN, WAY_UP};
+
+        const VisitInfo = struct{regex:*RegEx, kind:VisitKind};
+        var worklist = try initArrayListLikeWithElements(allocer, std.ArrayList(VisitInfo), &[1]VisitInfo{.{.regex = self, .kind = VisitKind.WAY_DOWN}});
+
+        while(worklist.items.len > 0) {
+            try worklist.ensureUnusedCapacity(2);
+            // only do this after enough capacity for at least two more items has been reserved, so that this pointer is not invalidated during appending
+            var cur:*VisitInfo = &worklist.items[worklist.items.len - 1];
+
+            // should never have a leaf/char in the worklist
+            assert(cur.regex.isOperator(), "worklist contained leaf/char", .{});
+            const left = cur.regex.left orelse unreachable;
+
+            switch(cur.kind){
+                VisitKind.WAY_DOWN => {
+                    // TODO ensure we're constructing a post order traversal on the way down
+
+                    // prepare next visit
+                    defer cur.kind = VisitKind.WAY_UP;
+
+                    if(left.isOperator())
+                        worklist.appendAssumeCapacity(.{.regex = left, .kind = VisitKind.WAY_DOWN});
+
+                    if(cur.regex.right) |right| if (right.isOperator())
+                        worklist.appendAssumeCapacity(.{.regex = right, .kind = VisitKind.WAY_DOWN});
+
+                    // if we haven't appended anything now, we will visit 'ourselves' immediately again, so we start the way up on this path
+                },
+                VisitKind.WAY_UP => {
+                    debugLog("up: {}\n", .{cur.regex});
+
+                    // TODO do all of the actual processing only on the way up
+                    defer _ = worklist.pop(); // remove the current item from the worklist after dealing with it
+
+                    // we can check whether left/right have a start/end state yet to determine whether we can just connect them, or we need to create a new start/end state (+transitions)
+
+                    // TODO this can be optimized, we don't need a new start/end state in every case. But it does not save huge amounts of time, we will just have a bunch of unused states in the nfa, that won't be added to the dfa, because they're never reached from the start state
+                    try nfa.addStates(2);
+                    cur.regex.nfaStartState = nfa.numStates - 2;
+                    const curStartState = cur.regex.nfaStartState orelse unreachable;
+                    cur.regex.nfaEndState = nfa.numStates - 1;
+                    const curEndState = cur.regex.nfaEndState orelse unreachable;
+
+                    // in the operator, connect the start/end states of the operands with the operator
+                    switch(cur.regex.kind){
+                        Token.Kind.Union => {
+                            const right = cur.regex.right orelse unreachable;
+
+                            if(!left.isOperator()){
+                                try nfa.addTransition(curStartState, left.char, curEndState);
+                            }else{
+                                // if it is an operator, we have visited it before, so it has a start/end state, so we can just connect it
+                                try nfa.addTransition(left.nfaEndState orelse unreachable, null, curEndState);
+
+                                // also connect the start state of the operator with the start state of the left operand
+                                try nfa.addTransition(curStartState, null, left.nfaStartState orelse unreachable);
+                            }
+
+                            if(!right.isOperator()){
+                                try nfa.addTransition(curStartState, right.char, curEndState);
+                            }else{
+                                // same as left
+                                try nfa.addTransition(right.nfaEndState orelse unreachable, null, curEndState);
+                                try nfa.addTransition(curStartState, null, right.nfaStartState orelse unreachable);
+                            }
+                            // sidenote: see? this is exactly why ever programming language needs the ability to use 'local functions'/lambdas for readability. Do you hear me, Zig? :). Don't even need to be real functions in the end, can just inline all of them (and forbid non-inlinable ones)
+                        },
+                        Token.Kind.Concat => {
+                            const right = cur.regex.right orelse unreachable;
+
+                            if(left.isOperator() and right.isOperator()){
+                                // if both are operators, we have visited them before, so they have start/end states, so we can just connect them
+                                try nfa.addTransition(left.nfaEndState orelse unreachable, null, right.nfaStartState orelse unreachable);
+                                // and set the start/end of this operator to the start/end of the operands
+                                cur.regex.nfaStartState = left.nfaStartState orelse unreachable;
+                                cur.regex.nfaEndState = right.nfaEndState orelse unreachable;
+                            }else if(left.isOperator()){
+                                // if only left is an operator, we can take the existing end state of left and connect it with the char of right to the new end state
+                                try nfa.addTransition(left.nfaEndState orelse unreachable, right.char, curEndState);
+                                cur.regex.nfaStartState = left.nfaStartState orelse unreachable;
+                            }else if(right.isOperator()){
+                                // same as left
+                                try nfa.addTransition(curStartState, left.char, right.nfaStartState orelse unreachable);
+                                cur.regex.nfaEndState = right.nfaEndState orelse unreachable;
+                            }else{
+                                // if both are chars, we need one more state in between
+                                const inBetweeny = try nfa.addState();
+                                try nfa.addTransition(curStartState, left.char, inBetweeny);
+                                try nfa.addTransition(inBetweeny, right.char, curEndState);
+                            }
+
+                        },
+                        Token.Kind.Kleen => {
+                            if(left.isOperator()){
+                                // we just reuse all of the operator and connect the end state with the start state
+                                try nfa.addTransition(left.nfaEndState orelse unreachable, null, left.nfaStartState orelse unreachable);
+                                cur.regex.nfaStartState = left.nfaStartState orelse unreachable;
+                                cur.regex.nfaEndState = left.nfaEndState orelse unreachable;
+                            }else{
+                                // just use the start state as start/end
+                                // and add a transition to itself
+                                try nfa.addTransition(curStartState, left.char, curStartState);
+                                cur.regex.nfaEndState = curStartState;
+                            }
+                        },
+                        else => unreachable,
+                    }
+                },
+            }
+        }
+
+        nfa.startState = self.nfaStartState orelse unreachable;
+        try nfa.designateStatesFinal(&[1]u32{self.nfaEndState orelse unreachable});
+
+
+    try (FiniteAutomaton{.nfa = nfa}).printDOT(std.io.getStdOut().writer());
+
+        try nfa.backUpEpsTransitions();
+        return try nfa.toPowersetConstructedDFA();
+    }
+
+    // mostly for debugging
+    pub fn format(value: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) std.os.WriteError!void {
+        try writer.print("Itself: {c}", .{value.char});
+        if(value.left) |left| if(!left.isOperator())
+            try writer.print(" Left: {c}", .{left.char});
+
+        if(value.right) |right| if(!right.isOperator())
+            try writer.print(" Right: {c}", .{right.char});
     }
 };
 
@@ -314,7 +484,12 @@ const FiniteAutomaton = union(enum){
     nfa:RegExNFA,
 
     pub fn printDOT(self:FiniteAutomaton, writer:anytype) !void {
-        try writer.print("digraph FiniteAutomaton {{ node[shape=circle];", .{});
+        try writer.print("digraph ", .{});
+        switch(self){
+            FiniteAutomaton.dfa => try writer.print("DFA", .{}),
+            FiniteAutomaton.nfa => try writer.print("NFA", .{}),
+        }
+        try writer.print("{{ node[shape=circle];", .{});
 
         const startState = switch(self){
             inline else => |case| case.startState
@@ -328,8 +503,13 @@ const FiniteAutomaton = union(enum){
             inline else => |case| case.finalStates
         };
 
-        var curState = startState;
-        for(0..states) |_| {
+        const numStates = switch(self){
+            inline else => |case| case.numStates
+        };
+
+        for(0..states) |curStateI| {
+            const curState:u32 = @truncate(curStateI);
+
             try writer.print("n{}[label=\"{}\"", .{curState, curState});
             if(finalStates.contains(curState)){
                 try writer.print(",shape=doublecircle", .{});
@@ -344,6 +524,9 @@ const FiniteAutomaton = union(enum){
                     }
                 },
                 FiniteAutomaton.nfa => |nfa| {
+                    if(curState > nfa.transitions.len)
+                        continue;
+
                     var it = nfa.transitions[curState].iterator();
                     // could also put the same transitions on the same edge, reduce clutter a bit, but this is only for debugging anyway
                     while(it.next()) |transitions| {
@@ -357,12 +540,10 @@ const FiniteAutomaton = union(enum){
                     }
                 },
             }
-
-            curState += 1;
         }
 
         // for start state
-        try writer.print("n{}[label=\"\",style=\"invis\"];n{} -> n{}; ", .{curState, curState, startState});
+        try writer.print("n{}[label=\"\",style=\"invis\"];n{} -> n{}; ", .{numStates, numStates, startState});
 
         try writer.print("}}\n", .{});
     }
@@ -434,6 +615,8 @@ const RegExNFA = struct {
             if (!entry.found_existing) {
                 entry.value_ptr.* = try transition.value_ptr.clone();
             }else{
+                // TODO this is wrong, needs to disallow duplicates
+                // TODO should probably make a sorted datastructure, would be helpful in tons of cases, like for set-like datastructures and more efficient maps than hashmaps
                 try entry.value_ptr.*.appendSlice(transition.value_ptr.*.items);
             }
         }
@@ -441,8 +624,11 @@ const RegExNFA = struct {
 
     // does not eliminate, but 'fill' epsilon transitions, so that they can be ignored from now on (because the language of the NFA after this function is the same with or without them)
     pub fn backUpEpsTransitions(self:*@This()) !void {
+        // TODO this is wrong, as it misses transitive epsilon transitions
         for(0.., self.transitions) |state,*transitionsFromState| {
             if(transitionsFromState.get(null)) |epsTransitionsFromState| {
+                // TODO solution to transitive epsilons: do this as long as it adds anything
+
                 // solution: copy all transitions of the targeted states (epsTransitionTargetsFromState) to the current state
                 // also if the target is a final state, make this one final too
                 for(epsTransitionsFromState.items) |epsTargetState|{
@@ -510,6 +696,8 @@ const RegExNFA = struct {
             // the transition lists in here are kept sorted, for deduplication (as they represent sets)
 
             for(curNfaStates.items) |curNfaState| {
+                assert(self.transitions.len > curNfaState, "nfa state out of bounds, nfa is invalid", .{});
+
                 var it = self.transitions[curNfaState].iterator();
 
                 while(it.next()) |transition| {
@@ -524,7 +712,7 @@ const RegExNFA = struct {
                             // add all targets of the transition to the combined state set, but only if they are not already in there
                             targetStateLoop: for(transition.value_ptr.items) |targetState| {
                                 // binary search, but we can't use the std.sort one, because we need to insert if not found
-                                // so just copy that one and change it :)
+                                // so just copy that one and change it :
                                 var left: usize = 0;
                                 var right: usize = entry.value_ptr.items.len;
 
@@ -687,6 +875,30 @@ test "complex eps-NFA powerset construction" {
     // TODO more words
 }
 
+test "regex to dfa" {
+    const input = "xyz|w*(abc)*de*f";
+
+    var tok = try Tokenizer.init(input);
+    defer tok.deinit();
+    const regex = try RegEx.parseExpr(0, &tok);
+    assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
+
+    var dfa = try regex.toDFA();
+    //try (FiniteAutomaton{.dfa = dfa}).printDOT(std.io.getStdOut().writer());
+
+    try expect(dfa.isInLanguage("xyz"));
+    try expect(!dfa.isInLanguage("xz"));
+    try expect(!dfa.isInLanguage("xy"));
+    try expect(!dfa.isInLanguage("x"));
+    try expect(!dfa.isInLanguage("y"));
+    try expect(!dfa.isInLanguage("z"));
+
+    try expect(dfa.isInLanguage("wwwwwwwwdf"));
+    try expect(dfa.isInLanguage("df"));
+    try expect(dfa.isInLanguage("wabcabcdeeef"));
+    try expect(dfa.isInLanguage("wwwwabcabcabcdeeef"));
+}
+
 pub fn main() !void {
     const writer = std.io.getStdOut().writer();
     //const a = RegEx.initLiteralChar('a');
@@ -695,33 +907,33 @@ pub fn main() !void {
     //const aOrB = RegEx.initOperator(Token.Kind.Union, &a, &b);
     //try aOrB.printDOTRoot(writer);
 
-    //const input = "xyz|w*(abc)*de*f";
+    const input = "xyz|w*(abc)*de*f";
 
-    //var tok = try Tokenizer.init(input);
-    //defer tok.deinit();
-    //const regex = try RegEx.parseExpr(0, &tok);
-    //assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
-    //try regex.printDOTRoot(writer);
+    var tok = try Tokenizer.init(input);
+    defer tok.deinit();
+    const regex = try RegEx.parseExpr(0, &tok);
+    assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
+    try regex.printDOTRoot(writer);
 
-    var nfa = try RegExNFA.init();
-    try nfa.addStates(4);
-    try nfa.addTransition(0, null, 2);
-    try nfa.addTransition(0, 'a', 1);
-    try nfa.addTransition(1, 'b', 1);
-    try nfa.addTransition(2, 'c', 1);
-    try nfa.addTransition(2, 'd', 3);
-    try nfa.addTransition(2, 'd', 1);
-    try nfa.addTransition(1, 'e', 0);
-    try nfa.addTransition(1, 'e', 3);
-    try nfa.addTransition(3, null, 1);
-
-    try nfa.designateStatesFinal(&[_]u32{3});
+    //var nfa = try RegExNFA.init();
+    //try nfa.addStates(4);
+    //try nfa.addTransition(0, null, 2);
+    //try nfa.addTransition(0, 'a', 1);
+    //try nfa.addTransition(1, 'b', 1);
+    //try nfa.addTransition(2, 'c', 1);
+    //try nfa.addTransition(2, 'd', 3);
+    //try nfa.addTransition(2, 'd', 1);
+    //try nfa.addTransition(1, 'e', 0);
+    //try nfa.addTransition(1, 'e', 3);
+    //try nfa.addTransition(3, null, 1);
+    //
+    //try nfa.designateStatesFinal(&[_]u32{3});
     //var nfaAsFA = FiniteAutomaton{.nfa = nfa};
     //try nfaAsFA.printDOT(writer);
 
-    try nfa.backUpEpsTransitions();
-    var dfa = try nfa.toPowersetConstructedDFA();
-    var dfaAsFA = FiniteAutomaton{.dfa = dfa};
-    try dfaAsFA.printDOT(writer);
+    //try nfa.backUpEpsTransitions();
+    //var dfa = try nfa.toPowersetConstructedDFA();
+    //var dfaAsFA = FiniteAutomaton{.dfa = dfa};
+    //try dfaAsFA.printDOT(writer);
 
 }
