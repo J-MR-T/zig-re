@@ -476,10 +476,9 @@ const RegExDFA = struct{
     }
 };
 
-// TODO make sure that this doesn't work by copying -> do i need pointers here? would that still work?
 const FiniteAutomaton = union(enum){
-    dfa:RegExDFA,
-    nfa:RegExNFA,
+    dfa:*RegExDFA,
+    nfa:*RegExNFA,
 
     pub fn printDOT(self:FiniteAutomaton, writer:anytype) !void {
         try writer.print("digraph ", .{});
