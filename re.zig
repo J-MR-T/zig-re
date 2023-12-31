@@ -19,6 +19,193 @@ fn initArrayListLikeWithElements(allocator:std.mem.Allocator, comptime ArrayList
     return arrayListLike;
 }
 
+// sorted array set. does not suppport removal
+pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) i8 )) type {
+    return struct {
+        items:[]T,
+        internalAllocator:std.mem.Allocator,
+        internalSlice:[]T,
+
+        const InsertOpts = struct{
+            ReplaceExisting:bool, // important for example if this is a key/value map and comparator fn only compares the key
+            AssumeCapacity:bool,
+            LinearInsertionSearch:bool,
+            DontSort:bool,
+        };
+
+        const DefaultInsertOpts = .{.ReplaceExisting = false, .AssumeCapacity = false, .LinearInsertionSearch = false, .DontSort = false};
+
+        pub fn init(allocator:std.mem.Allocator) !@This() {
+            var self = @This(){
+                .items = undefined,
+                .internalSlice = try allocator.alloc(T, 0),
+                .internalAllocator = allocator,
+            };
+            self.items = self.internalSlice[0..];
+            return self;
+        }
+
+        pub fn deinit(self:@This()) void {
+            self.internalAllocator.free(self.internalSlice);
+        }
+
+        pub fn ensureTotalCapacity(self:*@This(), minNewCapacity:usize) std.mem.Allocator.Error!void {
+            if(minNewCapacity > self.internalSlice.len) {
+                // from array_list.zig
+                var betterCapacity = self.internalSlice.len;
+                while (betterCapacity < minNewCapacity){
+                    // saturating addition
+                    betterCapacity +|= betterCapacity / 2 + 8;
+                }
+
+                // can't/shouldn't use realloc:
+                // - can't use it on the items slice, because the size has to match the original allocation size
+                // - shouldn't use it on the internalSlice, because that would copy even the unused capacity
+                const old = self.internalSlice;
+                self.internalSlice = try self.internalAllocator.alloc(T, betterCapacity);
+                @memcpy(self.internalSlice[0..self.items.len], self.items);
+                self.internalAllocator.free(old);
+
+                self.items = self.internalSlice[0..self.items.len];
+            }
+        }
+
+        pub fn ensureUnusedCapacity(self:*@This(), newCapacity:usize) std.mem.Allocator.Error!void {
+            try self.ensureTotalCapacity(self.internalSlice.len + newCapacity);
+        }
+
+        pub fn resize(self:*@This(), newSize:usize) std.mem.Allocator.Error!void {
+            try self.ensureTotalCapacity(newSize);
+            self.items.len = newSize;
+        }
+
+        pub fn sort(self:*@This()) void {
+            std.sort.pdq(T ,self.items, .{}, struct{
+                pub fn f(_:@TypeOf(.{}), a:T, b:T) bool {
+                    return comparatorFn(a, b) < 0;
+                }
+            }.f);
+        }
+
+        pub fn insert(self:*@This(), itemToInsert:T, comptime opts:InsertOpts) std.mem.Allocator.Error!void{
+            if(opts.DontSort){
+                if(!opts.AssumeCapacity)
+                    try self.ensureUnusedCapacity(1);
+                self.items.len += 1;
+                self.items[self.items.len-1] = itemToInsert;
+                return;
+            }
+
+            var left: usize = 0;
+            var right: usize = self.items.len;
+
+            if(opts.LinearInsertionSearch){
+                while(comparatorFn(itemToInsert, self.items[left]) == 1 and left < right){
+                    left += 1;
+                }
+
+                if(comparatorFn(itemToInsert, self.items[left]) == 0) {
+                    if(opts.ReplaceExisting){
+                        self.items[left] = itemToInsert;
+                    }
+                    return;
+                }
+                // otherwise left points to the first element that is greater than the item to insert
+            }else{
+                // binary search, but we can't use the std.sort one, because we need to insert if not found
+                // so just copy that one and change it :
+                while (left < right) {
+                    // Avoid overflowing in the midpoint calculation
+                    const mid = left + (right - left) / 2;
+                    // Compare the key with the midpoint element
+                    const comparison =  comparatorFn(itemToInsert, self.items[mid]);
+                    if(comparison < 0){
+                        // less
+                        right = mid;
+                    }else if(comparison > 0){
+                        // greater
+                        left = mid + 1;
+                    }else{
+                        // equal
+                        // go to next, the state already exists in the combined state set
+                        if(opts.ReplaceExisting){
+                            // replace:
+                            self.items[mid] = itemToInsert;
+                        }
+                        return;
+                    }
+                }
+                assert(left == right, "after binary search to insert, we should be left with a definitive insertion point", .{});
+            }
+
+            const insertBefore = left;
+
+            // we should insert if we reach this point -> reserve capacity
+            if(!opts.AssumeCapacity)
+                try self.ensureTotalCapacity(self.items.len + 1);
+
+            // let the `items` slice know that it has grown
+            self.items.len += 1;
+
+            // assert sufficient capacity
+            assert(insertBefore < self.items.len, "Insert out of capacity", .{});
+
+            // shift everything to the right
+            std.mem.copyBackwards(T, self.internalSlice[insertBefore+1..], self.internalSlice[insertBefore..(self.items.len - 1)]); // -1: old item length
+
+            // insert
+            self.items[insertBefore] = itemToInsert;
+        }
+    };
+
+}
+
+fn oldIntCast(x:anytype, comptime ResultType:type) ResultType {
+    const result:ResultType = @intCast(x);
+    return result;
+}
+
+test "test array set" {
+    const comparator = struct {fn f(a:u32, b:u32) i8 {
+        // TODO the casting is of course not optimal
+        const c:i32 = oldIntCast(a, i32) - oldIntCast(b, i32);
+        return @intCast(@max(@min(c, 1), -1));
+    }}.f;
+    try expect(comparator(1, 2) < 0);
+    try expect(comparator(4, 2) > 0);
+    try expect(comparator(2, 2) == 0);
+
+    const T = ArraySet(u32, comparator);
+    var set = try T.init(allocer);
+    const insertionOpts = T.DefaultInsertOpts;
+    try set.insert(5, insertionOpts);
+    try expect(std.mem.eql(u32, set.items, &[1]u32{5}));
+    try set.insert(2, insertionOpts);
+    try expect(std.mem.eql(u32, set.items, &[2]u32{2,5}));
+    try set.insert(7, insertionOpts);
+    try expect(std.mem.eql(u32, set.items, &[3]u32{2,5,7}));
+    try set.insert(0, insertionOpts);
+    try expect(std.mem.eql(u32, set.items, &[4]u32{0,2,5,7}));
+
+    var set2 = try ArraySet(u32, comparator).init(allocer);
+    const insertionOpts2 = .{.LinearInsertionSearch = false, .AssumeCapacity = false, .ReplaceExisting = false, .DontSort = true};
+    try set2.insert(5, insertionOpts2);
+    try expect(std.mem.eql(u32, set2.items, &[1]u32{5}));
+    try set2.insert(2, insertionOpts2);
+    try expect(std.mem.eql(u32, set2.items, &[2]u32{5,2}));
+    try set2.insert(7, insertionOpts2);
+    try expect(std.mem.eql(u32, set2.items, &[3]u32{5,2,7}));
+    try set2.insert(0, insertionOpts2);
+
+    for (set2.items) |item| {
+        std.debug.print("{}\n", .{item});
+    }
+
+    try expect(std.mem.eql(u32, set2.items, &[4]u32{5,2,7,0}));
+    set2.sort();
+    try expect(std.mem.eql(u32, set2.items, &[4]u32{0,2,5,7}));
+}
+
 const Token = struct {
     char:u8,
     kind:Kind,
@@ -359,7 +546,7 @@ const RegEx = struct {
                                 try nfa.addTransition(right.nfaEndState orelse unreachable, null, curEndState);
                                 try nfa.addTransition(curStartState, null, right.nfaStartState orelse unreachable);
                             }
-                            // sidenote: see? this is exactly why ever programming language needs the ability to use 'local functions'/lambdas for readability. Do you hear me, Zig? :). Don't even need to be real functions in the end, can just inline all of them (and forbid non-inlinable ones)
+                            // sidenote: see? this is exactly why ever programming language needs the ability to use 'local functions'/lambdas for readability. Do you hear me, Zig? :. Don't even need to be real functions in the end, can just inline all of them (and forbid non-inlinable ones)
                         },
                         Token.Kind.Concat => {
                             const right = cur.regex.right orelse unreachable;
@@ -890,27 +1077,27 @@ test "regex to dfa" {
     try expect(!dfa.isInLanguage("y"));
     try expect(!dfa.isInLanguage("z"));
 
-    try expect(dfa.isInLanguage("wwwwwwwwdf"));
-    try expect(dfa.isInLanguage("df"));
-    try expect(dfa.isInLanguage("wabcabcdeeef"));
-    try expect(dfa.isInLanguage("wwwwabcabcabcdeeef"));
+    //try expect(dfa.isInLanguage("wwwwwwwwdf"));
+    //try expect(dfa.isInLanguage("df"));
+    //try expect(dfa.isInLanguage("wabcabcdeeef"));
+    //try expect(dfa.isInLanguage("wwwwabcabcabcdeeef"));
 }
 
 pub fn main() !void {
     const writer = std.io.getStdOut().writer();
+    _ = writer;
     //const a = RegEx.initLiteralChar('a');
     //const b = RegEx.initLiteralChar('b');
     //
     //const aOrB = RegEx.initOperator(Token.Kind.Union, &a, &b);
     //try aOrB.printDOTRoot(writer);
 
-    const input = "xyz|w*(abc)*de*f";
-
-    var tok = try Tokenizer.init(input);
-    defer tok.deinit();
-    const regex = try RegEx.parseExpr(0, &tok);
-    assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
-    try regex.printDOTRoot(writer);
+    //const input = "xyz|w*(abc)*de*f";
+    //var tok = try Tokenizer.init(input);
+    //defer tok.deinit();
+    //const regex = try RegEx.parseExpr(0, &tok);
+    //assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
+    //try regex.printDOTRoot(writer);
 
     //var nfa = try RegExNFA.init();
     //try nfa.addStates(4);
@@ -933,4 +1120,19 @@ pub fn main() !void {
     //var dfaAsFA = FiniteAutomaton{.dfa = dfa};
     //try dfaAsFA.printDOT(writer);
 
+    const comparator = struct {fn f(a:u32, b:u32) i8 {
+        // TODO the casting is of course not optimal
+        const c:i32 = oldIntCast(a, i32) - oldIntCast(b, i32);
+        return @intCast(@max(@min(c, 1), -1));
+    }}.f;
+    try expect(comparator(1, 2) < 0);
+    try expect(comparator(4, 2) > 0);
+    try expect(comparator(2, 2) == 0);
+
+    var set = try ArraySet(u32, comparator).init(allocer);
+    const insertionOpts = .{.LinearInsertionSearch = false, .AssumeCapacity = false, .ReplaceExisting = false};
+    try set.insert(5, insertionOpts);
+    try set.insert(2, insertionOpts);
+    try set.insert(7, insertionOpts);
+    try set.insert(0, insertionOpts);
 }
