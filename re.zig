@@ -165,6 +165,15 @@ fn oldIntCast(x:anytype, comptime ResultType:type) ResultType {
     return result;
 }
 
+// TODO there has to be a better way to 'save' the Key Type locally somehow, to avoid code dupe
+fn keyCompare(comptime T:type, comptime compare:fn(@typeInfo(T).Struct.fields[0].type, @typeInfo(T).Struct.fields[0].type) i8) fn(T, T) i8 {
+    return struct {
+        pub fn f(a:T, b:T) i8 {
+            return compare(a[0], b[0]);
+        }
+    }.f;
+}
+
 test "test array set" {
     const comparator = struct {fn f(a:u32, b:u32) i8 {
         // TODO the casting is of course not optimal
@@ -204,6 +213,37 @@ test "test array set" {
     try expect(std.mem.eql(u32, set2.items, &[4]u32{5,2,7,0}));
     set2.sort();
     try expect(std.mem.eql(u32, set2.items, &[4]u32{0,2,5,7}));
+}
+
+test "use array set as map" {
+    const T = Tuple(&[2]type{u32, u32});
+
+    const comp = keyCompare(T, struct {fn f(a:u32, b:u32) i8 {
+        // TODO the casting is of course not optimal
+        const c:i32 = oldIntCast(a, i32) - oldIntCast(b, i32);
+        return @intCast(@max(@min(c, 1), -1));
+    }}.f);
+
+    const MapT = ArraySet(T, comp);
+    var set = try MapT.init(allocer);
+    const insertionOpts = MapT.DefaultInsertOpts;
+    // do x^2 for testing
+
+    var rnd = std.rand.DefaultPrng.init(0);
+    for (0..100) |_| {
+        const x = rnd.random().intRangeLessThan(u32, 0, 1 << 15);
+        try set.insert(.{x, x*x}, insertionOpts);
+    }
+
+    var lastItem = set.items[0];
+    for (set.items) |item| {
+        // keys ([0]) should be sorted
+        try expect(item[0] >= lastItem[0]);
+        lastItem = item;
+
+        // and values ([1]) should be correctd 
+        try expect(item[1] == item[0]*item[0]);
+    }
 }
 
 const Token = struct {
