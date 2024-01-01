@@ -339,7 +339,7 @@ fn tokenize(input:[]const u8) error{OutOfMemory}![]Token {
 }
 
 const SyntaxError = error{InvalidToken};
-const ParseError = error{InvalidToken, OutOfMemory};
+const ParseError = error{OutOfMemory} || SyntaxError;
 
 const Tokenizer = struct {
     tokens:[]Token,
@@ -532,11 +532,11 @@ const RegEx = struct {
 
             // should never have a leaf/char in the worklist
             assert(cur.regex.isOperator(), "worklist contained leaf/char", .{});
-            const left = cur.regex.left orelse unreachable;
+            const left = cur.regex.left.?;
 
             switch(cur.kind){
                 VisitKind.WAY_DOWN => {
-                    // TODO ensure we're constructing a post order traversal on the way down
+                    // ensure we're constructing a post order traversal on the way down
 
                     // prepare next visit
                     defer cur.kind = VisitKind.WAY_UP;
@@ -552,7 +552,7 @@ const RegEx = struct {
                 VisitKind.WAY_UP => {
                     debugLog("up: {}\n", .{cur.regex});
 
-                    // TODO do all of the actual processing only on the way up
+                    // do all of the actual processing only on the way up
                     defer _ = worklist.pop(); // remove the current item from the worklist after dealing with it
 
                     // we can check whether left/right have a start/end state yet to determine whether we can just connect them, or we need to create a new start/end state (+transitions)
@@ -560,51 +560,51 @@ const RegEx = struct {
                     // TODO this can be optimized, we don't need a new start/end state in every case. But it does not save huge amounts of time, we will just have a bunch of unused states in the nfa, that won't be added to the dfa, because they're never reached from the start state
                     try nfa.addStates(2);
                     cur.regex.nfaStartState = nfa.numStates - 2;
-                    const curStartState = cur.regex.nfaStartState orelse unreachable;
+                    const curStartState = cur.regex.nfaStartState.?;
                     cur.regex.nfaEndState = nfa.numStates - 1;
-                    const curEndState = cur.regex.nfaEndState orelse unreachable;
+                    const curEndState = cur.regex.nfaEndState.?;
 
                     // in the operator, connect the start/end states of the operands with the operator
                     switch(cur.regex.kind){
                         Token.Kind.Union => {
-                            const right = cur.regex.right orelse unreachable;
+                            const right = cur.regex.right.?;
 
                             if(!left.isOperator()){
                                 try nfa.addTransition(curStartState, left.char, curEndState);
                             }else{
                                 // if it is an operator, we have visited it before, so it has a start/end state, so we can just connect it
-                                try nfa.addTransition(left.nfaEndState orelse unreachable, null, curEndState);
+                                try nfa.addTransition(left.nfaEndState.?, null, curEndState);
 
                                 // also connect the start state of the operator with the start state of the left operand
-                                try nfa.addTransition(curStartState, null, left.nfaStartState orelse unreachable);
+                                try nfa.addTransition(curStartState, null, left.nfaStartState.?);
                             }
 
                             if(!right.isOperator()){
                                 try nfa.addTransition(curStartState, right.char, curEndState);
                             }else{
                                 // same as left
-                                try nfa.addTransition(right.nfaEndState orelse unreachable, null, curEndState);
-                                try nfa.addTransition(curStartState, null, right.nfaStartState orelse unreachable);
+                                try nfa.addTransition(right.nfaEndState.?, null, curEndState);
+                                try nfa.addTransition(curStartState, null, right.nfaStartState.?);
                             }
                             // sidenote: see? this is exactly why ever programming language needs the ability to use 'local functions'/lambdas for readability. Do you hear me, Zig? :. Don't even need to be real functions in the end, can just inline all of them (and forbid non-inlinable ones)
                         },
                         Token.Kind.Concat => {
-                            const right = cur.regex.right orelse unreachable;
+                            const right = cur.regex.right.?;
 
                             if(left.isOperator() and right.isOperator()){
                                 // if both are operators, we have visited them before, so they have start/end states, so we can just connect them
-                                try nfa.addTransition(left.nfaEndState orelse unreachable, null, right.nfaStartState orelse unreachable);
+                                try nfa.addTransition(left.nfaEndState.?, null, right.nfaStartState.?);
                                 // and set the start/end of this operator to the start/end of the operands
-                                cur.regex.nfaStartState = left.nfaStartState orelse unreachable;
-                                cur.regex.nfaEndState = right.nfaEndState orelse unreachable;
+                                cur.regex.nfaStartState = left.nfaStartState.?;
+                                cur.regex.nfaEndState = right.nfaEndState.?;
                             }else if(left.isOperator()){
                                 // if only left is an operator, we can take the existing end state of left and connect it with the char of right to the new end state
-                                try nfa.addTransition(left.nfaEndState orelse unreachable, right.char, curEndState);
-                                cur.regex.nfaStartState = left.nfaStartState orelse unreachable;
+                                try nfa.addTransition(left.nfaEndState.?, right.char, curEndState);
+                                cur.regex.nfaStartState = left.nfaStartState.?;
                             }else if(right.isOperator()){
                                 // same as left
-                                try nfa.addTransition(curStartState, left.char, right.nfaStartState orelse unreachable);
-                                cur.regex.nfaEndState = right.nfaEndState orelse unreachable;
+                                try nfa.addTransition(curStartState, left.char, right.nfaStartState.?);
+                                cur.regex.nfaEndState = right.nfaEndState.?;
                             }else{
                                 // if both are chars, we need one more state in between
                                 const inBetweeny = try nfa.addState();
@@ -616,9 +616,9 @@ const RegEx = struct {
                         Token.Kind.Kleen => {
                             if(left.isOperator()){
                                 // we just reuse all of the operator and connect the end state with the start state
-                                try nfa.addTransition(left.nfaEndState orelse unreachable, null, left.nfaStartState orelse unreachable);
-                                cur.regex.nfaStartState = left.nfaStartState orelse unreachable;
-                                cur.regex.nfaEndState = left.nfaEndState orelse unreachable;
+                                try nfa.addTransition(left.nfaEndState.?, null, left.nfaStartState.?);
+                                cur.regex.nfaStartState = left.nfaStartState.?;
+                                cur.regex.nfaEndState = left.nfaEndState.?;
                             }else{
                                 // just use the start state as start/end
                                 // and add a transition to itself
@@ -632,8 +632,8 @@ const RegEx = struct {
             }
         }
 
-        nfa.startState = self.nfaStartState orelse unreachable;
-        try nfa.designateStatesFinal(&[1]u32{self.nfaEndState orelse unreachable});
+        nfa.startState = self.nfaStartState.?;
+        try nfa.designateStatesFinal(&[1]u32{self.nfaEndState.?});
 
 
         try nfa.backUpEpsTransitions();
@@ -904,7 +904,7 @@ const RegExNFA = struct {
         // TODO 'curNfaState(s)' is not named perfectly, because it can also be a 'powerset state' that doesnt exist in the original NFA, just implicitly
         while(worklist.popOrNull()) |curNfaStates| {
             // get the state, has to be in there (but not visited yet) if its in the worklist
-            const curDfaState = nfaToDfaStates.get(curNfaStates.items) orelse unreachable;
+            const curDfaState = nfaToDfaStates.get(curNfaStates.items).?;
 
             // if any of the current nfa states is final, make the dfa state final
             loop: for(curNfaStates.items) |curNfaState| {
@@ -1044,7 +1044,7 @@ test "NFA eps removal" {
     try nfa.backUpEpsTransitions();
 
     try expect(nfa.finalStates.contains(0));
-    try expect((nfa.transitions[0].get('a') orelse unreachable).items[0] == 1);
+    try expect((nfa.transitions[0].get('a').?).items[0] == 1);
 }
 
 test "NFA simple powerset construction" {
