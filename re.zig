@@ -9,6 +9,7 @@ pub fn assert (condition:bool, comptime message:[]const u8, args:anytype) void {
 const debugLog = std.debug.print;
 
 const Tuple = std.meta.Tuple;
+const Order = std.math.Order;
 
 fn initArrayListLikeWithElements(allocator:std.mem.Allocator, comptime ArrayListType:type, elementsSlice:anytype) !ArrayListType{
     var arrayListLike = try ArrayListType.initCapacity(allocator, elementsSlice.len);
@@ -20,7 +21,7 @@ fn initArrayListLikeWithElements(allocator:std.mem.Allocator, comptime ArrayList
 }
 
 // sorted array set. does not suppport removal
-pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) i8 )) type {
+pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
     return struct {
         items:[]T,
         internalAllocator:std.mem.Allocator,
@@ -82,7 +83,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) i8 )) type {
         pub fn sort(self:*@This()) void {
             std.sort.pdq(T ,self.items, .{}, struct{
                 pub fn f(_:@TypeOf(.{}), a:T, b:T) bool {
-                    return comparatorFn(a, b) < 0;
+                    return comparatorFn(a, b) == Order.lt;
                 }
             }.f);
         }
@@ -100,11 +101,11 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) i8 )) type {
             var right: usize = self.items.len;
 
             if(opts.LinearInsertionSearch){
-                while(comparatorFn(itemToInsert, self.items[left]) == 1 and left < right){
+                while(comparatorFn(itemToInsert, self.items[left]) == Order.gt and left < right){
                     left += 1;
                 }
 
-                if(comparatorFn(itemToInsert, self.items[left]) == 0) {
+                if(comparatorFn(itemToInsert, self.items[left]) == Order.eq) {
                     if(opts.ReplaceExisting){
                         self.items[left] = itemToInsert;
                     }
@@ -118,21 +119,16 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) i8 )) type {
                     // Avoid overflowing in the midpoint calculation
                     const mid = left + (right - left) / 2;
                     // Compare the key with the midpoint element
-                    const comparison =  comparatorFn(itemToInsert, self.items[mid]);
-                    if(comparison < 0){
-                        // less
-                        right = mid;
-                    }else if(comparison > 0){
-                        // greater
-                        left = mid + 1;
-                    }else{
-                        // equal
-                        // go to next, the state already exists in the combined state set
-                        if(opts.ReplaceExisting){
-                            // replace:
-                            self.items[mid] = itemToInsert;
-                        }
-                        return;
+                    switch(comparatorFn(itemToInsert, self.items[mid])){
+                        Order.lt => right = mid,
+                        Order.gt => left = mid + 1,
+                        Order.eq => {
+                            // either replace or do nothing
+                            if(opts.ReplaceExisting){
+                                self.items[mid] = itemToInsert;
+                            }
+                            return;
+                        },
                     }
                 }
                 assert(left == right, "after binary search to insert, we should be left with a definitive insertion point", .{});
@@ -166,25 +162,22 @@ fn oldIntCast(x:anytype, comptime ResultType:type) ResultType {
 }
 
 // TODO there has to be a better way to 'save' the Key Type locally somehow, to avoid code dupe
-fn keyCompare(comptime T:type, comptime compare:fn(@typeInfo(T).Struct.fields[0].type, @typeInfo(T).Struct.fields[0].type) i8) fn(T, T) i8 {
+fn keyCompare(comptime T:type, comptime compare:fn(@typeInfo(T).Struct.fields[0].type, @typeInfo(T).Struct.fields[0].type) Order) fn(T, T) Order {
     return struct {
-        pub fn f(a:T, b:T) i8 {
+        pub fn f(a:T, b:T) Order {
             return compare(a[0], b[0]);
         }
     }.f;
 }
 
 test "test array set" {
-    const comparator = struct {fn f(a:u32, b:u32) i8 {
-        // TODO the casting is of course not optimal
-        const c:i32 = oldIntCast(a, i32) - oldIntCast(b, i32);
-        return @intCast(@max(@min(c, 1), -1));
-    }}.f;
-    try expect(comparator(1, 2) < 0);
-    try expect(comparator(4, 2) > 0);
-    try expect(comparator(2, 2) == 0);
+    const S = struct{
+        fn order_u32(a:u32, b:u32) Order {
+            return std.math.order(a, b);
+        }
+    };
 
-    const T = ArraySet(u32, comparator);
+    const T = ArraySet(u32, S.order_u32);
     var set = try T.init(allocer);
     const insertionOpts = T.DefaultInsertOpts;
     try set.insert(5, insertionOpts);
@@ -196,7 +189,7 @@ test "test array set" {
     try set.insert(0, insertionOpts);
     try expect(std.mem.eql(u32, set.items, &[4]u32{0,2,5,7}));
 
-    var set2 = try ArraySet(u32, comparator).init(allocer);
+    var set2 = try ArraySet(u32, S.order_u32).init(allocer);
     const insertionOpts2 = .{.LinearInsertionSearch = false, .AssumeCapacity = false, .ReplaceExisting = false, .DontSort = true};
     try set2.insert(5, insertionOpts2);
     try expect(std.mem.eql(u32, set2.items, &[1]u32{5}));
@@ -218,11 +211,13 @@ test "test array set" {
 test "use array set as map" {
     const T = Tuple(&[2]type{u32, u32});
 
-    const comp = keyCompare(T, struct {fn f(a:u32, b:u32) i8 {
-        // TODO the casting is of course not optimal
-        const c:i32 = oldIntCast(a, i32) - oldIntCast(b, i32);
-        return @intCast(@max(@min(c, 1), -1));
-    }}.f);
+    const S = struct{
+        fn order_u32(a:u32, b:u32) Order {
+            return std.math.order(a, b);
+        }
+    };
+
+    const comp = keyCompare(T, S.order_u32);
 
     const MapT = ArraySet(T, comp);
     var set = try MapT.init(allocer);
