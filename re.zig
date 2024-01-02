@@ -341,33 +341,33 @@ fn tokenize(input:[]const u8) error{OutOfMemory}![]Token {
 const SyntaxError = error{InvalidToken};
 const ParseError = error{OutOfMemory} || SyntaxError;
 
-const Tokenizer = struct {
+const TokenIterator = struct {
     tokens:[]Token,
     cur:u32,
 
     pub fn init(input:[]const u8) !@This() {
         const tokens = try tokenize(input);
-        return Tokenizer{
+        return TokenIterator{
             .tokens = tokens,
             .cur = 0,
         };
     }
 
-    pub fn peek(self:*const Tokenizer) Token {
+    pub fn peek(self:*const TokenIterator) Token {
         return self.tokens[self.cur];
     }
 
-    pub fn next(self:*Tokenizer) Token {
+    pub fn next(self:*TokenIterator) Token {
         const tok = self.tokens[self.cur];
         self.cur += 1;
         return tok;
     }
 
-    pub fn hasNext(self:*const Tokenizer) bool {
+    pub fn hasNext(self:*const TokenIterator) bool {
         return self.cur < self.tokens.len;
     }
     
-    pub fn matchNext(self:*Tokenizer, kind:Token.Kind, comptime advance:bool) bool {
+    pub fn matchNext(self:*TokenIterator, kind:Token.Kind, comptime advance:bool) bool {
         if(self.hasNext() and self.peek().kind == kind) {
             if (advance)
                 self.cur += 1;
@@ -376,7 +376,7 @@ const Tokenizer = struct {
         return false;
     }
 
-    pub fn assertNext(self:*Tokenizer, kind:Token.Kind) SyntaxError!void {
+    pub fn assertNext(self:*TokenIterator, kind:Token.Kind) SyntaxError!void {
         if(!self.matchNext(kind, true)) {
             return SyntaxError.InvalidToken;
         }
@@ -428,7 +428,7 @@ const RegEx = struct {
         };
     }
 
-    pub fn parsePrimaryExpr(tok:*Tokenizer) ParseError!*@This() {
+    pub fn parsePrimaryExpr(tok:*TokenIterator) ParseError!*@This() {
         var primary:*RegEx = undefined;
         if(tok.matchNext(Token.Kind.LParen, true)) {
             primary = try parseExpr(0, tok);
@@ -446,7 +446,7 @@ const RegEx = struct {
         return primary;
     }
 
-    pub fn parseExpr(minPrec:u32, tok:*Tokenizer) ParseError!*@This() {
+    pub fn parseExpr(minPrec:u32, tok:*TokenIterator) ParseError!*@This() {
         var lhs = try parsePrimaryExpr(tok);
         while (tok.hasNext()) {
             // let the upper level parse 'unknown operators' (in this case anything but the binary operators)
@@ -994,7 +994,7 @@ const expect = std.testing.expect;
 
 test "tokenizer" {
     const input = "xyz|w*(abc)*de*f";
-    var tok = try Tokenizer.init(input);
+    var tok = try TokenIterator.init(input);
     defer tok.deinit();
     const buf = try tok.debugFmt();
     try expect(std.mem.eql(u8, buf.items, "x y z|w* (a b c)* d e* f"));
@@ -1102,7 +1102,7 @@ test "complex eps-NFA powerset construction" {
 test "regex to dfa" {
     const input = "xyz|w*(abc)*de*f";
 
-    var tok = try Tokenizer.init(input);
+    var tok = try TokenIterator.init(input);
     defer tok.deinit();
     const regex = try RegEx.parseExpr(0, &tok);
     assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
