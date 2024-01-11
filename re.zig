@@ -1,12 +1,14 @@
 const std = @import("std");
 const allocer = std.heap.c_allocator;
-pub fn assert (condition:bool, comptime message:[]const u8, args:anytype) void {
+fn assert(condition:bool, comptime message:[]const u8, args:anytype) void {
     if (!condition) {
         std.debug.print("\n-----------------------\nAssertion failed: " ++ message ++ "\n-----------------------\nTrace:\n", args);
         unreachable;
     }
 }
-const debugLog = std.debug.print;
+fn debugLog(comptime message:[]const u8, args:anytype) void {
+    std.debug.print(message ++ "\n", args);
+}
 
 const Tuple = std.meta.Tuple;
 const Order = std.math.Order;
