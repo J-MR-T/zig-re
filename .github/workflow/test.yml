@@ -1,0 +1,24 @@
+name: Zig Test
+run-name: ${{ github.actor }} is testing out GitHub Actions 🚀
+on:
+  workflow_dispatch:
+  push:
+    branches:
+    - master
+    paths:
+    - "**/*.zig"
+    - ".github/**/*.yml"
+  pull_request:
+
+jobs:
+  zig-test:
+
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, 'skip-ci')" # manually skip ci through commit message
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install dependencies
+      run: sudo apt install zig
+    - name: Run Tests
+      run: zig test
