@@ -54,6 +54,26 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             return self;
         }
 
+        pub fn initCapacity(allocator:std.mem.Allocator, capacity:usize) std.mem.Allocator.Error!@This() {
+            var self = @This(){
+                .items = undefined,
+                .internalSlice = try allocator.alloc(T, capacity),
+                .internalAllocator = allocator,
+            };
+            // pay attention not to use the internalSlice here as above, because the items slice should not be filled with undefined items, it should just have the capacity
+            self.items.ptr = self.internalSlice.ptr;
+            self.items.len = 0;
+            return self;
+        }
+
+        pub fn initElements(allocator:std.mem.Allocator, elementsSlice:anytype) std.mem.Allocator.Error!@This() {
+            var self = try initCapacity(allocator, elementsSlice.len);
+            for (elementsSlice) |item| {
+                try self.insert(item, .{.AssumeCapacity = true});
+            }
+            return self;
+        }
+
         pub fn deinit(self:@This()) void {
             self.internalAllocator.free(self.internalSlice);
         }
