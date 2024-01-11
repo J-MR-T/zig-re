@@ -100,7 +100,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
         }
 
         pub fn ensureUnusedCapacity(self:*@This(), newCapacity:usize) std.mem.Allocator.Error!void {
-            try self.ensureTotalCapacity(self.internalSlice.len + newCapacity);
+            try self.ensureTotalCapacity(self.items.len + newCapacity);
         }
 
         pub fn resize(self:*@This(), newSize:usize) std.mem.Allocator.Error!void {
