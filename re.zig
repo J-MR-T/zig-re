@@ -753,7 +753,7 @@ const RegEx = struct {
             var dfa = try RegExDFA.init();
             dfa.startState = try dfa.addState();
             try dfa.designateStatesFinal(&[1]u32{@truncate(dfa.startState)});
-            try dfa.transitions[dfa.startState].put(self.char, dfa.startState);
+            try dfa.transitions[dfa.startState].insert(.{self.char, dfa.startState}, .{});
 
             // TODO handle AnyChar here as soon as it's implemented
 
@@ -792,8 +792,6 @@ const RegEx = struct {
                     // if we haven't appended anything now, we will visit 'ourselves' immediately again, so we start the way up on this path
                 },
                 VisitKind.WAY_UP => {
-                    debugLog("up: {}\n", .{cur.regex});
-
                     // do all of the actual processing only on the way up
                     defer _ = worklist.pop(); // remove the current item from the worklist after dealing with it
 
@@ -861,6 +859,9 @@ const RegEx = struct {
                                 try nfa.addTransition(left.nfaEndState.?, null, left.nfaStartState.?);
                                 cur.regex.nfaStartState = left.nfaStartState.?;
                                 cur.regex.nfaEndState = left.nfaEndState.?;
+
+                                // also connect the start state with the end state, to be able to match the empty string by skipping the sequence of states entirley
+                                try nfa.addTransition(left.nfaStartState.?, null, left.nfaEndState.?);
                             }else{
                                 // just use the start state as start/end
                                 // and add a transition to itself
@@ -897,22 +898,25 @@ const RegEx = struct {
 // TODO constructing the eps-NFA from a regex is the only thing left to do
 
 const RegExDFA = struct{
-    const TransitionsOfAState = std.AutoHashMap(u8, u32);
+    const Transition = Tuple(&[_]type{u8, u32});
+    const EntireTransitionMapOfAState = ArraySet(Transition, keyCompare(Transition, makeOrder(u8)));
+    const UniqueStateSet              = ArraySet(u32, makeOrder(u32));
+
+    const defaultTransitionCapacityForState = 2;
 
     startState:u32,
     // alphabet will be implicit
     numStates:u32,
     // an insert-first-lookup-later sorted vector like map would be preferable here for performance (like https://www.llvm.org/docs/ProgrammersManual.html recommends), but this will do for now
-    transitions:[]TransitionsOfAState,
-    finalStates:std.AutoHashMap(u32,void), // saw this online, but i kinda doubt there is a good specialization for void...
-                                           // a sorted vector would again be better
+    transitions:[]EntireTransitionMapOfAState,
+    finalStates:UniqueStateSet,
 
     pub fn init() !@This() {
         return RegExDFA{
             .startState  = 0,
             .numStates   = 0,
-            .transitions = try allocer.alloc(TransitionsOfAState, 0),
-            .finalStates = std.AutoHashMap(u32, void).init(allocer)
+            .transitions = try allocer.alloc(EntireTransitionMapOfAState, 0),
+            .finalStates = try UniqueStateSet.init(allocer)
         };
     }
 
@@ -925,13 +929,14 @@ const RegExDFA = struct{
         self.numStates += n;
         self.transitions = try allocer.realloc(self.transitions, self.numStates);
         for(self.numStates-n..self.numStates) |i| {
-            self.transitions[i] = TransitionsOfAState.init(allocer);
+            self.transitions[i] = try EntireTransitionMapOfAState.initCapacity(allocer, defaultTransitionCapacityForState);
         }
     }
 
     pub fn designateStatesFinal(self:*@This(), states:[]const u32) !void{
+        try self.finalStates.ensureUnusedCapacity(states.len);
         for (states) |state| {
-            try self.finalStates.put(state, {});
+            self.finalStates.insert(state, .{.AssumeCapacity = true}) catch unreachable;
         }
     }
 
@@ -939,7 +944,7 @@ const RegExDFA = struct{
     pub fn isInLanguage(self:@This(), word:[]const u8) bool{
         var curState:u32 = self.startState;
         for(word) |c| {
-            curState = self.transitions[curState].get(c) orelse return false;
+            curState = self.transitions[curState].findByKey(c) orelse return false;
         }
         return self.finalStates.contains(curState);
     }
@@ -984,20 +989,18 @@ const FiniteAutomaton = union(enum){
 
             switch(self){
                 FiniteAutomaton.dfa => |dfa| {
-                    var it = dfa.transitions[curState].iterator();
-                    while(it.next()) |transition| {
-                        try writer.print("n{} -> n{}[label=\"{c}\"]; ", .{curState, transition.value_ptr.*, transition.key_ptr.*});
+                    for(dfa.transitions[curState].items) |transition| {
+                        try writer.print("n{} -> n{}[label=\"{c}\"]; ", .{curState, transition[1], transition[0]});
                     }
                 },
                 FiniteAutomaton.nfa => |nfa| {
                     if(curState > nfa.transitions.len)
                         continue;
 
-                    var it = nfa.transitions[curState].iterator();
                     // could also put the same transitions on the same edge, reduce clutter a bit, but this is only for debugging anyway
-                    while(it.next()) |transitions| {
-                        for(transitions.value_ptr.items) |targetState| {
-                            if(transitions.key_ptr.*) |c| {
+                    for(nfa.transitions[curState].items) |transitions| {
+                        for(transitions[1].items) |targetState| {
+                            if(transitions[0]) |c| {
                                 try writer.print("n{} -> n{}[label=\"{c}\"]; ", .{curState, targetState, c});
                             }else{
                                 try writer.print("n{} -> n{}[label=\"&epsilon;\"]; ", .{curState, targetState});
@@ -1016,14 +1019,31 @@ const FiniteAutomaton = union(enum){
 };
 
 const RegExNFA = struct {
+    const UniqueStateSet = ArraySet(u32, makeOrder(u32));
+    const EpsTransitionsForOneTerminal = Tuple(&[_]type{?u8, UniqueStateSet});
+    const NonEpsTransitionsForOneTerminal = Tuple(&[_]type{u8, UniqueStateSet});
+
     // an insert-first-lookup-later sorted vector like map would be preferable here for performance (like https://www.llvm.org/docs/ProgrammersManual.html recommends), but this will do for now
-    const TransitionsOfAState = std.AutoHashMap(?u8, std.ArrayList(u32)); // ?u8 for eps transitions
-    const FinalStates = std.AutoHashMap(u32,void);// saw this online, but i kinda doubt there is a good specialization for void...
+    //const TransitionsOfAState = std.AutoHashMap(?u8, std.ArrayList(u32)); // ?u8 for eps transitions
+    const EntireTransitionMapOfAState = ArraySet(EpsTransitionsForOneTerminal, keyCompare(EpsTransitionsForOneTerminal, struct {
+        pub fn f(a:?u8, b:?u8) Order {
+            // i hope this gets compiled into something proper...
+            if(a == null){
+                if(b == null)
+                    return Order.eq;
+                return Order.lt;
+            }else if(b == null){
+                return Order.gt;
+            }
+            return std.math.order(a.?,b.?);
+        }
+    }.f)); // ?u8 for eps transitions
+    const FinalStates = UniqueStateSet;
 
     startState:u32,
     // alphabet will be implicit
     numStates:u32,
-    transitions:[]TransitionsOfAState,
+    transitions:[]EntireTransitionMapOfAState,
     finalStates:FinalStates, 
 
     internalArena:std.heap.ArenaAllocator,
@@ -1041,8 +1061,8 @@ const RegExNFA = struct {
         // TODO panics for some reason (doesnt seem to be a recoverable Error), so im just using the allocer again for now. That will leak like crazy, so this definitely needs to be fixed
         //nfa.internalAllocator = nfa.internalArena.allocator();
         nfa.internalAllocator = allocer;
-        nfa.transitions       = try nfa.internalAllocator.alloc(TransitionsOfAState, 0);
-        nfa.finalStates       = FinalStates.init(nfa.internalAllocator);
+        nfa.transitions       = try nfa.internalAllocator.alloc(EntireTransitionMapOfAState, 0);
+        nfa.finalStates       = try FinalStates.init(nfa.internalAllocator);
         return nfa;
     }
 
@@ -1055,54 +1075,96 @@ const RegExNFA = struct {
         self.numStates += n;
         self.transitions = try self.internalAllocator.realloc(self.transitions, self.numStates);
         for(self.numStates-n..self.numStates) |i| {
-            self.transitions[i] = TransitionsOfAState.init(self.internalAllocator);
+            self.transitions[i] = try EntireTransitionMapOfAState.init(self.internalAllocator);
+        }
+    }
+
+    pub fn designateStatesFinal(self:*@This(), states:[]const u32) !void{
+        try self.finalStates.ensureUnusedCapacity(states.len);
+        for (states) |state| {
+            self.finalStates.insert(state, .{.AssumeCapacity = true}) catch unreachable;
         }
     }
 
     pub fn addTransition(self:*@This(), from:u32, with:?u8, to:u32) !void {
-        var entry = try self.transitions[from].getOrPut(with);
-        if(!entry.found_existing)
-            entry.value_ptr.* = try std.ArrayList(u32).initCapacity(self.internalAllocator, 1);
-
-        try entry.value_ptr.append(to);
+        _ = try self. addTransitionGetInfo(from, with, to);
     }
 
-    pub fn designateStatesFinal(self:*@This(), states:[]const u32) !void{
-        for (states) |state| {
-            try self.finalStates.put(state, {});
+
+    // returns whether it added anything
+    pub fn addTransitionGetInfo(self:*@This(), from:u32, with:?u8, to:u32) !bool {
+        var entry = try self.transitions[from].findSpot(.{with, undefined}, .{.MakeSpaceForNewIfNotFound = true});
+        if(!entry.found_existing){
+            // set the char, if its new
+            entry.item_ptr.*[0] = with;
+            entry.item_ptr.*[1] = try UniqueStateSet.initElements(self.internalAllocator, &[1]u32{to});
+            return true;
+        }else{
+            return !(try entry.item_ptr.*[1].insertAndGet(to, .{})).found_existing;
         }
     }
 
-    pub fn addAllTransitionsFromOtherState(self:*@This(), transitionToCopyTo:*TransitionsOfAState, stateToCopyFrom:u32) !void{
-        // there doesn't seem to be a 'put all', so I guess we'll loop...
-        var it = self.transitions[stateToCopyFrom].iterator();
-        while(it.next()) |transition| {
-            var entry = try transitionToCopyTo.getOrPut(transition.key_ptr.*);
-            if (!entry.found_existing) {
-                entry.value_ptr.* = try transition.value_ptr.clone();
+    // returns whether it added anything
+    pub fn addAllTransitionsFromOtherState(self:*@This(), to:u32, from:u32, comptime opts:struct{excludeEpsilonTransitions:bool = false}) !bool {
+        if(to == from)
+            return false; 
+
+        var addedSomething = false;
+        const transitionsToCopyFrom:EntireTransitionMapOfAState = self.transitions[from];
+        const transitionsToCopyTo:*EntireTransitionMapOfAState = &self.transitions[to];
+        for(transitionsToCopyFrom.items) |transition| {
+            const terminal = transition[0];
+            if(opts.excludeEpsilonTransitions and terminal == null)
+                continue;
+
+            const transitionTargets = transition[1];
+            
+            const transitionsUsingTerminalFromStateToCopyTo = try transitionsToCopyTo.findSpot(.{terminal, undefined}, .{.MakeSpaceForNewIfNotFound = true});
+            const targetListToChangePtr:*UniqueStateSet = &transitionsUsingTerminalFromStateToCopyTo.item_ptr.*[1];
+
+            if(transitionsUsingTerminalFromStateToCopyTo.found_existing){
+                const lengthBefore = targetListToChangePtr.items.len;
+                // if the terminal already exists, just add all the targets to the existing set
+                try targetListToChangePtr.addAll(transitionTargets);
+
+                // can't just OR it, zig won't let me :(
+                if(targetListToChangePtr.items.len != lengthBefore)
+                    addedSomething = true;
             }else{
-                // TODO this is wrong, needs to disallow duplicates
-                // TODO should probably make a sorted datastructure, would be helpful in tons of cases, like for set-like datastructures and more efficient maps than hashmaps
-                try entry.value_ptr.*.appendSlice(transition.value_ptr.*.items);
+                // otherwise, create a new transition list
+                transitionsUsingTerminalFromStateToCopyTo.item_ptr.*[0] = terminal;
+                targetListToChangePtr.* = try transitionTargets.clone();
+                addedSomething = true;
             }
         }
+        return addedSomething;
     }
 
     // does not eliminate, but 'fill' epsilon transitions, so that they can be ignored from now on (because the language of the NFA after this function is the same with or without them)
     pub fn backUpEpsTransitions(self:*@This()) !void {
-        // TODO this is wrong, as it misses transitive epsilon transitions
-        for(0.., self.transitions) |state,*transitionsFromState| {
-            if(transitionsFromState.get(null)) |epsTransitionsFromState| {
-                // TODO solution to transitive epsilons: do this as long as it adds anything
+        // TODO this is obviously very inefficient, I'm thinking about how to do it better, maybe a kind of modifierd post order traversal (that takes cycles into consideration)
 
-                // solution: copy all transitions of the targeted states (epsTransitionTargetsFromState) to the current state
-                // also if the target is a final state, make this one final too
-                for(epsTransitionsFromState.items) |epsTargetState|{
-                    try self.addAllTransitionsFromOtherState(transitionsFromState, epsTargetState);
+        // to handle transitive epsilons: just do this as long as it adds anything (this is why its inefficient)
+        var changedSmth = true;
+        while(changedSmth){
+            changedSmth = false;
+            for(0.., self.transitions) |state,*transitionsFromState| {
+                if(transitionsFromState.findByKey(null)) |epsTargetsFromState| {
+                    // solution: copy all transitions of the targeted states (epsTargetsFromState) to the current state
+                    // also if the target is a final state, make this one final too
+                    for(epsTargetsFromState.items) |epsTargetState|{
+                        // exclude eps transitions here, they just make the whole thing bigger, and adding them anywhere might modify the epsTargetsFromState while we're iterating over them.
+                        if(try self.addAllTransitionsFromOtherState(@intCast(state), epsTargetState, .{.excludeEpsilonTransitions = true}))
+                            changedSmth = true;
 
-                    // make final if target is final
-                    if(self.finalStates.contains(epsTargetState))
-                        try self.designateStatesFinal(&[1]u32{@truncate(state)});
+                        // make final if target is final
+                        if(self.finalStates.contains(epsTargetState)){
+                            if(!self.finalStates.contains(@intCast(state))){
+                                try self.designateStatesFinal(&[1]u32{@truncate(state)});
+                                changedSmth = true;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1114,7 +1176,7 @@ const RegExNFA = struct {
     pub fn toPowersetConstructedDFA(self:*@This()) !RegExDFA{
         // combine all transitions into new states (if they don't exist yet), add them to the worklist
 
-        // maps input array list of nfa states to dfa state
+        // maps input slice of nfa states to dfa state
         var nfaToDfaStates = std.HashMap([]u32, u32, struct {
             // just a simple hashing of slice *content*
             pub fn hash(_: @This(), key: []u32) u64 {
@@ -1132,16 +1194,15 @@ const RegExNFA = struct {
         
         var dfa = try RegExDFA.init();
         // worklist of nfa (and generated i.e. powerset-) states to visit
-        var worklist = try std.ArrayList(std.ArrayList(u32)).initCapacity(self.internalAllocator, 8);
+        var worklist = try std.ArrayList(UniqueStateSet).initCapacity(self.internalAllocator, 8);
 
         // add start state to new DFA
         dfa.startState = try dfa.addState();
-        var startStateList = try initArrayListLikeWithElements(self.internalAllocator, std.ArrayList(u32), &[1]u32{self.startState});
-        try nfaToDfaStates.putNoClobber(startStateList.items, dfa.startState);
+        var startStateSet = try UniqueStateSet.initElements(self.internalAllocator, &[1]u32{self.startState});
+        try nfaToDfaStates.putNoClobber(startStateSet.items, dfa.startState);
 
         // used like a stack
-        try worklist.append(startStateList);
-
+        try worklist.append(startStateSet);
 
         // TODO 'curNfaState(s)' is not named perfectly, because it can also be a 'powerset state' that doesnt exist in the original NFA, just implicitly
         while(worklist.popOrNull()) |curNfaStates| {
@@ -1158,50 +1219,26 @@ const RegExNFA = struct {
 
             // then go through the transitions of the states, and construct a transition map for the state step by step
             // after the transition map is complete, the actual dfa states can be created and the dfa transitions can be added
-            var combinedTransitionsForCurNfaState = std.AutoHashMap(u8, std.ArrayList(u32)).init(self.internalAllocator);
+            var combinedTransitionsForCurNfaState = try ArraySet(NonEpsTransitionsForOneTerminal, keyCompare(NonEpsTransitionsForOneTerminal, makeOrder(u8))).init(self.internalAllocator);
             // the transition lists in here are kept sorted, for deduplication (as they represent sets)
 
             for(curNfaStates.items) |curNfaState| {
                 assert(self.transitions.len > curNfaState, "nfa state out of bounds, nfa is invalid", .{});
 
-                var it = self.transitions[curNfaState].iterator();
-
-                while(it.next()) |transition| {
+                for(self.transitions[curNfaState].items) |*transition| {
                     // ignore empty, because eps transitions are already handled
-                    if(transition.key_ptr.*) |c| {
-                        var entry = try combinedTransitionsForCurNfaState.getOrPut(c);
-                        // either create or append (keep sorted)
+
+                    if(transition.*[0]) |c| {
+                        // first: find/insert the transition map for the current char
+                        // results are still correct
+                        var entry = try combinedTransitionsForCurNfaState.findSpot(.{c, undefined}, .{.MakeSpaceForNewIfNotFound = true});
+                        // either create, if it doesn't exist yet or add all
                         if(!entry.found_existing){
-                            entry.value_ptr.* = try transition.value_ptr.clone();
-                            std.sort.pdq(u32, entry.value_ptr.items, {}, std.sort.asc(u32));
+                            // set the char
+                            entry.item_ptr.*[0] = c;
+                            entry.item_ptr.*[1] = try transition.*[1].clone();
                         }else{
-                            // add all targets of the transition to the combined state set, but only if they are not already in there
-                            targetStateLoop: for(transition.value_ptr.items) |targetState| {
-                                // binary search, but we can't use the std.sort one, because we need to insert if not found
-                                // so just copy that one and change it :
-                                var left: usize = 0;
-                                var right: usize = entry.value_ptr.items.len;
-
-                                while (left < right) {
-                                    // Avoid overflowing in the midpoint calculation
-                                    const mid = left + (right - left) / 2;
-                                    // Compare the key with the midpoint element
-                                    if(targetState < entry.value_ptr.items[mid]){
-                                        right = mid;
-                                    }else if(targetState > entry.value_ptr.items[mid]){
-                                        left = mid + 1;
-                                    }else{
-                                        // go to next, the state already exists in the combined state set
-                                        continue :targetStateLoop;
-                                    }
-                                }
-
-                                // if it didn't find anything, the next bigger value is at index left=right
-                                assert(left == right, "binary search behaved weirdly", .{});
-
-                                // so insert right before there
-                                try entry.value_ptr.insert(left, targetState);
-                            }
+                            try entry.item_ptr.*[1].addAll(transition.*[1]);
                         }
                     }
                 }
@@ -1209,19 +1246,18 @@ const RegExNFA = struct {
 
             // now we have the combined transitions for the current state, so we can create the actual states and add the transitions in the dfa
 
-            var it = combinedTransitionsForCurNfaState.iterator();
-            while(it.next()) |transition| {
+            for(combinedTransitionsForCurNfaState.items) |transition| {
                 // create or get state
-                var targetStateEntry = try nfaToDfaStates.getOrPut(transition.value_ptr.*.items);
+                var targetStateEntry = try nfaToDfaStates.getOrPut(transition[1].items);
                 if(!targetStateEntry.found_existing){
                     targetStateEntry.value_ptr.* = try dfa.addState();
 
                     // add (the possibly combined state of the nfa) to worklist, because its new -> we haven't visited it yet
-                    try worklist.append(transition.value_ptr.*);
+                    try worklist.append(transition[1]);
                 }
 
                 // add transition
-                try dfa.transitions[curDfaState].putNoClobber(transition.key_ptr.*, targetStateEntry.value_ptr.*);
+                try dfa.transitions[curDfaState].insert(.{transition[0], targetStateEntry.value_ptr.*}, .{});
             }
 
         }
@@ -1248,8 +1284,8 @@ test "ab* DFA" {
     const a = 0;
     const b = 1;
 
-    try dfa.transitions[a].put('a', b);
-    try dfa.transitions[b].put('b', b);
+    try dfa.transitions[a].insert(.{'a', b}, .{});
+    try dfa.transitions[b].insert(.{'b', b}, .{});
     try dfa.designateStatesFinal(&[1]u32{b});
 
     try expect(dfa.isInLanguage("a"));
@@ -1266,11 +1302,17 @@ test "ab|aaa NFA" {
     var nfa = try RegExNFA.init();
     try nfa.addStates(6);
     try nfa.addTransition(0, 'a', 1);
+    try expect(nfa.transitions[0].findByKey('a') != null);
+    try expect(nfa.transitions[0].findByKey('a').?.items[0] == 1);
+    try expect(nfa.transitions[0].items[0][1].items[0] == 1);
+    try expect(nfa.transitions[0].findByKey('b') == null);
     try nfa.addTransition(0, 'a', 2);
     try nfa.addTransition(1, 'b', 3);
     try nfa.addTransition(2, 'a', 4);
     try nfa.addTransition(4, 'a', 5);
     try nfa.designateStatesFinal(&[_]u32{3,5});
+
+    try expect(std.mem.eql(u32, nfa.transitions[0].findByKey('a').?.items, &[2]u32{1,2}));
 }
 
 test "NFA eps removal" {
@@ -1281,12 +1323,30 @@ test "NFA eps removal" {
     try nfa.designateStatesFinal(&[_]u32{1});
 
     try expect(!nfa.finalStates.contains(0));
-    try expect(nfa.transitions[0].get('a') == null);
+    try expect(nfa.transitions[0].findByKey('a') == null);
 
     try nfa.backUpEpsTransitions();
 
     try expect(nfa.finalStates.contains(0));
-    try expect((nfa.transitions[0].get('a').?).items[0] == 1);
+    try expect(nfa.transitions[0].findByKey('a') != null);
+    try expect((nfa.transitions[0].findByKey('a').?).items[0] == 1);
+}
+
+test "NFA transitive eps removal" {
+    var nfa = try RegExNFA.init();
+    try nfa.addStates(3);
+    try nfa.addTransition(0, null, 1);
+    try nfa.addTransition(1, null, 2);
+    try nfa.addTransition(2, 'a', 2);
+    try nfa.designateStatesFinal(&[_]u32{2});
+
+    try expect(!nfa.finalStates.contains(0));
+    try expect(nfa.transitions[0].findByKey('a') == null);
+
+    try nfa.backUpEpsTransitions();
+
+    try expect(nfa.finalStates.contains(0));
+    try expect(nfa.transitions[0].findByKey('a').?.items[0] == 2);
 }
 
 test "NFA simple powerset construction" {
@@ -1338,7 +1398,6 @@ test "complex eps-NFA powerset construction" {
     try expect(dfa.isInLanguage("abed"));
     try expect(dfa.isInLanguage("abbbbbed"));
     try expect(dfa.isInLanguage("dbbbbbeceecebbbed"));
-    // TODO more words
 }
 
 test "regex to dfa" {
@@ -1350,19 +1409,26 @@ test "regex to dfa" {
     assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
 
     var dfa = try regex.toDFA();
-    //try (FiniteAutomaton{.dfa = dfa}).printDOT(std.io.getStdOut().writer());
 
     try expect(dfa.isInLanguage("xyz"));
+
     try expect(!dfa.isInLanguage("xz"));
     try expect(!dfa.isInLanguage("xy"));
     try expect(!dfa.isInLanguage("x"));
     try expect(!dfa.isInLanguage("y"));
     try expect(!dfa.isInLanguage("z"));
 
-    //try expect(dfa.isInLanguage("wwwwwwwwdf"));
-    //try expect(dfa.isInLanguage("df"));
-    //try expect(dfa.isInLanguage("wabcabcdeeef"));
-    //try expect(dfa.isInLanguage("wwwwabcabcabcdeeef"));
+    try expect(dfa.isInLanguage("wwwwwwwwdf"));
+    try expect(dfa.isInLanguage("df"));
+    try expect(dfa.isInLanguage("deef"));
+    try expect(dfa.isInLanguage("wabcabcdeeef"));
+    try expect(dfa.isInLanguage("wwwwabcabcabcdeeef"));
+
+    try expect(!dfa.isInLanguage("wwwwacabcabcdeeef"));
+    try expect(!dfa.isInLanguage("xyz" ++ "wwwwwwwwdf"));
+    try expect(!dfa.isInLanguage("xyz" ++ "df"));
+    try expect(!dfa.isInLanguage("xyz" ++ "wabcabcdeeef"));
+    try expect(!dfa.isInLanguage("xyz" ++ "wwwwabcabcabcdeeef"));
 }
 
 pub fn main() !void {
@@ -1402,19 +1468,39 @@ pub fn main() !void {
     //var dfaAsFA = FiniteAutomaton{.dfa = dfa};
     //try dfaAsFA.printDOT(writer);
 
-    const comparator = struct {fn f(a:u32, b:u32) i8 {
-        // TODO the casting is of course not optimal
-        const c:i32 = oldIntCast(a, i32) - oldIntCast(b, i32);
-        return @intCast(@max(@min(c, 1), -1));
-    }}.f;
-    try expect(comparator(1, 2) < 0);
-    try expect(comparator(4, 2) > 0);
-    try expect(comparator(2, 2) == 0);
+    //var nfa = try RegExNFA.init();
+    //try nfa.addStates(2);
+    //try nfa.addTransition(0, null, 1);
+    //try nfa.addTransition(1, 'a', 1);
+    //try nfa.designateStatesFinal(&[_]u32{1});
+    //
+    //try expect(!nfa.finalStates.contains(0));
+    //try expect(nfa.transitions[0].findByKey('a') == null);
+    //
+    //try nfa.backUpEpsTransitions();
+    //
+    //try expect(nfa.finalStates.contains(0));
 
-    var set = try ArraySet(u32, comparator).init(allocer);
-    const insertionOpts = .{.LinearInsertionSearch = false, .AssumeCapacity = false, .ReplaceExisting = false};
-    try set.insert(5, insertionOpts);
-    try set.insert(2, insertionOpts);
-    try set.insert(7, insertionOpts);
-    try set.insert(0, insertionOpts);
+    var nfa = try RegExNFA.init();
+    try nfa.addStates(2);
+    try nfa.addTransition(0, null, 1);
+    try nfa.addTransition(1, 'a', 1);
+    try nfa.designateStatesFinal(&[_]u32{1});
+
+    try expect(!nfa.finalStates.contains(0));
+    try expect(nfa.transitions[0].findByKey('a') == null);
+
+    try nfa.backUpEpsTransitions();
+
+    try expect(nfa.finalStates.contains(0));
+
+    // print
+    for(0.., nfa.transitions) |from,transitionsForState| {
+        for(transitionsForState.items) |transition| {
+            debugLog("from {} with {?} to {}", .{from, transition[0], transition[1]});
+        }
+    }
+
+    try expect(nfa.transitions[0].findByKey('a') != null);
+    try expect((nfa.transitions[0].findByKey('a').?).items[0] == 1);
 }
