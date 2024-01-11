@@ -22,6 +22,14 @@ fn initArrayListLikeWithElements(allocator:std.mem.Allocator, comptime ArrayList
     return arrayListLike;
 }
 
+fn makeOrder(comptime T:type) fn (T, T) Order {
+    return struct {
+        pub fn f(a:T, b:T) Order {
+            return std.math.order(a, b);
+        }
+    }.f;
+}
+
 // sorted array set. does not suppport removal
 pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
     return struct {
@@ -173,13 +181,7 @@ fn keyCompare(comptime T:type, comptime compare:fn(@typeInfo(T).Struct.fields[0]
 }
 
 test "test array set" {
-    const S = struct{
-        fn order_u32(a:u32, b:u32) Order {
-            return std.math.order(a, b);
-        }
-    };
-
-    const T = ArraySet(u32, S.order_u32);
+    const T = ArraySet(u32, makeOrder(u32));
     var set = try T.init(allocer);
     const insertionOpts = T.DefaultInsertOpts;
     try set.insert(5, insertionOpts);
@@ -191,7 +193,7 @@ test "test array set" {
     try set.insert(0, insertionOpts);
     try expect(std.mem.eql(u32, set.items, &[4]u32{0,2,5,7}));
 
-    var set2 = try ArraySet(u32, S.order_u32).init(allocer);
+    var set2 = try ArraySet(u32, makeOrder(u32)).init(allocer);
     const insertionOpts2 = .{.LinearInsertionSearch = false, .AssumeCapacity = false, .ReplaceExisting = false, .DontSort = true};
     try set2.insert(5, insertionOpts2);
     try expect(std.mem.eql(u32, set2.items, &[1]u32{5}));
@@ -200,12 +202,8 @@ test "test array set" {
     try set2.insert(7, insertionOpts2);
     try expect(std.mem.eql(u32, set2.items, &[3]u32{5,2,7}));
     try set2.insert(0, insertionOpts2);
-
-    for (set2.items) |item| {
-        std.debug.print("{}\n", .{item});
-    }
-
     try expect(std.mem.eql(u32, set2.items, &[4]u32{5,2,7,0}));
+
     set2.sort();
     try expect(std.mem.eql(u32, set2.items, &[4]u32{0,2,5,7}));
 }
