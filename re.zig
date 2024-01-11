@@ -44,6 +44,11 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             DontSort:bool              = false,
         };
 
+        const FindOpts = struct{
+            MakeSpaceForNewIfNotFound:bool = false,
+            AssumeCapacity:bool            = false,
+            LinearInsertionSearch:bool     = false,
+        };
         pub fn init(allocator:std.mem.Allocator) !@This() {
             var self = @This(){
                 .items = undefined,
@@ -116,30 +121,182 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             }.f);
         }
 
+        const SpotInfo = struct{item_ptr:*T, found_existing:bool};
+
         pub fn insert(self:*@This(), itemToInsert:T, comptime opts:InsertOpts) std.mem.Allocator.Error!void{
+            _ = try insertAndGet(self, itemToInsert, opts);
+        }
+
+        pub fn insertAndGet(self:*@This(), itemToInsert:T, comptime opts:InsertOpts) std.mem.Allocator.Error!SpotInfo {
             if(opts.DontSort){
+                if(opts.LinearInsertionSearch)
+                    @compileError("LinearInsertionSearch not applicable when DontSort is set");
+                if(opts.ReplaceExisting)
+                    @compileError("ReplaceExisting not applicable when DontSort is set");
+
                 if(!opts.AssumeCapacity)
                     try self.ensureUnusedCapacity(1);
                 self.items.len += 1;
                 self.items[self.items.len-1] = itemToInsert;
+                return .{.item_ptr = &self.items[self.items.len-1], .found_existing = false};
+            }
+
+            var findResults = try self.findSpot(itemToInsert, .{.MakeSpaceForNewIfNotFound = true, .AssumeCapacity = opts.AssumeCapacity, .LinearInsertionSearch = opts.LinearInsertionSearch});
+            // if we didnt find it, or we should replace it, write to it
+            if(!findResults.found_existing or opts.ReplaceExisting)
+                findResults.item_ptr.* = itemToInsert;
+
+            // results are still correct
+            return findResults;
+        }
+
+        // invalidates pointers and capacity guarantees in all cases (!)
+        // this could also be done sort of in-place with sufficient guarantees, but that is unnecessarily complex for now
+        pub fn addAll(a:*@This(), b:@This()) std.mem.Allocator.Error!void {
+            if(a.items.ptr == b.items.ptr){
+                assert(a.items.len == b.items.len, "addAll called on the same set with different lengths", .{});
                 return;
             }
+
+            var self = a;
+
+            // allocate a new array with the combined capacity, that will become the self.items array later
+            var newInternalSlice = try a.internalAllocator.alloc(T, a.items.len + b.items.len);
+
+            // merge the two basically like in mergesort, but take care to deduplicate them
+
+            var aI:usize = 0;
+            var bI:usize = 0;
+            var newI:usize = 0;
+
+            var actualNewLen:usize = newInternalSlice.len;
+
+            while(true) : (newI += 1) {
+                if(aI >= a.items.len){
+                    // a is empty, just copy the rest of b (deduplicate the joint)
+                    if(newI != 0 and comparatorFn(newInternalSlice[newI - 1], b.items[bI]) == Order.eq){
+                        bI += 1;
+                        actualNewLen -= 1;
+                    }
+
+                    if(bI >= b.items.len)
+                        // b is empty too, we're done
+                        break;
+
+                    @memcpy(newInternalSlice[newI..actualNewLen], b.items[bI..]);
+                    break;
+                }else if(bI >= b.items.len){
+                    // same thing, b is empty, so copy the rest of a, with deduplication
+                    if(newI != 0 and comparatorFn(newInternalSlice[newI - 1], a.items[aI]) == Order.eq){
+                        aI += 1;
+                        actualNewLen -= 1;
+                    }
+
+                    if(aI >= a.items.len)
+                        // a is empty too, we're done
+                        break;
+
+                    @memcpy(newInternalSlice[newI..actualNewLen], a.items[aI..]);
+                    break;
+                }else
+                    // otherwise copy the smaller one
+                if(comparatorFn(a.items[aI], b.items[bI]) == Order.lt){
+                    // deduplicate
+                    if(newI != 0 and comparatorFn(newInternalSlice[newI - 1], a.items[aI]) == Order.eq){
+                        actualNewLen -= 1;
+                        // don't increment newI, so we overwrite the duplicate
+                        newI -= 1;
+                    }else{
+                        newInternalSlice[newI] = a.items[aI];
+                    }
+                    aI += 1;
+                }else{
+                    // deduplicate
+                    if(newI != 0 and comparatorFn(newInternalSlice[newI - 1], b.items[bI]) == Order.eq){
+                        actualNewLen -= 1;
+                        // don't increment newI, so we overwrite the duplicate
+                        newI -= 1;
+                    }else{
+                        newInternalSlice[newI] = b.items[bI];
+                    }
+                    bI += 1;
+                }
+            } 
+
+            // replace the old self array with the new one
+            self.internalAllocator.free(self.internalSlice);
+            self.internalSlice = newInternalSlice;
+            self.items = newInternalSlice[0..actualNewLen];
+        }
+
+        // this is not very efficient, as this set is not really designed to have elements removed from frequently. Has to move O(n) elements in the worst case
+        // returns whether it removed something
+        // never shrinks the internal array
+        pub fn remove(self:*@This(), itemToRemove:T, comptime findOpts:FindOpts) bool {
+            if(findOpts.MakeSpaceForNewIfNotFound)
+                @compileError("MakeSpaceForNewIfNotFound not applicable for remove");
+
+            const spot = self.findSpot(itemToRemove, findOpts) catch unreachable;
+            if(spot.found_existing){
+                const i = (@intFromPtr(spot.item_ptr) - @intFromPtr(self.items.ptr))/@sizeOf(T);
+                std.mem.copyForwards(T, self.items[i..self.items.len-1], self.items[i+1..self.items.len]);
+                self.items.len -= 1;
+                return true;
+            }
+            return false;
+        }
+
+        // returns whether the set contains the item
+        pub fn contains(self:*const @This(), itemToFind:T) bool {
+            return self.find(itemToFind) != null;
+        }
+
+        pub fn containsKey(self:*const @This(), keyToFind:@typeInfo(T).Struct.fields[0].type) bool {
+            return self.findByKey(keyToFind) != null;
+        }
+
+        // finds the first item that is greater than or equal to the item to find using binary search
+        pub fn find(self:*const @This(), itemToCompareAgainst:T) ?T{
+            // can confidently @constCast, and ignore the error, because we don't modify anything (guaranteed by the implementation)
+            const spot = @constCast(self).findSpot(itemToCompareAgainst, .{.MakeSpaceForNewIfNotFound = false, .AssumeCapacity = false, .LinearInsertionSearch = false}) catch unreachable;
+            return if(spot.found_existing) spot.item_ptr.* else null;
+        }
+
+        // finds the first item that is greater than or equal to the item to find using linear search
+        pub fn findLinear(self:*const @This(), itemToCompareAgainst:T) ?T{
+            const spot = @constCast(self).findSpot(itemToCompareAgainst, .{.MakeSpaceForNewIfNotFound = false, .AssumeCapacity = false, .LinearInsertionSearch = true}) catch unreachable;
+            return if(spot.found_existing) spot.item_ptr.* else null;
+        }
+
+        // finds 
+        pub fn findByKey(self:*const @This(), keyToCompareAgainst:@typeInfo(T).Struct.fields[0].type) ?@typeInfo(T).Struct.fields[1].type{
+            if(@typeInfo(T).Struct.fields.len != 2)
+                @compileError("findByKey only works when this set is being used as a key value map, i.e. with two-long tuple elements");
+
+            return (self.find(.{keyToCompareAgainst, undefined}) orelse return null)[1];
+        }
+
+        // only use this if you know what you're doing, try to use `contains`, the other `find...` function or `insert` if possible
+        // finds the first item that is greater than or equal to the item to find and returns a pointer to it or the place it should be inserted if it does not exist, as well as whether or not it exists
+        // if opts.MakeSpaceForNewIfNotFound is set, the array will be expanded and the returned pointer will point to the new item (undefined) item.
+        // if opts.MakeSpaceForNewIfNotFound is not set, the returned pointer will be invalid (but sensible!), if .found_existing is false
+        pub fn findSpot(self:*@This(), itemToCompareAgainst:T, comptime opts:FindOpts) !SpotInfo {
+            if(!opts.MakeSpaceForNewIfNotFound and opts.AssumeCapacity)
+                @compileError("Can't assume capacity if findSpot can not insert");
 
             var left: usize = 0;
             var right: usize = self.items.len;
 
+            // in any of the cases where we find it, we can ignore opts.MakeSpaceForNewIfNotFound (obviously)
             if(opts.LinearInsertionSearch){
-                while(comparatorFn(itemToInsert, self.items[left]) == Order.gt and left < right){
+                while(comparatorFn(itemToCompareAgainst, self.items[left]) == Order.gt and left < right){
                     left += 1;
                 }
 
-                if(comparatorFn(itemToInsert, self.items[left]) == Order.eq) {
-                    if(opts.ReplaceExisting){
-                        self.items[left] = itemToInsert;
-                    }
-                    return;
+                if(comparatorFn(itemToCompareAgainst, self.items[left]) == Order.eq) {
+                    return .{.item_ptr = &self.items[left], .found_existing = true};
                 }
-                // otherwise left points to the first element that is greater than the item to insert
+                // otherwise left points to the first element that is greater than the item to insert -> insert before that 
             }else{
                 // binary search, but we can't use the std.sort one, because we need to insert if not found
                 // so just copy that one and change it :
@@ -147,38 +304,50 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
                     // Avoid overflowing in the midpoint calculation
                     const mid = left + (right - left) / 2;
                     // Compare the key with the midpoint element
-                    switch(comparatorFn(itemToInsert, self.items[mid])){
+                    switch(comparatorFn(itemToCompareAgainst, self.items[mid])){
                         Order.lt => right = mid,
                         Order.gt => left = mid + 1,
-                        Order.eq => {
-                            // either replace or do nothing
-                            if(opts.ReplaceExisting){
-                                self.items[mid] = itemToInsert;
-                            }
-                            return;
-                        },
+                        Order.eq => return .{.item_ptr = &self.items[mid], .found_existing = true},
                     }
                 }
                 assert(left == right, "after binary search to insert, we should be left with a definitive insertion point", .{});
+                // left again points to first element that is greater than the item to insert -> insert before that
             }
 
-            const insertBefore = left;
+            // didn't find, return the insertion point (and possibly expand the array, and move the items)
 
-            // we should insert if we reach this point -> reserve capacity
-            if(!opts.AssumeCapacity)
-                try self.ensureTotalCapacity(self.items.len + 1);
+            const firstGreater = left;
 
-            // let the `items` slice know that it has grown
-            self.items.len += 1;
+            // assert sensible insertion point
+            assert(firstGreater <= self.items.len, "Find reached too far outside the array", .{});
 
-            // assert sufficient capacity
-            assert(insertBefore < self.items.len, "Insert out of capacity", .{});
+            if(opts.MakeSpaceForNewIfNotFound){
+                if(!opts.AssumeCapacity)
+                    try self.ensureUnusedCapacity(1);
 
-            // shift everything to the right
-            std.mem.copyBackwards(T, self.internalSlice[insertBefore+1..], self.internalSlice[insertBefore..(self.items.len - 1)]); // -1: old item length
+                // let the `items` slice know that it has grown
+                self.items.len += 1;
 
-            // insert
-            self.items[insertBefore] = itemToInsert;
+                // shift everything to the right
+                std.mem.copyBackwards(T, self.internalSlice[firstGreater+1..], self.internalSlice[firstGreater..(self.items.len - 1)]); // -1: old item length
+            }
+
+            return .{.item_ptr = @ptrCast(self.items.ptr + firstGreater), .found_existing = false};
+        }
+
+        // clones the set, uses the same allocator. Does not make any guarantees about the capacity of the new set, just that the actual elements are the same
+        pub fn clone(self:@This()) !@This() {
+            var theClone = try @This().initCapacity(self.internalAllocator, self.items.len);
+            theClone.items.len = self.items.len;
+            @memcpy(theClone.items, self.items);
+            return theClone;
+        }
+
+        pub fn debugPrint(self:@This()) void {
+            for (self.items) |item| {
+                std.debug.print("{}, ", .{item});
+            }
+            std.debug.print("\n", .{});
         }
     };
 
@@ -223,6 +392,66 @@ test "test array set" {
 
     set2.sort();
     try expect(std.mem.eql(u32, set2.items, &[4]u32{0,2,5,7}));
+
+    try expect(set2.remove(2, .{}) == true);
+    try expect(std.mem.eql(u32, set2.items, &[3]u32{0,5,7}));
+    try expect(set2.remove(3, .{}) == false);
+    try expect(std.mem.eql(u32, set2.items, &[3]u32{0,5,7}));
+    try expect(set2.remove(4, .{}) == false);
+    try expect(std.mem.eql(u32, set2.items, &[3]u32{0,5,7}));
+    try expect(set2.remove(5, .{}) == true);
+    try expect(std.mem.eql(u32, set2.items, &[2]u32{0,7}));
+}
+
+test "array set addAll" {
+    const insertionOpts = .{.LinearInsertionSearch = false, .AssumeCapacity = false, .ReplaceExisting = false, .DontSort = false};
+    var set1 = try ArraySet(u32, makeOrder(u32)).init(allocer);
+    try set1.insert(5, insertionOpts);
+    try set1.insert(2, insertionOpts);
+    try set1.insert(7, insertionOpts);
+    try set1.insert(0, insertionOpts);
+
+    var set2 = try ArraySet(u32, makeOrder(u32)).init(allocer);
+    try set2.insert(4, insertionOpts);
+    try set2.insert(1, insertionOpts);
+    try set2.insert(6, insertionOpts);
+    try set2.insert(3, insertionOpts);
+
+    try set1.addAll(set2);
+
+    try expect(std.mem.eql(u32, set1.items, &[8]u32{0,1,2,3,4,5,6,7}));
+
+
+    // add random stuff to the two sets, compare against a single set
+    const numStuffToInsert = 10000;
+
+    set1 = try ArraySet(u32, makeOrder(u32)).initCapacity(allocer, numStuffToInsert * 2);
+    set2 = try ArraySet(u32, makeOrder(u32)).initCapacity(allocer, numStuffToInsert);
+
+    var correctSet = try ArraySet(u32, makeOrder(u32)).initCapacity(allocer, numStuffToInsert * 2 );
+
+    var rnd = std.rand.DefaultPrng.init(0);
+    for(0..numStuffToInsert) |_| {
+        var rand1 = rnd.random().intRangeLessThan(u32, 0, 1000);
+        var rand2 = rnd.random().intRangeLessThan(u32, 0, 1000);
+
+        try set1.insert(rand1, insertionOpts);
+        try set2.insert(rand2, insertionOpts);
+
+        try correctSet.insert(rand1, insertionOpts);
+        try correctSet.insert(rand2, insertionOpts);
+
+        try set1.addAll(set2);
+
+        if(!std.mem.eql(u32, set1.items, correctSet.items)){
+            debugLog("added set (size: {}):", .{set1.items.len});
+            set1.debugPrint();
+            debugLog("check set (size: {}):", .{correctSet.items.len});
+            correctSet.debugPrint();
+            try expect(false);
+        }
+    }
+
 }
 
 test "use array set as map" {
@@ -242,7 +471,8 @@ test "use array set as map" {
     // do x^2 for testing
 
     var rnd = std.rand.DefaultPrng.init(0);
-    for (0..100) |_| {
+    for (0..10000) |i| {
+        _ = i;
         const x = rnd.random().intRangeLessThan(u32, 0, 1 << 15);
         try set.insert(.{x, x*x}, insertionOpts);
     }
