@@ -38,13 +38,11 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
         internalSlice:[]T,
 
         const InsertOpts = struct{
-            ReplaceExisting:bool, // important for example if this is a key/value map and comparator fn only compares the key
-            AssumeCapacity:bool,
-            LinearInsertionSearch:bool,
-            DontSort:bool,
+            ReplaceExisting:bool       = false, // important for example if this is a key/value map and comparator fn only compares the key
+            AssumeCapacity:bool        = false,
+            LinearInsertionSearch:bool = false,
+            DontSort:bool              = false,
         };
-
-        const DefaultInsertOpts = .{.ReplaceExisting = false, .AssumeCapacity = false, .LinearInsertionSearch = false, .DontSort = false};
 
         pub fn init(allocator:std.mem.Allocator) !@This() {
             var self = @This(){
@@ -183,18 +181,17 @@ fn keyCompare(comptime T:type, comptime compare:fn(@typeInfo(T).Struct.fields[0]
 test "test array set" {
     const T = ArraySet(u32, makeOrder(u32));
     var set = try T.init(allocer);
-    const insertionOpts = T.DefaultInsertOpts;
-    try set.insert(5, insertionOpts);
+    try set.insert(5, .{});
     try expect(std.mem.eql(u32, set.items, &[1]u32{5}));
-    try set.insert(2, insertionOpts);
+    try set.insert(2, .{});
     try expect(std.mem.eql(u32, set.items, &[2]u32{2,5}));
-    try set.insert(7, insertionOpts);
+    try set.insert(7, .{});
     try expect(std.mem.eql(u32, set.items, &[3]u32{2,5,7}));
-    try set.insert(0, insertionOpts);
+    try set.insert(0, .{});
     try expect(std.mem.eql(u32, set.items, &[4]u32{0,2,5,7}));
 
     var set2 = try ArraySet(u32, makeOrder(u32)).init(allocer);
-    const insertionOpts2 = .{.LinearInsertionSearch = false, .AssumeCapacity = false, .ReplaceExisting = false, .DontSort = true};
+    const insertionOpts2:T.InsertOpts = .{.DontSort = true};
     try set2.insert(5, insertionOpts2);
     try expect(std.mem.eql(u32, set2.items, &[1]u32{5}));
     try set2.insert(2, insertionOpts2);
@@ -221,7 +218,7 @@ test "use array set as map" {
 
     const MapT = ArraySet(T, comp);
     var set = try MapT.init(allocer);
-    const insertionOpts = MapT.DefaultInsertOpts;
+    const insertionOpts:MapT.InsertOpts = .{};
     // do x^2 for testing
 
     var rnd = std.rand.DefaultPrng.init(0);
