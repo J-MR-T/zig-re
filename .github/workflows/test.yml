@@ -20,4 +20,4 @@ jobs:
     - name: Install dependencies
       run: sudo snap install zig --classic --beta
     - name: Run Tests
-      run: zig test re.zig
+      run: zig test -lc re.zig
