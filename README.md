@@ -3,11 +3,22 @@ RegEx in Zig.
 
 At the moment, parsing of basic RegEx's (literal characters, concatenation, `|`, and `*`) is implemented, with a Graphviz DOT output format.
 
-Translation of regular expressions to $\varepsilon$-NFA to NFA to DFA is implemented and works in basic scenarios, but has some known bugs that are being worked on.
+Translation of regular expressions to $\varepsilon$-NFA to NFA to DFA is implemented and seems to work in somewhat complex scenarios, but is not tested extensively yet. Canonicalization of the final DFA is not implemented yet, and $\varepsilon$-NFA to NFA conversion is not very efficient yet.
 
 Example of a regex combining all current features: `xyz|w*(abc)*de*f`
+
 AST:
 
-![](assets/example.svg)
+![](assets/exampleAST.svg)
 
-<!-- TODO: include eps-NFA, NFA, DFA -->
+$\varepsilon$-NFA:
+
+![](assets/exampleEpsNFA.svg)
+
+NFA (still has the epsilon transitions, but they can all be ignored):
+
+![](assets/exampleNFA.svg)
+
+DFA:
+
+![](assets/exampleDFA.svg)
