@@ -22,3 +22,6 @@ NFA (still has the epsilon transitions, but they can all be ignored):
 DFA:
 
 ![](assets/exampleDFA.svg)
+
+## `comptime` ?
+Building the DFA at compile-time should be possible quite easily (if/when Zig gets working compile-time allocators)[https://github.com/ziglang/zig/issues/1291]. It should also be possible now, but not without significant rewrites.
