@@ -1,5 +1,6 @@
 const std = @import("std");
-const allocer = std.heap.c_allocator;
+const easyAllocer = std.heap.c_allocator;
+const Allocator = std.mem.Allocator;
 fn assert(condition:bool, comptime message:[]const u8, args:anytype) void {
     if (!condition) {
         std.debug.print("\n-----------------------\nAssertion failed: " ++ message ++ "\n-----------------------\nTrace:\n", args);
@@ -13,7 +14,7 @@ fn debugLog(comptime message:[]const u8, args:anytype) void {
 const Tuple = std.meta.Tuple;
 const Order = std.math.Order;
 
-fn initArrayListLikeWithElements(allocator:std.mem.Allocator, comptime ArrayListType:type, elementsSlice:anytype) !ArrayListType{
+fn initArrayListLikeWithElements(allocator:Allocator, comptime ArrayListType:type, elementsSlice:anytype) !ArrayListType{
     var arrayListLike = try ArrayListType.initCapacity(allocator, elementsSlice.len);
     errdefer arrayListLike.deinit();
 
@@ -34,7 +35,7 @@ fn makeOrder(comptime T:type) fn (T, T) Order {
 pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
     return struct {
         items:[]T,
-        internalAllocator:std.mem.Allocator,
+        internalAllocator:Allocator,
         internalSlice:[]T,
 
         const InsertOpts = struct{
@@ -49,7 +50,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             AssumeCapacity:bool            = false,
             LinearInsertionSearch:bool     = false,
         };
-        pub fn init(allocator:std.mem.Allocator) !@This() {
+        pub fn init(allocator:Allocator) !@This() {
             var self = @This(){
                 .items = undefined,
                 .internalSlice = try allocator.alloc(T, 0),
@@ -59,7 +60,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             return self;
         }
 
-        pub fn initCapacity(allocator:std.mem.Allocator, capacity:usize) std.mem.Allocator.Error!@This() {
+        pub fn initCapacity(allocator:Allocator, capacity:usize) Allocator.Error!@This() {
             var self = @This(){
                 .items = undefined,
                 .internalSlice = try allocator.alloc(T, capacity),
@@ -71,7 +72,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             return self;
         }
 
-        pub fn initElements(allocator:std.mem.Allocator, elementsSlice:anytype) std.mem.Allocator.Error!@This() {
+        pub fn initElements(allocator:Allocator, elementsSlice:anytype) Allocator.Error!@This() {
             var self = try initCapacity(allocator, elementsSlice.len);
             for (elementsSlice) |item| {
                 try self.insert(item, .{.AssumeCapacity = true});
@@ -83,7 +84,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             self.internalAllocator.free(self.internalSlice);
         }
 
-        pub fn ensureTotalCapacity(self:*@This(), minNewCapacity:usize) std.mem.Allocator.Error!void {
+        pub fn ensureTotalCapacity(self:*@This(), minNewCapacity:usize) Allocator.Error!void {
             if(minNewCapacity > self.internalSlice.len) {
                 // from array_list.zig
                 var betterCapacity = self.internalSlice.len;
@@ -104,11 +105,11 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             }
         }
 
-        pub fn ensureUnusedCapacity(self:*@This(), newCapacity:usize) std.mem.Allocator.Error!void {
+        pub fn ensureUnusedCapacity(self:*@This(), newCapacity:usize) Allocator.Error!void {
             try self.ensureTotalCapacity(self.items.len + newCapacity);
         }
 
-        pub fn resize(self:*@This(), newSize:usize) std.mem.Allocator.Error!void {
+        pub fn resize(self:*@This(), newSize:usize) Allocator.Error!void {
             try self.ensureTotalCapacity(newSize);
             self.items.len = newSize;
         }
@@ -123,11 +124,11 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
 
         const SpotInfo = struct{item_ptr:*T, found_existing:bool};
 
-        pub fn insert(self:*@This(), itemToInsert:T, comptime opts:InsertOpts) std.mem.Allocator.Error!void{
+        pub fn insert(self:*@This(), itemToInsert:T, comptime opts:InsertOpts) Allocator.Error!void{
             _ = try insertAndGet(self, itemToInsert, opts);
         }
 
-        pub fn insertAndGet(self:*@This(), itemToInsert:T, comptime opts:InsertOpts) std.mem.Allocator.Error!SpotInfo {
+        pub fn insertAndGet(self:*@This(), itemToInsert:T, comptime opts:InsertOpts) Allocator.Error!SpotInfo {
             if(opts.DontSort){
                 if(opts.LinearInsertionSearch)
                     @compileError("LinearInsertionSearch not applicable when DontSort is set");
@@ -152,7 +153,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
 
         // invalidates pointers and capacity guarantees in all cases (!)
         // this could also be done sort of in-place with sufficient guarantees, but that is unnecessarily complex for now
-        pub fn addAll(a:*@This(), b:@This()) std.mem.Allocator.Error!void {
+        pub fn addAll(a:*@This(), b:@This()) Allocator.Error!void {
             if(a.items.ptr == b.items.ptr){
                 assert(a.items.len == b.items.len, "addAll called on the same set with different lengths", .{});
                 return;
@@ -368,8 +369,11 @@ fn keyCompare(comptime T:type, comptime compare:fn(@typeInfo(T).Struct.fields[0]
 }
 
 test "test array set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     const T = ArraySet(u32, makeOrder(u32));
-    var set = try T.init(allocer);
+    var set = try T.init(arena.allocator());
     try set.insert(5, .{});
     try expect(std.mem.eql(u32, set.items, &[1]u32{5}));
     try set.insert(2, .{});
@@ -379,7 +383,7 @@ test "test array set" {
     try set.insert(0, .{});
     try expect(std.mem.eql(u32, set.items, &[4]u32{0,2,5,7}));
 
-    var set2 = try ArraySet(u32, makeOrder(u32)).init(allocer);
+    var set2 = try ArraySet(u32, makeOrder(u32)).init(arena.allocator());
     const insertionOpts2:T.InsertOpts = .{.DontSort = true};
     try set2.insert(5, insertionOpts2);
     try expect(std.mem.eql(u32, set2.items, &[1]u32{5}));
@@ -404,14 +408,17 @@ test "test array set" {
 }
 
 test "array set addAll" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     const insertionOpts = .{.LinearInsertionSearch = false, .AssumeCapacity = false, .ReplaceExisting = false, .DontSort = false};
-    var set1 = try ArraySet(u32, makeOrder(u32)).init(allocer);
+    var set1 = try ArraySet(u32, makeOrder(u32)).init(arena.allocator());
     try set1.insert(5, insertionOpts);
     try set1.insert(2, insertionOpts);
     try set1.insert(7, insertionOpts);
     try set1.insert(0, insertionOpts);
 
-    var set2 = try ArraySet(u32, makeOrder(u32)).init(allocer);
+    var set2 = try ArraySet(u32, makeOrder(u32)).init(arena.allocator());
     try set2.insert(4, insertionOpts);
     try set2.insert(1, insertionOpts);
     try set2.insert(6, insertionOpts);
@@ -425,10 +432,10 @@ test "array set addAll" {
     // add random stuff to the two sets, compare against a single set
     const numStuffToInsert = 10000;
 
-    set1 = try ArraySet(u32, makeOrder(u32)).initCapacity(allocer, numStuffToInsert * 2);
-    set2 = try ArraySet(u32, makeOrder(u32)).initCapacity(allocer, numStuffToInsert);
+    set1 = try ArraySet(u32, makeOrder(u32)).initCapacity(arena.allocator(), numStuffToInsert * 2);
+    set2 = try ArraySet(u32, makeOrder(u32)).initCapacity(arena.allocator(), numStuffToInsert);
 
-    var correctSet = try ArraySet(u32, makeOrder(u32)).initCapacity(allocer, numStuffToInsert * 2 );
+    var correctSet = try ArraySet(u32, makeOrder(u32)).initCapacity(arena.allocator(), numStuffToInsert * 2 );
 
     var rnd = std.rand.DefaultPrng.init(0);
     for(0..numStuffToInsert) |_| {
@@ -455,6 +462,9 @@ test "array set addAll" {
 }
 
 test "use array set as map" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     const T = Tuple(&[2]type{u32, u32});
 
     const S = struct{
@@ -466,7 +476,7 @@ test "use array set as map" {
     const comp = keyCompare(T, S.order_u32);
 
     const MapT = ArraySet(T, comp);
-    var set = try MapT.init(allocer);
+    var set = try MapT.init(arena.allocator());
     const insertionOpts:MapT.InsertOpts = .{};
     // do x^2 for testing
 
@@ -561,55 +571,58 @@ const Token = struct {
     }
 };
 
-fn tokenize(input:[]const u8) error{OutOfMemory}![]Token {
-    // we need to fill in concat tokens, as they are implicit in the input
-    var tokens:[]Token = try allocer.alloc(Token, input.len << 1); // multiply by 2 to account for concat tokens
-    var i:u32 = 0;
-    for (input) |char| {
-        const curToken = Token.initChar(char);
-        // hope this gets unrolled
-        if(i > 0 and curToken.kind.canConcatToLeft() and tokens[i-1].kind.canConcatToRight()) {
-            tokens[i] = Token.initKind(Token.Kind.Concat);
-            i+=1;
-            tokens[i] = curToken;
-        }else{
-            tokens[i] = curToken;
-        }
-        i+=1;
-    }
-    return try allocer.realloc(tokens, i);
-}
-
 const SyntaxError = error{InvalidToken};
 const ParseError = error{OutOfMemory} || SyntaxError;
 
-const TokenIterator = struct {
+const Tokenizer = struct {
     tokens:[]Token,
     cur:u32,
+    internalAllocator:Allocator,
 
-    pub fn init(input:[]const u8) !@This() {
-        const tokens = try tokenize(input);
-        return TokenIterator{
+    // can be used without Tokenizer, but tokenizer is more convenient
+    fn tokenize(input:[]const u8, allocer:Allocator) error{OutOfMemory}![]Token {
+        // we need to fill in concat tokens, as they are implicit in the input
+        var tokens:[]Token = try allocer.alloc(Token, input.len << 1); // multiply by 2 to account for concat tokens
+        var i:u32 = 0;
+        for (input) |char| {
+            const curToken = Token.initChar(char);
+            // hope this gets unrolled
+            if(i > 0 and curToken.kind.canConcatToLeft() and tokens[i-1].kind.canConcatToRight()) {
+                tokens[i] = Token.initKind(Token.Kind.Concat);
+                i+=1;
+                tokens[i] = curToken;
+            }else{
+                tokens[i] = curToken;
+            }
+            i+=1;
+        }
+        return try allocer.realloc(tokens, i);
+    }
+
+    pub fn init(input:[]const u8, allocer:Allocator) !@This() {
+        const tokens = try tokenize(input, allocer);
+        return Tokenizer{
             .tokens = tokens,
             .cur = 0,
+            .internalAllocator = allocer,
         };
     }
 
-    pub fn peek(self:*const TokenIterator) Token {
+    pub fn peek(self:*const Tokenizer) Token {
         return self.tokens[self.cur];
     }
 
-    pub fn next(self:*TokenIterator) Token {
+    pub fn next(self:*Tokenizer) Token {
         const tok = self.tokens[self.cur];
         self.cur += 1;
         return tok;
     }
 
-    pub fn hasNext(self:*const TokenIterator) bool {
+    pub fn hasNext(self:*const Tokenizer) bool {
         return self.cur < self.tokens.len;
     }
     
-    pub fn matchNext(self:*TokenIterator, kind:Token.Kind, comptime advance:bool) bool {
+    pub fn matchNext(self:*Tokenizer, kind:Token.Kind, comptime advance:bool) bool {
         if(self.hasNext() and self.peek().kind == kind) {
             if (advance)
                 self.cur += 1;
@@ -618,18 +631,18 @@ const TokenIterator = struct {
         return false;
     }
 
-    pub fn assertNext(self:*TokenIterator, kind:Token.Kind) SyntaxError!void {
+    pub fn assertNext(self:*Tokenizer, kind:Token.Kind) SyntaxError!void {
         if(!self.matchNext(kind, true)) {
             return SyntaxError.InvalidToken;
         }
     }
 
     pub fn deinit(self:@This()) void {
-        allocer.free(self.tokens);
+        self.internalAllocator.free(self.tokens);
     }
 
     fn debugFmt(self:@This()) !std.ArrayList(u8) {
-        var buf = try std.ArrayList(u8).initCapacity(allocer, self.tokens.len);
+        var buf = try std.ArrayList(u8).initCapacity(easyAllocer, self.tokens.len);
         const writer = buf.writer();
         for (self.tokens) |tok| {
             try writer.print("{?c}", .{tok.char});
@@ -644,52 +657,57 @@ const RegEx = struct {
     kind:Token.Kind,
     char:u8,
 
+    internalAllocator:Allocator,
+
     // for DFA conversion
     nfaStartState:?u32,
     nfaEndState:?u32,
 
-    pub fn initLiteralChar(char:u8) @This() {
+    pub fn initLiteralChar(allocer:Allocator, char:u8) @This() {
         return RegEx{
             .left = null,
             .right = null,
             .kind = Token.Kind.Char,
             .char = char,
+            .internalAllocator = allocer,
             .nfaStartState = null,
             .nfaEndState = null,
         };
     }
 
-    pub fn initOperator(kind:Token.Kind, left:*RegEx, right:?*RegEx) @This() {
+    pub fn initOperator(allocer:Allocator, kind:Token.Kind, left:*RegEx, right:?*RegEx) @This() {
         return RegEx{
             .left = left,
             .right = right,
             .kind = kind,
             .char = kind.precedenceAndChar().char,
+            .internalAllocator = allocer,
             .nfaStartState = null,
             .nfaEndState = null,
         };
     }
 
-    pub fn parsePrimaryExpr(tok:*TokenIterator) ParseError!*@This() {
+    pub fn parsePrimaryExpr(allocer:Allocator, tok:*Tokenizer) ParseError!*@This() {
         var primary:*RegEx = undefined;
         if(tok.matchNext(Token.Kind.LParen, true)) {
-            primary = try parseExpr(0, tok);
+            primary = try parseExpr(allocer, 0, tok);
             try tok.assertNext(Token.Kind.RParen);
         }else{
             primary = try allocer.create(RegEx);
-            primary.* = initLiteralChar(tok.next().char);
+            primary.* = initLiteralChar(allocer, tok.next().char);
         }
 
         if(tok.matchNext(Token.Kind.Kleen, true)) { // kleens prec is ignored because its the highest anyway
             var kleen = try allocer.create(RegEx);
-            kleen.* = initOperator(Token.Kind.Kleen, primary, null);
+            kleen.* = initOperator(allocer, Token.Kind.Kleen, primary, null);
             return kleen;
         }
         return primary;
     }
 
-    pub fn parseExpr(minPrec:u32, tok:*TokenIterator) ParseError!*@This() {
-        var lhs = try parsePrimaryExpr(tok);
+    // TODO expand with allocator choice
+    pub fn parseExpr(allocer:Allocator, minPrec:u32, tok:*Tokenizer) ParseError!*@This() {
+        var lhs = try parsePrimaryExpr(allocer, tok);
         while (tok.hasNext()) {
             // let the upper level parse 'unknown operators' (in this case anything but the binary operators)
             var operatorKind = tok.peek().kind; // we peek, because if we return inside the loop, the upper level needs to consume that token
@@ -704,9 +722,9 @@ const RegEx = struct {
 
 
 
-            var rhs = try parseExpr(prec + 1, tok); // always + 1, because we only have left-associative operators, so we want to bind the same operator again in the next depth, not in the one above
-            var op = try allocer.create(RegEx);
-            op.* = initOperator(operatorKind, lhs, rhs);
+            var rhs = try parseExpr(allocer, prec + 1, tok); // always + 1, because we only have left-associative operators, so we want to bind the same operator again in the next depth, not in the one above
+            var op = try easyAllocer.create(RegEx);
+            op.* = initOperator(allocer, operatorKind, lhs, rhs);
             lhs = op;
         }
         return lhs;
@@ -750,7 +768,7 @@ const RegEx = struct {
         if(!self.isOperator()) {
             assert(self.right == null, "regex has no left operand, but right operand is not null", .{});
 
-            var dfa = try RegExDFA.init();
+            var dfa = try RegExDFA.init(self.internalAllocator);
             dfa.startState = try dfa.addState();
             try dfa.designateStatesFinal(&[1]u32{@truncate(dfa.startState)});
             try dfa.transitions[dfa.startState].insert(.{self.char, dfa.startState}, .{});
@@ -760,12 +778,15 @@ const RegEx = struct {
             return dfa;
         }
 
-        var nfa = try RegExNFA.init();
+        var arena = std.heap.ArenaAllocator.init(easyAllocer);
+        defer arena.deinit();
+
+        var nfa = try RegExNFA.init(arena.allocator());
 
         const VisitKind = enum{WAY_DOWN, WAY_UP};
 
         const VisitInfo = struct{regex:*RegEx, kind:VisitKind};
-        var worklist = try initArrayListLikeWithElements(allocer, std.ArrayList(VisitInfo), &[1]VisitInfo{.{.regex = self, .kind = VisitKind.WAY_DOWN}});
+        var worklist = try initArrayListLikeWithElements(arena.allocator(), std.ArrayList(VisitInfo), &[1]VisitInfo{.{.regex = self, .kind = VisitKind.WAY_DOWN}});
 
         while(worklist.items.len > 0) {
             try worklist.ensureUnusedCapacity(2);
@@ -895,10 +916,11 @@ const RegEx = struct {
 };
 
 // (eps-)NFA, removing eps transitions, powerset construction, then we can simply construct the eps-NFA from the regex and then convert it to a DFA to perform checks
-// TODO constructing the eps-NFA from a regex is the only thing left to do
 
+// alphabet is implicitly the space of u8.
+// passing an arena allocator and *not* calling deinit on the DFA, just on the arena is recommended. If you need to use another allocator, call deinit on the DFA directly
 const RegExDFA = struct{
-    const Transition = Tuple(&[_]type{u8, u32});
+    const Transition                  = Tuple(&[_]type{u8, u32});
     const EntireTransitionMapOfAState = ArraySet(Transition, keyCompare(Transition, makeOrder(u8)));
     const UniqueStateSet              = ArraySet(u32, makeOrder(u32));
 
@@ -911,13 +933,24 @@ const RegExDFA = struct{
     transitions:[]EntireTransitionMapOfAState,
     finalStates:UniqueStateSet,
 
-    pub fn init() !@This() {
+    internalAllocator:Allocator,
+
+    pub fn init(allocer:Allocator) !@This() {
         return RegExDFA{
             .startState  = 0,
             .numStates   = 0,
             .transitions = try allocer.alloc(EntireTransitionMapOfAState, 0),
-            .finalStates = try UniqueStateSet.init(allocer)
+            .finalStates = try UniqueStateSet.init(allocer),
+            .internalAllocator = allocer,
         };
+    }
+    
+    pub fn deinit(self:@This()) void {
+        for (self.transitions) |transitionsOfState| {
+            transitionsOfState.deinit();
+        }
+        self.internalAllocator.free(self.transitions);
+        self.finalStates.deinit();
     }
 
     pub fn addState(self:*@This()) !u32{
@@ -927,9 +960,9 @@ const RegExDFA = struct{
 
     pub fn addStates(self:*@This(), comptime n:comptime_int) !void{
         self.numStates += n;
-        self.transitions = try allocer.realloc(self.transitions, self.numStates);
+        self.transitions = try self.internalAllocator.realloc(self.transitions, self.numStates);
         for(self.numStates-n..self.numStates) |i| {
-            self.transitions[i] = try EntireTransitionMapOfAState.initCapacity(allocer, defaultTransitionCapacityForState);
+            self.transitions[i] = try EntireTransitionMapOfAState.initCapacity(self.internalAllocator, defaultTransitionCapacityForState);
         }
     }
 
@@ -1018,6 +1051,8 @@ const FiniteAutomaton = union(enum){
     }
 };
 
+// alphabet is implicitly the space of u8.
+// passing an arena allocator and *not* calling deinit on the NFA, just on the arena is recommended. If you need to use another allocator, call deinit on the NFA directly
 const RegExNFA = struct {
     const UniqueStateSet = ArraySet(u32, makeOrder(u32));
     const EpsTransitionsForOneTerminal = Tuple(&[_]type{?u8, UniqueStateSet});
@@ -1046,24 +1081,28 @@ const RegExNFA = struct {
     transitions:[]EntireTransitionMapOfAState,
     finalStates:FinalStates, 
 
-    internalArena:std.heap.ArenaAllocator,
-    internalAllocator:std.mem.Allocator,
+    internalAllocator:Allocator,
 
-    pub fn init() !@This() {
+    pub fn init(allocer:Allocator) !@This() {
         var nfa                = RegExNFA{
             .startState        = 0,
             .numStates         = 0,
-            .transitions       = undefined,
-            .finalStates       = undefined,
-            .internalArena     = std.heap.ArenaAllocator.init(allocer),
-            .internalAllocator = undefined,
+            .transitions       = try allocer.alloc(EntireTransitionMapOfAState, 0),
+            .finalStates       = try FinalStates.init(allocer),
+            .internalAllocator = allocer,
         };
-        // TODO panics for some reason (doesnt seem to be a recoverable Error), so im just using the allocer again for now. That will leak like crazy, so this definitely needs to be fixed
-        //nfa.internalAllocator = nfa.internalArena.allocator();
-        nfa.internalAllocator = allocer;
-        nfa.transitions       = try nfa.internalAllocator.alloc(EntireTransitionMapOfAState, 0);
-        nfa.finalStates       = try FinalStates.init(nfa.internalAllocator);
         return nfa;
+    }
+
+    pub fn deinit(self:@This()) void {
+        for (self.transitions) |transitionsOfState| {
+            for(transitionsOfState.items) |transition| {
+                transition[1].deinit();
+            }
+            transitionsOfState.deinit();
+        }
+        self.internalAllocator.free(self.transitions);
+        self.finalStates.deinit();
     }
 
     pub fn addState(self:*@This()) !u32{
@@ -1192,7 +1231,7 @@ const RegExNFA = struct {
             }
         }, std.hash_map.default_max_load_percentage).init(self.internalAllocator);
         
-        var dfa = try RegExDFA.init();
+        var dfa = try RegExDFA.init(self.internalAllocator);
         // worklist of nfa (and generated i.e. powerset-) states to visit
         var worklist = try std.ArrayList(UniqueStateSet).initCapacity(self.internalAllocator, 8);
 
@@ -1272,14 +1311,16 @@ const expect = std.testing.expect;
 
 test "tokenizer" {
     const input = "xyz|w*(abc)*de*f";
-    var tok = try TokenIterator.init(input);
+    var tok = try Tokenizer.init(input, std.testing.allocator);
     defer tok.deinit();
     const buf = try tok.debugFmt();
     try expect(std.mem.eql(u8, buf.items, "x y z|w* (a b c)* d e* f"));
 }
 
 test "ab* DFA" {
-    var dfa = try RegExDFA.init();
+    var dfa = try RegExDFA.init(std.testing.allocator);
+    defer dfa.deinit();
+
     try dfa.addStates(2);
     const a = 0;
     const b = 1;
@@ -1299,13 +1340,16 @@ test "ab* DFA" {
 }
 
 test "ab|aaa NFA" {
-    var nfa = try RegExNFA.init();
+    var nfa = try RegExNFA.init(std.testing.allocator);
+    defer nfa.deinit();
+
     try nfa.addStates(6);
     try nfa.addTransition(0, 'a', 1);
     try expect(nfa.transitions[0].findByKey('a') != null);
     try expect(nfa.transitions[0].findByKey('a').?.items[0] == 1);
     try expect(nfa.transitions[0].items[0][1].items[0] == 1);
     try expect(nfa.transitions[0].findByKey('b') == null);
+
     try nfa.addTransition(0, 'a', 2);
     try nfa.addTransition(1, 'b', 3);
     try nfa.addTransition(2, 'a', 4);
@@ -1316,7 +1360,10 @@ test "ab|aaa NFA" {
 }
 
 test "NFA eps removal" {
-    var nfa = try RegExNFA.init();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var nfa = try RegExNFA.init(arena.allocator());
     try nfa.addStates(2);
     try nfa.addTransition(0, null, 1);
     try nfa.addTransition(1, 'a', 1);
@@ -1333,7 +1380,10 @@ test "NFA eps removal" {
 }
 
 test "NFA transitive eps removal" {
-    var nfa = try RegExNFA.init();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var nfa = try RegExNFA.init(arena.allocator());
     try nfa.addStates(3);
     try nfa.addTransition(0, null, 1);
     try nfa.addTransition(1, null, 2);
@@ -1350,7 +1400,10 @@ test "NFA transitive eps removal" {
 }
 
 test "NFA simple powerset construction" {
-    var nfa = try RegExNFA.init();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var nfa = try RegExNFA.init(arena.allocator());
     try nfa.addStates(6);
     try nfa.addTransition(0, 'a', 1);
     try nfa.addTransition(0, 'a', 2);
@@ -1379,7 +1432,10 @@ test "NFA simple powerset construction" {
 }
 
 test "complex eps-NFA powerset construction" {
-    var nfa = try RegExNFA.init();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var nfa = try RegExNFA.init(arena.allocator());
     try nfa.addStates(4);
     try nfa.addTransition(0, null, 2);
     try nfa.addTransition(0, 'a', 1);
@@ -1403,9 +1459,12 @@ test "complex eps-NFA powerset construction" {
 test "regex to dfa" {
     const input = "xyz|w*(abc)*de*f";
 
-    var tok = try TokenIterator.init(input);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var tok = try Tokenizer.init(input, arena.allocator());
     defer tok.deinit();
-    const regex = try RegEx.parseExpr(0, &tok);
+    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
     assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
 
     var dfa = try regex.toDFA();
@@ -1433,74 +1492,19 @@ test "regex to dfa" {
 
 pub fn main() !void {
     const writer = std.io.getStdOut().writer();
-    _ = writer;
-    //const a = RegEx.initLiteralChar('a');
-    //const b = RegEx.initLiteralChar('b');
-    //
-    //const aOrB = RegEx.initOperator(Token.Kind.Union, &a, &b);
-    //try aOrB.printDOTRoot(writer);
 
-    //const input = "xyz|w*(abc)*de*f";
-    //var tok = try Tokenizer.init(input);
-    //defer tok.deinit();
-    //const regex = try RegEx.parseExpr(0, &tok);
-    //assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
-    //try regex.printDOTRoot(writer);
+    const input = "xyz|w*(abc)*de*f";
 
-    //var nfa = try RegExNFA.init();
-    //try nfa.addStates(4);
-    //try nfa.addTransition(0, null, 2);
-    //try nfa.addTransition(0, 'a', 1);
-    //try nfa.addTransition(1, 'b', 1);
-    //try nfa.addTransition(2, 'c', 1);
-    //try nfa.addTransition(2, 'd', 3);
-    //try nfa.addTransition(2, 'd', 1);
-    //try nfa.addTransition(1, 'e', 0);
-    //try nfa.addTransition(1, 'e', 3);
-    //try nfa.addTransition(3, null, 1);
-    //
-    //try nfa.designateStatesFinal(&[_]u32{3});
-    //var nfaAsFA = FiniteAutomaton{.nfa = nfa};
-    //try nfaAsFA.printDOT(writer);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    //try nfa.backUpEpsTransitions();
-    //var dfa = try nfa.toPowersetConstructedDFA();
-    //var dfaAsFA = FiniteAutomaton{.dfa = dfa};
-    //try dfaAsFA.printDOT(writer);
+    var tok = try Tokenizer.init(input, arena.allocator());
+    defer tok.deinit();
+    const regex = try RegEx.parseExpr(0, &tok);
+    assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
 
-    //var nfa = try RegExNFA.init();
-    //try nfa.addStates(2);
-    //try nfa.addTransition(0, null, 1);
-    //try nfa.addTransition(1, 'a', 1);
-    //try nfa.designateStatesFinal(&[_]u32{1});
-    //
-    //try expect(!nfa.finalStates.contains(0));
-    //try expect(nfa.transitions[0].findByKey('a') == null);
-    //
-    //try nfa.backUpEpsTransitions();
-    //
-    //try expect(nfa.finalStates.contains(0));
+    var dfa = try regex.toDFA();
+    const fa = FiniteAutomaton{.dfa = &dfa};
 
-    var nfa = try RegExNFA.init();
-    try nfa.addStates(2);
-    try nfa.addTransition(0, null, 1);
-    try nfa.addTransition(1, 'a', 1);
-    try nfa.designateStatesFinal(&[_]u32{1});
-
-    try expect(!nfa.finalStates.contains(0));
-    try expect(nfa.transitions[0].findByKey('a') == null);
-
-    try nfa.backUpEpsTransitions();
-
-    try expect(nfa.finalStates.contains(0));
-
-    // print
-    for(0.., nfa.transitions) |from,transitionsForState| {
-        for(transitionsForState.items) |transition| {
-            debugLog("from {} with {?} to {}", .{from, transition[0], transition[1]});
-        }
-    }
-
-    try expect(nfa.transitions[0].findByKey('a') != null);
-    try expect((nfa.transitions[0].findByKey('a').?).items[0] == 1);
+    try fa.printDOT(writer);
 }
