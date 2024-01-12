@@ -899,8 +899,8 @@ const RegEx = struct {
         nfa.startState = self.nfaStartState.?;
         try nfa.designateStatesFinal(&[1]u32{self.nfaEndState.?});
 
-
         try nfa.backUpEpsTransitions();
+
         return try nfa.toPowersetConstructedDFA();
     }
 
@@ -993,7 +993,7 @@ const FiniteAutomaton = union(enum){
             FiniteAutomaton.dfa => try writer.print("DFA", .{}),
             FiniteAutomaton.nfa => try writer.print("NFA", .{}),
         }
-        try writer.print("{{ node[shape=circle];", .{});
+        try writer.print("{{ node[shape=circle]; mode = \"hier\"; layout = \"neato\"; edge[len = 2.5,  weight = 2.5]; ", .{});
 
         const startState = switch(self){
             inline else => |case| case.startState
