@@ -1495,12 +1495,12 @@ pub fn main() !void {
 
     const input = "xyz|w*(abc)*de*f";
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(easyAllocer);
     defer arena.deinit();
 
     var tok = try Tokenizer.init(input, arena.allocator());
     defer tok.deinit();
-    const regex = try RegEx.parseExpr(0, &tok);
+    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
     assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
 
     var dfa = try regex.toDFA();
