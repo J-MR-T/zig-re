@@ -10,6 +10,10 @@ fn assert(condition:bool, comptime message:[]const u8, args:anytype) void {
 fn debugLog(comptime message:[]const u8, args:anytype) void {
     std.debug.print(message ++ "\n", args);
 }
+fn structFieldType(comptime T:type, comptime fieldIndex:comptime_int) type{
+    return @typeInfo(T).Struct.fields[fieldIndex].type;
+}
+
 
 const Tuple = std.meta.Tuple;
 const Order = std.math.Order;
@@ -270,7 +274,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
         }
 
         // finds 
-        pub fn findByKey(self:*const @This(), keyToCompareAgainst:@typeInfo(T).Struct.fields[0].type) ?@typeInfo(T).Struct.fields[1].type{
+        pub fn findByKey(self:*const @This(), keyToCompareAgainst:structFieldType(T, 0)) ?structFieldType(T, 1){
             if(@typeInfo(T).Struct.fields.len != 2)
                 @compileError("findByKey only works when this set is being used as a key value map, i.e. with two-long tuple elements");
 
@@ -360,7 +364,7 @@ fn oldIntCast(x:anytype, comptime ResultType:type) ResultType {
 }
 
 // TODO there has to be a better way to 'save' the Key Type locally somehow, to avoid code dupe
-fn keyCompare(comptime T:type, comptime compare:fn(@typeInfo(T).Struct.fields[0].type, @typeInfo(T).Struct.fields[0].type) Order) fn(T, T) Order {
+fn keyCompare(comptime T:type, comptime compare:fn(structFieldType(T, 0), structFieldType(T, 0)) Order) fn(T, T) Order {
     return struct {
         pub fn f(a:T, b:T) Order {
             return compare(a[0], b[0]);
