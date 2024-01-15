@@ -26,5 +26,9 @@ jobs:
       run: |
            sudo snap install zig --classic --beta
            pip install meson ninja
+    - name: Debug CI
+      run: |
+           meson --help
+           meson setup thirdparty/fadec/build thirdparty/fadec
     - name: Run Tests
       run: zig build test
