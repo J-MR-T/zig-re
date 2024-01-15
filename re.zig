@@ -987,6 +987,57 @@ const RegExDFA = struct{
         return self.finalStates.contains(curState);
     }
 
+    const ProfilingInformation = struct{
+        transitionFequencyPerState:[]ArraySet(Tuple(&[_]type{u8, u32}), keyCompare(Tuple(&[_]type{u8, u32}), makeOrder(u8))),
+        // only counts if we left the state again (so that all transition frequencies add up to the number of visits)
+        visitsPerState:[]u32,
+
+        internalAllocator:Allocator,
+
+        pub fn init(allocer:Allocator, numStates:u32) !@This() {
+            var info = ProfilingInformation{
+                .transitionFequencyPerState = try allocer.alloc(ArraySet(Tuple(&[_]type{u8, u32}), keyCompare(Tuple(&[_]type{u8, u32}), makeOrder(u8))), numStates),
+                .visitsPerState = try allocer.alloc(u32, numStates),
+                .internalAllocator = allocer,
+            };
+
+            @memset(info.visitsPerState, 0);
+
+            for (info.transitionFequencyPerState) |*transitions| {
+                transitions.* = try ArraySet(Tuple(&[_]type{u8, u32}), keyCompare(Tuple(&[_]type{u8, u32}), makeOrder(u8))).init(allocer);
+            }
+
+            return info;
+        }
+
+        pub fn deinit(self:@This()) void {
+            for (self.transitionFequencyPerState) |transitions| {
+                transitions.deinit();
+            }
+            self.internalAllocator.free(self.transitionFequencyPerState);
+            self.internalAllocator.free(self.visitsPerState);
+        }
+    };
+
+    pub fn profileOneRun(self:@This(), word:[]const u8, profile:*ProfilingInformation) !void {
+        var curState:u32 = self.startState;
+        for(word) |c| {
+            // possibly return first so that the visit count only counts if we left the state again
+            const nextState = self.transitions[curState].findByKey(c) orelse return;
+
+            profile.visitsPerState[curState] += 1;
+            var spot = try profile.transitionFequencyPerState[curState].findSpot(.{c, undefined}, .{.MakeSpaceForNewIfNotFound = true});
+            if(spot.found_existing){
+                spot.item_ptr.*[1] += 1;
+            }else{
+                spot.item_ptr.*[0] = c;
+                spot.item_ptr.*[1] = 1;
+            }
+
+            curState = nextState;
+        }
+    }
+
     const CompilationError = error{DFATooLargeError} || FeError || std.os.MMapError;
 
     const CompiledRegExDFA = struct{
@@ -1755,6 +1806,46 @@ test "xyz|w*(abc)*de*f regex to dfa compiled" {
     var compiledDFA = try dfa.compile(&arena);
 
     try xyzTestCases(compiledDFA, RegExDFA.CompiledRegExDFA.isInLanguageCompiled);
+}
+
+test "regex dfa profiling" {
+    const input = "xyz|w*(abc)*de*f";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var tok = try Tokenizer.init(arena.allocator(), input);
+    defer tok.deinit();
+    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+
+    var dfa = try regex.toDFA(.{});
+
+    var profileInfo = try RegExDFA.ProfilingInformation.init(std.testing.allocator, dfa.numStates);
+    defer profileInfo.deinit();
+
+    for(0..3) |i| {
+        const runNumber = i+1;
+
+        try dfa.profileOneRun("xyz", &profileInfo);
+        try expect(runNumber == profileInfo.transitionFequencyPerState[dfa.startState].findByKey('x').?);
+        const stateOne = dfa.transitions[dfa.startState].findByKey('x').?;
+        try expect(runNumber == profileInfo.transitionFequencyPerState[stateOne].findByKey('y').?);
+        const stateTwo = dfa.transitions[stateOne].findByKey('y').?;
+        try expect(runNumber == profileInfo.transitionFequencyPerState[stateTwo].findByKey('z').?);
+
+        try expect(runNumber == profileInfo.visitsPerState[dfa.startState]);
+        try expect(runNumber == profileInfo.visitsPerState[stateOne]);
+        try expect(runNumber == profileInfo.visitsPerState[stateTwo]);
+        // don't increment the final state, as that is not left
+        try expect(0 == profileInfo.visitsPerState[dfa.transitions[stateTwo].findByKey('z').?]);
+
+        // these should be the only entries -> check that all are runNumber
+        for(profileInfo.transitionFequencyPerState) |transitions| {
+            for(transitions.items) |transition| {
+                try expect(transition[1] == runNumber);
+            }
+        }
+    }
 }
 
 const fadec = @cImport({
