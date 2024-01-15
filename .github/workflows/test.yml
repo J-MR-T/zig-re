@@ -19,9 +19,12 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - uses: actions/setup-python@v1
+      with:
+        python-version: '3.x'
     - name: Install dependencies
       run: |
            sudo snap install zig --classic --beta
-           sudo apt install meson
+           pip install meson ninja
     - name: Run Tests
       run: zig build test
