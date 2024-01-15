@@ -20,6 +20,10 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Install dependencies
-      run: sudo snap install zig --classic --beta
+      run: |
+           sudo snap install zig --classic --beta
+           sudo apt-get install python3 python3-pip python3-setuptools python3-wheel ninja-build
+           # might break at some point and need --break-system-packages
+           pip3 install --user meson
     - name: Run Tests
       run: zig build test
