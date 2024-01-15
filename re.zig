@@ -1068,7 +1068,7 @@ const RegExDFA = struct{
         // - binary search based switching might be fastest, if the number of transitions per state is medium to high
         // - indirect jumps using hashtables might be fastest, if branch target buffer overflows aren't too common, or if the number of transitions per state is very high
 
-        // TODO there are 2 options for checking whether we have the final char:
+        // there are 2 options for checking whether we have the final char:
         // - either check when/after increasing the pointer, if we are at the end of the word
         //   - this would incur a check for every char, but would not make the function harder to use
         // - or make sure the word is zero terminated, and include a branch to a check on the current char being zero
@@ -1170,6 +1170,7 @@ const RegExDFA = struct{
         @memset(startOfState, null);
 
         var jumpsToPatch = try std.ArrayList(struct{instrToPatch:*u8, targetState:u32}).initCapacity(self.internalAllocator, self.numStates);
+        defer jumpsToPatch.deinit();
 
         var worklistI:usize = 0;
         while(worklistI < self.numStates) : (worklistI += 1) {
@@ -1177,7 +1178,7 @@ const RegExDFA = struct{
             startOfState[curState] = @ptrCast(cur);
 
             // get current char
-            try encode(&cur, fadec.FE_MOV8rm, .{fadec.FE_CX, std.math.minInt(i64) | oldIntCast(fadec.FE_AX, i64) << 32}); // << 32 is the same as FE_MEM(FE_AX, 0, 0, 0), but that doesn't work, c translation does not work there
+            try encode(&cur, fadec.FE_MOV8rm, .{fadec.FE_CX, std.math.minInt(i64) | oldIntCast(fadec.FE_AX, i64) << 32}); // std.math.minInt(i64) | ... << 32 is the same as FE_MEM(FE_AX, 0, 0, 0), but that doesn't work, c translation does not work there
 
             // increment the pointer
             try encode(&cur, fadec.FE_ADD64ri, .{fadec.FE_AX, 1});
@@ -1195,7 +1196,7 @@ const RegExDFA = struct{
                 // cmp cl, transitionChar
                 try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, transition[0]});
 
-                // je targetStatee 
+                // je targetState
                 if(startOfState[targetState]) |jeTarget| {
                     // just encode, and let fadec pick the best encoding
                     try encode(&cur, fadec.FE_JZ, .{oldIntCast(@intFromPtr(jeTarget), fadec.FeOp)});
