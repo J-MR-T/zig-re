@@ -6,6 +6,8 @@ on:
     - master
     paths:
     - "re.zig"
+    - "thirdparty/*"
+    - "build.zig"
     - ".github/**/*.yml"
   pull_request:
 
@@ -20,4 +22,4 @@ jobs:
     - name: Install dependencies
       run: sudo snap install zig --classic --beta
     - name: Run Tests
-      run: zig test -lc re.zig
+      run: zig build test

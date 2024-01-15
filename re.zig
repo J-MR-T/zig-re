@@ -14,6 +14,7 @@ fn structFieldType(comptime T:type, comptime fieldIndex:comptime_int) type{
     return @typeInfo(T).Struct.fields[fieldIndex].type;
 }
 
+const expect = std.testing.expect;
 
 const Tuple = std.meta.Tuple;
 const Order = std.math.Order;
@@ -584,7 +585,7 @@ const Tokenizer = struct {
     internalAllocator:Allocator,
 
     // can be used without Tokenizer, but tokenizer is more convenient
-    fn tokenize(input:[]const u8, allocer:Allocator) error{OutOfMemory}![]Token {
+    fn tokenize(allocer:Allocator, input:[]const u8) error{OutOfMemory}![]Token {
         // we need to fill in concat tokens, as they are implicit in the input
         var tokens:[]Token = try allocer.alloc(Token, input.len << 1); // multiply by 2 to account for concat tokens
         var i:u32 = 0;
@@ -603,8 +604,8 @@ const Tokenizer = struct {
         return try allocer.realloc(tokens, i);
     }
 
-    pub fn init(input:[]const u8, allocer:Allocator) !@This() {
-        const tokens = try tokenize(input, allocer);
+    pub fn init(allocer:Allocator, input:[]const u8) !@This() {
+        const tokens = try tokenize(allocer, input);
         return Tokenizer{
             .tokens = tokens,
             .cur = 0,
@@ -759,7 +760,8 @@ const RegEx = struct {
         try writer.print("}}\n", .{});
     }
 
-    pub fn toDFA(self:*@This()) !RegExDFA {
+    // if called without options, this function just uses the RegEx's allocator for the DFA, i.e. that allocators lifetime has to exceed the lifetime of the DFA
+    pub fn toDFA(self:*@This(), opts:struct{overrideAllocator:?Allocator = null}) !RegExDFA {
         // broad overview: convert regex to eps-nfa to nfa to dfa.
         // vague idea (mostly my own, no idea if this is good): 
         // 1. iterate in post order over the AST, create and save start and end states for each operator node (all except the leafs), and connect the with the transitions. Distinguish between whether the operator has leaf- (i.e. char-) operands or other operator operands
@@ -905,7 +907,7 @@ const RegEx = struct {
 
         try nfa.backUpEpsTransitions();
 
-        return try nfa.toPowersetConstructedDFA();
+        return try nfa.toPowersetConstructedDFA(.{.overrideAllocator = opts.overrideAllocator orelse self.internalAllocator});
     }
 
     // mostly for debugging
@@ -977,13 +979,245 @@ const RegExDFA = struct{
         }
     }
 
-
-    pub fn isInLanguage(self:@This(), word:[]const u8) bool{
+    pub fn isInLanguageInterpreted(self:@This(), word:[]const u8) bool{
         var curState:u32 = self.startState;
         for(word) |c| {
             curState = self.transitions[curState].findByKey(c) orelse return false;
         }
         return self.finalStates.contains(curState);
+    }
+
+    const CompilationError = error{DFATooLargeError} || FeError || std.os.MMapError;
+
+    const CompiledRegExDFA = struct{
+        jitBuf:[]u8,
+        finalStates:*const UniqueStateSet,
+        recognize:*fn(*const UniqueStateSet, word:[:0] const u8) bool,
+
+        pub fn isInLanguageCompiled(self:@This(), word:[:0] const u8) bool{
+            return self.recognize(self.finalStates, word);
+        }
+
+        // finalStates obviously needs to have a lifetime that is at least as long as the compiled DFA
+        pub fn init(finalStates:*const UniqueStateSet) std.os.MMapError!@This() {
+            // we just map 2 GiB by default, and mremap it later to the actual size
+            return CompiledRegExDFA{
+                .jitBuf = try std.os.mmap(
+                    null,
+                    1 << 31,
+                    std.os.PROT.READ | std.os.PROT.WRITE | std.os.PROT.EXEC,
+                    std.os.MAP.PRIVATE | std.os.MAP.ANONYMOUS,
+                    -1,
+                    0,
+                ),
+                .finalStates = finalStates,
+                .recognize = undefined,
+            };
+        } 
+
+        pub fn shrinkToSize(self:*@This(), shrunkSize:usize) !void {
+            self.jitBuf.len = shrunkSize;
+            // TODO call mremap through libc, no zig bindings yet :(
+            // (page align length first)
+        }
+
+        pub fn deinit(self:@This()) void {
+            std.os.munmap(self.jitBuf.ptr, self.jitBuf.len);
+        }
+
+        pub fn debugPrint(self:@This()) void {
+            debugLog("compiled DFA:", .{});
+
+            var cur = self.jitBuf.ptr;
+            while(@intFromPtr(cur) < @intFromPtr(self.jitBuf.ptr) + self.jitBuf.len) {
+                if(@intFromPtr(cur) == @intFromPtr(self.recognize))
+                    debugLog("start of regognize:", .{});
+
+                var instr:fadec.FdInstr = undefined;
+
+                const numBytes = fadec.fd_decode(cur, self.jitBuf.len, 64, 0, &instr);
+                if(numBytes < 0){
+                    debugLog("error decoding instruction at byte: {}", .{numBytes});
+                    return;
+                }
+                cur += oldIntCast(numBytes, usize);
+
+                var fmtBuf:[64:0]u8 = undefined;
+                fadec.fd_format(&instr, &fmtBuf, fmtBuf.len);
+
+                debugLog("{s}", .{@as([*:0]u8, &fmtBuf)});
+            }
+        }
+    };
+
+    // TODO could the compilation somehow be SIMD-d? doing all the comparisons at once might be faster, but the branching and scalar/vector mixing might make it slower than normal
+
+    // for now, requires that the self-DFA has been allocated with an arena (and this arena has been passed), to be able to ensure the total code size will be < 2 GiB
+    // for now, requires the original DFA to be live for the lifetime of the compiled DFA, because it needs to be able to access the final states
+    pub fn compile(self:@This(), arena:*std.heap.ArenaAllocator) CompilationError!CompiledRegExDFA{
+        // there are different options for implementing the jumps to the next state, equivalent to the approaches for lowering switch statements:
+        // let's try a linear if-else chain first (could later order this by estimated frequency of each transition, by profiling this on the interpreted version). Should be fastest for a low number of transitions per state 
+        // - binary search based switching might be fastest, if the number of transitions per state is medium to high
+        // - indirect jumps using hashtables might be fastest, if branch target buffer overflows aren't too common, or if the number of transitions per state is very high
+
+        // TODO there are 2 options for checking whether we have the final char:
+        // - either check when/after increasing the pointer, if we are at the end of the word
+        //   - this would incur a check for every char, but would not make the function harder to use
+        // - or make sure the word is zero terminated, and include a branch to a check on the current char being zero
+        //   - this would only incur a check if we actually reached the end of the word, but require the user to have a zero-terminated string, and it forbids using fallthrough for the last possible transition (although - with profiling info - that should be the most unlikely one)
+        //   - currently only this option is implemented
+
+        const executableRegionSizeEstimate = 
+            // data region
+            // nothing for if-else chain or binary search based solutions
+            0
+            +
+            // text/code region
+            // for each state:
+            // add rax, 1 (4 bytes); increment the pointer to the word (inc rax would be 3 bytes, but Agner Fog recommends not to use inc, so add it is for now)
+            // mov cl, BYTE PTR [rax] (2 bytes); load the current char into cl for comparisons
+            // <transitions, see below>
+            // end:
+            // - fallthrough for last transition and jne <trap state>
+            // - or normal je for last transition, and then a jmp <trap state> 
+            self.numStates*(4+2)
+            +
+            // lets say approx. 3 transitions per state
+            // per transitions for the if-else chain:
+            // cmp cl, IMM (3 bytes)
+            // je (6 bytes (short encoding (3 bytes) is likely for some, but not all)) for each transition
+            self.numStates*3*(3+6)
+            // each indirect branch of the form `jmp [rax-0xbeef]` is 6 bytes long
+            // -> for the indirect branch model this is an exact estimate
+            //self.numStates*6
+            ;
+        _ = executableRegionSizeEstimate;
+
+        // this is obviously a ridiculous overestimate, but it is definitely safe, and should still allow gargantuan regexes
+        const upperMemoryLimit = arena.queryCapacity() * (3+6) + self.numStates*(4+2);
+        if(upperMemoryLimit > 1 << 31)
+            return error.DFATooLargeError;
+
+
+        var compiledDFA = try CompiledRegExDFA.init(&self.finalStates);
+
+        const buf = compiledDFA.jitBuf;
+        var cur:[*]u8 = buf.ptr;
+
+        // setup
+        // register layout (at the start, rsi contains the pointer to the word, but that is overridden immediately):
+        // rax: pointer to word
+        // cl: constantly updated to contain the current char of the word
+        // rdi: pointer to finalStates for checking whether the state at the end is a final state
+        // rsi: current state
+
+        // generate trap state code at the start -> we know the jump offset right away
+        // trap state -> return false
+        const trapStatePtr = cur; 
+
+        try encode(&cur, fadec.FE_ADD64ri, .{fadec.FE_SP, 8});
+        try encode(&cur, fadec.FE_MOV64ri, .{fadec.FE_AX, @intFromBool(false)});
+        try encode(&cur, fadec.FE_RET, .{});
+
+        // same for when we have reached the end of the word
+        const checkFinalStatePtr = cur;
+        
+        // we basically need to do:
+        // return finalStates.contains(curState);
+        // so just call that function, and pass on its return value to the caller of our function
+        // we can do this even quicker by not even using a call, but just cleaning up our whole stackframe and jumping there immediately. Our return address will then be used by finalStates.contains to return to the proper place. Also keeps the CPU shadow call stack in tact.
+
+        // stack cleanup and "return" (by jumping to finalStates.contains)
+        try encode(&cur, fadec.FE_ADD64ri, .{fadec.FE_SP, 8});
+        // finalStates self arg is already in RDI, stays there from the call to this function
+        // real arg (the state to check) is implicitly already in RSI, the states that branch to this code segment put their own state number in RSI
+
+        // mov rax, finalStates.contains
+        try encode(&cur, fadec.FE_MOV64ri, .{fadec.FE_AX, oldIntCast(@intFromPtr(&UniqueStateSet.contains), fadec.FeOp)});
+        // jmp rax
+        try encode(&cur, fadec.FE_JMPr, .{fadec.FE_AX});
+
+        const recognizerFunctionEntryPtr = cur;
+
+        // stackframe setup
+        // align stack to 16 bytes
+        try encode(&cur, fadec.FE_SUB64ri, .{fadec.FE_SP, 8});
+
+        // mov rax, rsi; move the passed pointer to the word into rax
+        try encode(&cur, fadec.FE_MOV64rr, .{fadec.FE_AX, fadec.FE_SI});
+
+
+        // traverse the DFA in BFS from the start state (to try to ensure that jumps are as short as possible and some can be left out if they're the last option)
+        var worklist = try std.ArrayList(u32).initCapacity(self.internalAllocator, self.numStates);
+        defer worklist.deinit();
+        worklist.appendAssumeCapacity(self.startState);
+        // we're not removing from the worklist, moving elements to do that would be unnecessary
+
+        var visited = try self.internalAllocator.alloc(bool, self.numStates);
+        defer self.internalAllocator.free(visited);
+        @memset(visited, false);
+
+        var startOfState = try self.internalAllocator.alloc(?*u8, self.numStates);
+        defer self.internalAllocator.free(startOfState);
+        @memset(startOfState, null);
+
+        var jumpsToPatch = try std.ArrayList(struct{instrToPatch:*u8, targetState:u32}).initCapacity(self.internalAllocator, self.numStates);
+
+        var worklistI:usize = 0;
+        while(worklistI < self.numStates) : (worklistI += 1) {
+            const curState = worklist.items[worklistI];
+            startOfState[curState] = @ptrCast(cur);
+
+            // get current char
+            try encode(&cur, fadec.FE_MOV8rm, .{fadec.FE_CX, std.math.minInt(i64) | oldIntCast(fadec.FE_AX, i64) << 32}); // << 32 is the same as FE_MEM(FE_AX, 0, 0, 0), but that doesn't work, c translation does not work there
+
+            // increment the pointer
+            try encode(&cur, fadec.FE_ADD64ri, .{fadec.FE_AX, 1});
+
+            for(self.transitions[curState].items) |transition| {
+                // add to the worklist
+                const targetState = transition[1];
+                if(!visited[targetState]) {
+                    worklist.appendAssumeCapacity(targetState);
+                    visited[targetState] = true;
+                }
+
+                // do the actual work
+
+                // cmp cl, transitionChar
+                try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, transition[0]});
+
+                // je targetStatee 
+                if(startOfState[targetState]) |jeTarget| {
+                    // just encode, and let fadec pick the best encoding
+                    try encode(&cur, fadec.FE_JZ, .{oldIntCast(@intFromPtr(jeTarget), fadec.FeOp)});
+                }else{
+                    try jumpsToPatch.append(.{.instrToPatch = @ptrCast(cur), .targetState = targetState});
+                    // use longest possible encoding to reserve space, patch it later
+                    try encode(&cur, fadec.FE_JZ | fadec.FE_JMPL, .{oldIntCast(@intFromPtr(cur), fadec.FeOp)});
+                }
+            }
+
+            // check if we have reached the end of the word
+            try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, 0});
+            // if we have, jump to the checkFinalStatePtr and move the current state into RSI
+            try encode(&cur, fadec.FE_MOV64ri, .{fadec.FE_SI, curState});
+            try encode(&cur, fadec.FE_JZ, .{oldIntCast(@intFromPtr(checkFinalStatePtr), fadec.FeOp)});
+
+            // trap state
+            try encode(&cur, fadec.FE_JMP, .{oldIntCast(@intFromPtr(trapStatePtr), fadec.FeOp)});
+        }
+
+        // patch jumps
+        for(jumpsToPatch.items) |*jump| {
+            try encode(@ptrCast(&jump.instrToPatch), fadec.FE_JZ | fadec.FE_JMPL, .{oldIntCast(@intFromPtr(startOfState[jump.targetState].?), fadec.FeOp)});
+        }
+
+        compiledDFA.recognize = @ptrCast(recognizerFunctionEntryPtr);
+
+        try compiledDFA.shrinkToSize(@intFromPtr(cur)-@intFromPtr(buf.ptr));
+
+        return compiledDFA;
     }
 };
 
@@ -1062,8 +1296,7 @@ const RegExNFA = struct {
     const EpsTransitionsForOneTerminal = Tuple(&[_]type{?u8, UniqueStateSet});
     const NonEpsTransitionsForOneTerminal = Tuple(&[_]type{u8, UniqueStateSet});
 
-    // an insert-first-lookup-later sorted vector like map would be preferable here for performance (like https://www.llvm.org/docs/ProgrammersManual.html recommends), but this will do for now
-    //const TransitionsOfAState = std.AutoHashMap(?u8, std.ArrayList(u32)); // ?u8 for eps transitions
+    // an insert-first-lookup-later sorted vector like map for performance (like https://www.llvm.org/docs/ProgrammersManual.html recommends)
     const EntireTransitionMapOfAState = ArraySet(EpsTransitionsForOneTerminal, keyCompare(EpsTransitionsForOneTerminal, struct {
         pub fn f(a:?u8, b:?u8) Order {
             // i hope this gets compiled into something proper...
@@ -1214,9 +1447,8 @@ const RegExNFA = struct {
     }
 
     // this function assumes backUpEpsTransitions has been called just before!
-    // this also deinitializes the NFA, so it can't be used afterwards
-    // TODO handle different allocator for DFA, currently that just does malloc
-    pub fn toPowersetConstructedDFA(self:*@This()) !RegExDFA{
+    // if called without options, this function just uses the NFAs allocator for the DFA, i.e. that allocators lifetime has to exceed the lifetime of the DFA
+    pub fn toPowersetConstructedDFA(self:*@This(), opts:struct{overrideAllocator:?Allocator = null}) !RegExDFA{
         // combine all transitions into new states (if they don't exist yet), add them to the worklist
 
         // maps input slice of nfa states to dfa state
@@ -1235,7 +1467,7 @@ const RegExNFA = struct {
             }
         }, std.hash_map.default_max_load_percentage).init(self.internalAllocator);
         
-        var dfa = try RegExDFA.init(self.internalAllocator);
+        var dfa = try RegExDFA.init(opts.overrideAllocator orelse self.internalAllocator);
         // worklist of nfa (and generated i.e. powerset-) states to visit
         var worklist = try std.ArrayList(UniqueStateSet).initCapacity(self.internalAllocator, 8);
 
@@ -1305,17 +1537,13 @@ const RegExNFA = struct {
 
         }
 
-        // TODO when the arena allocator works call deinit etc.
-
         return dfa;
     }
 };
 
-const expect = std.testing.expect;
-
 test "tokenizer" {
     const input = "xyz|w*(abc)*de*f";
-    var tok = try Tokenizer.init(input, std.testing.allocator);
+    var tok = try Tokenizer.init(std.testing.allocator, input);
     defer tok.deinit();
     const buf = try tok.debugFmt();
     try expect(std.mem.eql(u8, buf.items, "x y z|w* (a b c)* d e* f"));
@@ -1333,14 +1561,14 @@ test "ab* DFA" {
     try dfa.transitions[b].insert(.{'b', b}, .{});
     try dfa.designateStatesFinal(&[1]u32{b});
 
-    try expect(dfa.isInLanguage("a"));
-    try expect(dfa.isInLanguage("ab"));
-    try expect(dfa.isInLanguage("abb"));
-    try expect(dfa.isInLanguage("abbbbbbbbbbbbbbbbbbbbbbbbbb"));
-    try expect(!dfa.isInLanguage("b"));
-    try expect(!dfa.isInLanguage("ba"));
-    try expect(!dfa.isInLanguage("aba"));
-    try expect(!dfa.isInLanguage("abbbbbbbbbbbbbbbbbbbbbbbbbba"));
+    try expect(dfa.isInLanguageInterpreted("a"));
+    try expect(dfa.isInLanguageInterpreted("ab"));
+    try expect(dfa.isInLanguageInterpreted("abb"));
+    try expect(dfa.isInLanguageInterpreted("abbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    try expect(!dfa.isInLanguageInterpreted("b"));
+    try expect(!dfa.isInLanguageInterpreted("ba"));
+    try expect(!dfa.isInLanguageInterpreted("aba"));
+    try expect(!dfa.isInLanguageInterpreted("abbbbbbbbbbbbbbbbbbbbbbbbbba"));
 }
 
 test "ab|aaa NFA" {
@@ -1416,9 +1644,9 @@ test "NFA simple powerset construction" {
     try nfa.addTransition(4, 'a', 5);
     try nfa.designateStatesFinal(&[_]u32{3,5});
 
-    var dfa = try nfa.toPowersetConstructedDFA();
-    try expect(dfa.isInLanguage("ab"));
-    try expect(dfa.isInLanguage("aaa"));
+    var dfa = try nfa.toPowersetConstructedDFA(.{});
+    try expect(dfa.isInLanguageInterpreted("ab"));
+    try expect(dfa.isInLanguageInterpreted("aaa"));
 
     // nothing else should be in the language
     // lets just test a bunch of random strings
@@ -1431,7 +1659,7 @@ test "NFA simple powerset construction" {
         for(buf) |*c| {
             c.* = rnd.random().int(u8);
         }
-        try expect(!dfa.isInLanguage(buf));
+        try expect(!dfa.isInLanguageInterpreted(buf));
     }
 }
 
@@ -1454,61 +1682,123 @@ test "complex eps-NFA powerset construction" {
     try nfa.designateStatesFinal(&[_]u32{3});
 
     try nfa.backUpEpsTransitions();
-    var dfa = try nfa.toPowersetConstructedDFA();
-    try expect(dfa.isInLanguage("abed"));
-    try expect(dfa.isInLanguage("abbbbbed"));
-    try expect(dfa.isInLanguage("dbbbbbeceecebbbed"));
+    var dfa = try nfa.toPowersetConstructedDFA(.{});
+    try expect(dfa.isInLanguageInterpreted("abed"));
+    try expect(dfa.isInLanguageInterpreted("abbbbbed"));
+    try expect(dfa.isInLanguageInterpreted("dbbbbbeceecebbbed"));
 }
 
-test "regex to dfa" {
+fn xyzTestCases(dfa:anytype, checkFn:anytype) !void {
+    try expect(checkFn(dfa, "xyz"));
+
+    try expect(!checkFn(dfa, "xz"));
+    try expect(!checkFn(dfa, "xy"));
+    try expect(!checkFn(dfa, "x"));
+    try expect(!checkFn(dfa, "y"));
+    try expect(!checkFn(dfa, "z"));
+
+    try expect(checkFn(dfa, "wwwwwwwwdf"));
+    try expect(checkFn(dfa, "df"));
+    try expect(checkFn(dfa, "deef"));
+    try expect(checkFn(dfa, "wabcabcdeeef"));
+    try expect(checkFn(dfa, "wwwwabcabcabcdeeef"));
+
+    try expect(!checkFn(dfa, "wwwwacabcabcdeeef"));
+    try expect(!checkFn(dfa, "xyz" ++ "wwwwwwwwdf"));
+    try expect(!checkFn(dfa, "xyz" ++ "df"));
+    try expect(!checkFn(dfa, "xyz" ++ "wabcabcdeeef"));
+    try expect(!checkFn(dfa, "xyz" ++ "wwwwabcabcabcdeeef"));
+}
+
+test "xyz|w*(abc)*de*f regex to dfa interpreted" {
     const input = "xyz|w*(abc)*de*f";
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var tok = try Tokenizer.init(input, arena.allocator());
+    var tok = try Tokenizer.init(arena.allocator(), input);
     defer tok.deinit();
     const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
     assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
 
-    var dfa = try regex.toDFA();
+    var dfa = try regex.toDFA(.{});
+    try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
 
-    try expect(dfa.isInLanguage("xyz"));
+    try xyzTestCases(dfa, RegExDFA.isInLanguageInterpreted);
+}
 
-    try expect(!dfa.isInLanguage("xz"));
-    try expect(!dfa.isInLanguage("xy"));
-    try expect(!dfa.isInLanguage("x"));
-    try expect(!dfa.isInLanguage("y"));
-    try expect(!dfa.isInLanguage("z"));
+test "xyz|w*(abc)*de*f regex to dfa compiled" {
+    const input = "xyz|w*(abc)*de*f";
 
-    try expect(dfa.isInLanguage("wwwwwwwwdf"));
-    try expect(dfa.isInLanguage("df"));
-    try expect(dfa.isInLanguage("deef"));
-    try expect(dfa.isInLanguage("wabcabcdeeef"));
-    try expect(dfa.isInLanguage("wwwwabcabcabcdeeef"));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    try expect(!dfa.isInLanguage("wwwwacabcabcdeeef"));
-    try expect(!dfa.isInLanguage("xyz" ++ "wwwwwwwwdf"));
-    try expect(!dfa.isInLanguage("xyz" ++ "df"));
-    try expect(!dfa.isInLanguage("xyz" ++ "wabcabcdeeef"));
-    try expect(!dfa.isInLanguage("xyz" ++ "wwwwabcabcabcdeeef"));
+    var tok = try Tokenizer.init(arena.allocator(), input);
+    defer tok.deinit();
+    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
+    assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
+
+    var dfa = try regex.toDFA(.{});
+    try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
+
+    var compiledDFA = try dfa.compile(&arena);
+
+    try xyzTestCases(compiledDFA, RegExDFA.CompiledRegExDFA.isInLanguageCompiled);
+}
+
+const fadec = @cImport({
+    @cInclude("fadec.h");
+    @cInclude("fadec-enc.h");
+});
+
+const FeMnem = u64;
+const FeError = error{EncodeError};
+
+fn encode(bufPtr:*[*]u8, mnem:FeMnem, args:struct{@"0":fadec.FeOp = 0, @"1":fadec.FeOp = 0, @"2":fadec.FeOp = 0, @"3":fadec.FeOp = 0, }) FeError!void {
+    const ret = fadec.fe_enc64_impl(@ptrCast(bufPtr), mnem, args.@"0", args.@"1", args.@"2", args.@"3");
+    if(ret != 0)
+        return FeError.EncodeError;
+}
+
+test "fadec basic functionality and abstractions" {
+    const buf:[]u8 = try easyAllocer.alloc(u8, 256);
+    var cur:[*]u8 = buf.ptr;
+    var curPtr:[*c][*c]u8 = @ptrCast(&cur); // in zig-style this is not right, but the c translation of fadec expects this type, instead of the more sensible *[*]u8
+
+    _ = fadec.fe_enc64_impl(curPtr, fadec.FE_ADD8rr, fadec.FE_AX, fadec.FE_AX, 0, 0);
+    const length = @intFromPtr(cur) - @intFromPtr(buf.ptr);
+
+    try encode(&cur, fadec.FE_ADD8rr, .{fadec.FE_AX, fadec.FE_AX});
+    try expect(2*length == @intFromPtr(cur) - @intFromPtr(buf.ptr));
+
+    try expect(std.mem.eql(u8, buf[0..length], buf[length..2*length]));
 }
 
 pub fn main() !void {
-    const writer = std.io.getStdOut().writer();
-
-    const input = "xyz|w*(abc)*de*f";
+    //const writer = std.io.getStdOut().writer();
 
     var arena = std.heap.ArenaAllocator.init(easyAllocer);
     defer arena.deinit();
 
-    var tok = try Tokenizer.init(input, arena.allocator());
+    const input = "xyz|w*(abc)*de*f";
+
+    var tok = try Tokenizer.init(arena.allocator(), input);
     defer tok.deinit();
     const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
     assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
 
-    var dfa = try regex.toDFA();
-    const fa = FiniteAutomaton{.dfa = &dfa};
+    var dfa = try regex.toDFA(.{});
 
-    try fa.printDOT(writer);
+    assert(dfa.internalAllocator.ptr == arena.allocator().ptr, "dfa should use the same allocator as the regex", .{});
+
+    var compiled = try dfa.compile(&arena);
+    debugLog("{}", .{compiled.isInLanguageCompiled("xyz")});
+    //compiled.debugPrint();
+
+    //const fa = FiniteAutomaton{.dfa = &dfa};
+    //
+    //try fa.printDOT(writer);
+
 }

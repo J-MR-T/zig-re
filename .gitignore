@@ -1,5 +1,6 @@
 re*
 ^re.zig
+zig-*
 
 test.svg
 Session.vim
