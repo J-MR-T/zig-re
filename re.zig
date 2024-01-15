@@ -1017,8 +1017,16 @@ const RegExDFA = struct{
 
         pub fn shrinkToSize(self:*@This(), shrunkSize:usize) !void {
             self.jitBuf.len = shrunkSize;
-            // TODO call mremap through libc, no zig bindings yet :(
+            // call mremap through libc, no zig bindings yet :(
             // (page align length first)
+            const alignedLen = std.mem.alignForward(usize, self.jitBuf.len, std.mem.page_size); // TODO this is just a 'minimum page size'
+
+            const ret = std.os.linux.syscall4(.mremap, @intFromPtr(self.jitBuf.ptr), 1 << 31, alignedLen, 0);
+            if(ret < 0)
+                return error.MMapError;
+
+            assert(ret == @intFromPtr(self.jitBuf.ptr), "mremap returned a different pointer than the one we passed, even though we should only be shrinking", .{});
+            //self.jitBuf.ptr = @ptrFromInt(ret);
         }
 
         pub fn deinit(self:@This()) void {
