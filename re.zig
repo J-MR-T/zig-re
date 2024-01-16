@@ -1212,9 +1212,10 @@ const RegExDFA = struct{
         worklist.appendAssumeCapacity(self.startState);
         // we're not removing from the worklist, moving elements to do that would be unnecessary
 
-        var visited = try self.internalAllocator.alloc(bool, self.numStates);
-        defer self.internalAllocator.free(visited);
-        @memset(visited, false);
+        var scheduledForVisit = try self.internalAllocator.alloc(bool, self.numStates);
+        defer self.internalAllocator.free(scheduledForVisit);
+        @memset(scheduledForVisit, false);
+        scheduledForVisit[self.startState] = true;
 
         var startOfState = try self.internalAllocator.alloc(?*u8, self.numStates);
         defer self.internalAllocator.free(startOfState);
@@ -1237,9 +1238,9 @@ const RegExDFA = struct{
             for(self.transitions[curState].items) |transition| {
                 // add to the worklist
                 const targetState = transition[1];
-                if(!visited[targetState]) {
+                if(!scheduledForVisit[targetState]) {
                     worklist.appendAssumeCapacity(targetState);
-                    visited[targetState] = true;
+                    scheduledForVisit[targetState] = true;
                 }
 
                 // do the actual work
