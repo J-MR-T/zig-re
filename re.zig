@@ -1113,7 +1113,8 @@ const RegExDFA = struct{
 
     // for now, requires that the self-DFA has been allocated with an arena (and this arena has been passed), to be able to ensure the total code size will be < 2 GiB
     // for now, requires the original DFA to be live for the lifetime of the compiled DFA, because it needs to be able to access the final states
-    pub fn compile(self:@This(), arena:*std.heap.ArenaAllocator) CompilationError!CompiledRegExDFA{
+    // TODO there has to be a better way to do this comptime bool thing. A nullable profile info wouldn't generate a different function per bool value, i.e. cost runtime performance (I think)
+    pub fn compile(self:@This(), arena:*std.heap.ArenaAllocator, comptime hasProfileInfo:bool, opts:struct{profileInfo:ProfilingInformation = undefined}) CompilationError!CompiledRegExDFA{
         // there are different options for implementing the jumps to the next state, equivalent to the approaches for lowering switch statements:
         // let's try a linear if-else chain first (could later order this by estimated frequency of each transition, by profiling this on the interpreted version). Should be fastest for a low number of transitions per state 
         // - binary search based switching might be fastest, if the number of transitions per state is medium to high
@@ -1235,7 +1236,36 @@ const RegExDFA = struct{
             // increment the pointer
             try encode(&cur, fadec.FE_ADD64ri, .{fadec.FE_AX, 1});
 
-            for(self.transitions[curState].items) |transition| {
+
+            var curTransitionsOrdered:EntireTransitionMapOfAState = undefined;
+            defer if(hasProfileInfo) curTransitionsOrdered.deinit();
+
+            if(hasProfileInfo) {
+                // TODO this functionality is probably quite slow overall in terms of compile-time, because of the cloning, sorting, etc.
+                curTransitionsOrdered = try self.transitions[curState].clone();
+
+                const transitionFequency = opts.profileInfo.transitionFequencyPerState[curState];
+                const lambda = struct{
+                    fn f(transitionFequencyLocal:@TypeOf(transitionFequency), a:Transition, b:Transition) bool {
+                        if(transitionFequencyLocal.findByKey(a[0])) |aFreq| {
+                            if(transitionFequencyLocal.findByKey(b[0])) |bFreq| {
+                                return aFreq > bFreq;
+                            }
+                            return true; // otherwise b frequency is zero
+                        }
+                        // if both are equally zero, the order doesn't matter, so let the compiler combine the two returns (here for clarity)
+                        return true;
+                    }
+                }.f;
+                std.sort.pdq(Transition, curTransitionsOrdered.items, transitionFequency, lambda);
+
+                // TODO Check whether the sort order is correct
+            }else{
+                // copy shouldnt be a problem, is only copying fat pointers, right?
+                curTransitionsOrdered = self.transitions[curState];
+            }
+
+            for(curTransitionsOrdered.items) |transition| {
                 // add to the worklist
                 const targetState = transition[1];
                 if(!scheduledForVisit[targetState]) {
@@ -1804,7 +1834,7 @@ test "xyz|w*(abc)*de*f regex to dfa compiled" {
     var dfa = try regex.toDFA(.{});
     try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
 
-    var compiledDFA = try dfa.compile(&arena);
+    var compiledDFA = try dfa.compile(&arena, false, .{});
 
     try xyzTestCases(compiledDFA, RegExDFA.CompiledRegExDFA.isInLanguageCompiled);
 }
@@ -1847,6 +1877,17 @@ test "regex dfa profiling" {
             }
         }
     }
+
+    const compiled = try dfa.compile(&arena, true, .{.profileInfo = profileInfo});
+    const startOfRecognize:[*]u8 = @ptrCast(compiled.recognize);
+    // if the profiling has worked right, the first comparison should be comparing to x, i.e. the start of the recognize function should be:
+    // sub rsp, 0x8
+    // mov rax, rsi
+    // mov cl, byte ptr [rax]
+    // add rax, 0x1
+    // cmp cl, 0x78; this compares to 'x'
+    // -> check this
+    try expect(std.mem.eql(u8, startOfRecognize[0..16], "\x48\x83\xEC\x08\x48\x89\xF0\x8A\x08\x48\x83\xC0\x01\x80\xF9\x78"));
 }
 
 const fadec = @cImport({
@@ -1894,7 +1935,7 @@ pub fn main() !void {
 
     assert(dfa.internalAllocator.ptr == arena.allocator().ptr, "dfa should use the same allocator as the regex", .{});
 
-    var compiled = try dfa.compile(&arena);
+    var compiled = try dfa.compile(&arena, false, .{});
     debugLog("{}", .{compiled.isInLanguageCompiled("xyz")});
     //compiled.debugPrint();
 
