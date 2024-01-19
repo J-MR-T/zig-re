@@ -1247,19 +1247,12 @@ const RegExDFA = struct{
                 const transitionFequency = opts.profileInfo.transitionFequencyPerState[curState];
                 const lambda = struct{
                     fn f(transitionFequencyLocal:@TypeOf(transitionFequency), a:Transition, b:Transition) bool {
-                        if(transitionFequencyLocal.findByKey(a[0])) |aFreq| {
-                            if(transitionFequencyLocal.findByKey(b[0])) |bFreq| {
-                                return aFreq > bFreq;
-                            }
-                            return true; // otherwise b frequency is zero
-                        }
-                        // if both are equally zero, the order doesn't matter, so let the compiler combine the two returns (here for clarity)
-                        return true;
+                        return transitionFequencyLocal.findByKey(a[0]) orelse 0 > transitionFequencyLocal.findByKey(b[0]) orelse 0;
                     }
                 }.f;
                 std.sort.pdq(Transition, curTransitionsOrdered.items, transitionFequency, lambda);
 
-                // TODO Check whether the sort order is correct
+                assert(curTransitionsOrdered.items.len == 0 or transitionFequency.findByKey(curTransitionsOrdered.items[0][0]) orelse 0 >= transitionFequency.findByKey(curTransitionsOrdered.items[curTransitionsOrdered.items.len-1][0]) orelse 0, "sorting didnt work", .{});
             }else{
                 // copy shouldnt be a problem, is only copying fat pointers, right?
                 curTransitionsOrdered = self.transitions[curState];
@@ -1328,10 +1321,6 @@ const FiniteAutomaton = union(enum){
             inline else => |case| case.startState
         };
 
-        const states = switch(self){
-            inline else => |case| case.numStates
-        };
-
         const finalStates = switch(self){
             inline else => |case| case.finalStates
         };
@@ -1340,7 +1329,7 @@ const FiniteAutomaton = union(enum){
             inline else => |case| case.numStates
         };
 
-        for(0..states) |curStateI| {
+        for(0..numStates) |curStateI| {
             const curState:u32 = @truncate(curStateI);
 
             try writer.print("n{}[label=\"{}\"", .{curState, curState});
