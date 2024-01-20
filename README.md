@@ -5,6 +5,9 @@ At the moment, parsing of basic RegEx's (literal characters, concatenation, `|`,
 
 Translation of regular expressions to $\varepsilon$-NFA to NFA to DFA is implemented and seems to work in somewhat complex scenarios, but is not tested extensively yet. Canonicalization of the final DFA is not implemented yet, and $\varepsilon$-NFA to NFA conversion is not very efficient yet.
 
+The project also includes a JIT compiler for x86-64 that can convert DFAs to machine code that is executable immediately. Profile guided optimization is also implemented: the JIT compiler can use information collected during profiling runs of the DFA (pre-compilation, i.e. interpreted runs), to emit more efficient machine code. Although the compile-time performance of using this features is not great yet.
+
+## Example
 Example of a regex combining all current features: `xyz|w*(abc)*de*f`
 
 AST:
