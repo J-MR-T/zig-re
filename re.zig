@@ -710,7 +710,6 @@ const RegEx = struct {
         return primary;
     }
 
-    // TODO expand with allocator choice
     pub fn parseExpr(allocer:Allocator, minPrec:u32, tok:*Tokenizer) ParseError!*@This() {
         var lhs = try parsePrimaryExpr(allocer, tok);
         while (tok.hasNext()) {
@@ -1068,7 +1067,7 @@ const RegExDFA = struct{
 
         pub fn shrinkToSize(self:*@This(), shrunkSize:usize) !void {
             self.jitBuf.len = shrunkSize;
-            // call mremap through libc, no zig bindings yet :(
+            // call mremap through direct syscall, no zig bindings yet :(
             // (page align length first)
             const alignedLen = std.mem.alignForward(usize, self.jitBuf.len, std.mem.page_size); // TODO this is just a 'minimum page size'
 
