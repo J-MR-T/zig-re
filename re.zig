@@ -359,6 +359,70 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
 
 }
 
+pub fn UnionFind(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
+    return struct{
+        parent:ArraySet(Tuple(&[2]type{T, T}), keyCompare(Tuple(&[2]type{T, T}), comparatorFn)),
+
+        pub fn init(allocator:Allocator) !@This() {
+            return @This(){
+                .parent = try ArraySet(Tuple(&[2]type{T, T}), keyCompare(Tuple(&[2]type{T, T}), comparatorFn)).init(allocator),
+            };
+        }
+
+        pub fn find(self:*@This(), item:T) !*T {
+            const parent = try self.parent.findSpot(.{item, undefined}, .{.MakeSpaceForNewIfNotFound = true});
+            // smallest sets are simply one-element sets represented by themselves. These get inserted explicitly, so that a union (yunyin) can be done with them
+            if(!parent.found_existing){
+                parent.item_ptr.*[0] = item;
+                parent.item_ptr.*[1] = item;
+                return &parent.item_ptr.*[1];
+            }
+
+            // parents that point to themselves are also the representative of their set
+            if(comparatorFn(parent.item_ptr.*[1], item) == Order.eq)
+                return &parent.item_ptr.*[1];
+
+            const rep = try self.find(parent.item_ptr.*[1]);
+            // path compression
+            parent.item_ptr.*[1] = rep.*;
+            return rep;
+        }
+
+        // representative of a is now the representative of all of a \cup b
+        pub fn yunyin(self:*@This(), a:T, b:T) !void {
+            const aParent = try self.find(a);
+            var bParent = try self.find(b);
+
+            if(comparatorFn(aParent.*, bParent.*) == Order.eq)
+                return;
+
+            bParent.* = aParent.*;
+        }
+    };
+}
+
+test "union-find" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const T = u32;
+    var uf = try UnionFind(T, makeOrder(T)).init(arena.allocator());
+
+    try uf.yunyin(1, 2);
+    try expect(try uf.find(1) == try uf.find(2));
+    try expect((try uf.find(1)).* == 1);
+
+    try uf.yunyin(3, 4);
+    try expect(try uf.find(3) == try uf.find(4));
+    try expect((try uf.find(3)).* == 3);
+
+    try uf.yunyin(2, 4);
+    try expect((try uf.find(1)).* == 1);
+    for(1..5) |i| {
+        try expect(try uf.find(@intCast(i)) == try uf.find(1));
+    }
+}
+
 fn oldIntCast(x:anytype, comptime ResultType:type) ResultType {
     const result:ResultType = @intCast(x);
     return result;
@@ -779,6 +843,7 @@ const RegEx = struct {
             try dfa.transitions[dfa.startState].insert(.{self.char, dfa.startState}, .{});
 
             // TODO handle AnyChar here as soon as it's implemented
+            // TODO the best thing to do would probably to add some sort of relaxation on transitions, so that they can also be taken if the input char is in a certain range. This would allow groups like [0-9] to be handled somewhat efficiently, and AnyChar would just be the range 1-255
 
             return dfa;
         }
@@ -934,7 +999,6 @@ const RegExDFA = struct{
     startState:u32,
     // alphabet will be implicit
     numStates:u32,
-    // an insert-first-lookup-later sorted vector like map would be preferable here for performance (like https://www.llvm.org/docs/ProgrammersManual.html recommends), but this will do for now
     transitions:[]EntireTransitionMapOfAState,
     finalStates:UniqueStateSet,
 
