@@ -17,6 +17,9 @@ fn structFieldType(comptime T:type, comptime fieldIndex:comptime_int) type{
 const expect = std.testing.expect;
 
 const Tuple = std.meta.Tuple;
+fn Pair(comptime T:type, comptime U:type) type {
+    return Tuple(&[2]type{T, U});
+}
 const Order = std.math.Order;
 
 fn initArrayListLikeWithElements(allocator:Allocator, comptime ArrayListType:type, elementsSlice:anytype) !ArrayListType{
@@ -990,7 +993,7 @@ const RegEx = struct {
 // alphabet is implicitly the space of u8.
 // passing an arena allocator and *not* calling deinit on the DFA, just on the arena is recommended. If you need to use another allocator, call deinit on the DFA directly
 const RegExDFA = struct{
-    const Transition                  = Tuple(&[_]type{u8, u32});
+    const Transition                  = Pair(u8, u32);
     const EntireTransitionMapOfAState = ArraySet(Transition, keyCompare(Transition, makeOrder(u8)));
     const UniqueStateSet              = ArraySet(u32, makeOrder(u32));
 
@@ -1051,7 +1054,7 @@ const RegExDFA = struct{
     }
 
     const ProfilingInformation = struct{
-        transitionFequencyPerState:[]ArraySet(Tuple(&[_]type{u8, u32}), keyCompare(Tuple(&[_]type{u8, u32}), makeOrder(u8))),
+        transitionFequencyPerState:[]ArraySet(Pair(u8, u32), keyCompare(Pair(u8, u32), makeOrder(u8))),
         // only counts if we left the state again (so that all transition frequencies add up to the number of visits)
         visitsPerState:[]u32,
 
@@ -1059,7 +1062,7 @@ const RegExDFA = struct{
 
         pub fn init(allocer:Allocator, numStates:u32) !@This() {
             var info = ProfilingInformation{
-                .transitionFequencyPerState = try allocer.alloc(ArraySet(Tuple(&[_]type{u8, u32}), keyCompare(Tuple(&[_]type{u8, u32}), makeOrder(u8))), numStates),
+                .transitionFequencyPerState = try allocer.alloc(ArraySet(Pair(u8, u32), keyCompare(Pair(u8, u32), makeOrder(u8))), numStates),
                 .visitsPerState = try allocer.alloc(u32, numStates),
                 .internalAllocator = allocer,
             };
@@ -1067,7 +1070,7 @@ const RegExDFA = struct{
             @memset(info.visitsPerState, 0);
 
             for (info.transitionFequencyPerState) |*transitions| {
-                transitions.* = try ArraySet(Tuple(&[_]type{u8, u32}), keyCompare(Tuple(&[_]type{u8, u32}), makeOrder(u8))).init(allocer);
+                transitions.* = try ArraySet(Pair(u8, u32), keyCompare(Pair(u8, u32), makeOrder(u8))).init(allocer);
             }
 
             return info;
@@ -1436,8 +1439,8 @@ const FiniteAutomaton = union(enum){
 // passing an arena allocator and *not* calling deinit on the NFA, just on the arena is recommended. If you need to use another allocator, call deinit on the NFA directly
 const RegExNFA = struct {
     const UniqueStateSet = ArraySet(u32, makeOrder(u32));
-    const EpsTransitionsForOneTerminal = Tuple(&[_]type{?u8, UniqueStateSet});
-    const NonEpsTransitionsForOneTerminal = Tuple(&[_]type{u8, UniqueStateSet});
+    const EpsTransitionsForOneTerminal = Pair(?u8, UniqueStateSet);
+    const NonEpsTransitionsForOneTerminal = Pair(u8, UniqueStateSet);
 
     // an insert-first-lookup-later sorted vector like map for performance (like https://www.llvm.org/docs/ProgrammersManual.html recommends)
     const EntireTransitionMapOfAState = ArraySet(EpsTransitionsForOneTerminal, keyCompare(EpsTransitionsForOneTerminal, struct {
