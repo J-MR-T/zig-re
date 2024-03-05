@@ -613,7 +613,7 @@ pub fn RangeMap(comptime RangeableKey:type, comptime keyOrder:(fn(RangeableKey, 
                 // passed key is higher than any highest element of a range
                 orelse return null;
 
-            if(key >= spotInfo.item_ptr.*[1][0])
+            if(keyOrder(key, spotInfo.item_ptr.*[1][0]) != Order.lt)
                 // lies within the range
                 return spotInfo.item_ptr.*[1][1];
 
