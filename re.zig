@@ -15,6 +15,11 @@ fn structFieldType(comptime T:type, comptime fieldIndex:comptime_int) type{
 }
 
 const expect = std.testing.expect;
+// unwraps the optional and std.testing.expect's that its not null (similar to just doing .?, but with an explicit expect)
+fn expectNotNull(value:anytype) !@typeInfo(@TypeOf(value)).Optional.child {
+    try expect(value != null);
+    return value.?;
+}
 
 const Tuple = std.meta.Tuple;
 fn Pair(comptime T:type, comptime U:type) type {
@@ -607,7 +612,7 @@ pub fn RangeMap(comptime RangeableKey:type, comptime keyOrder:(fn(RangeableKey, 
             try self.map.insert(.{upper, .{lower, value}}, .{});
         }
 
-        pub fn find(self:*const @This(), key:RangeableKey) ?Value {
+        pub fn findSpot(self:*const @This(), key:RangeableKey) ?*Value {
             // finds the first greater than or equal to key -> will be the highest element of the range that could contain key, if key >= lowest
             const spotInfo = self.map.findSpot(.{key, undefined}, .{}) 
                 // passed key is higher than any highest element of a range
@@ -615,9 +620,13 @@ pub fn RangeMap(comptime RangeableKey:type, comptime keyOrder:(fn(RangeableKey, 
 
             if(keyOrder(key, spotInfo.item_ptr.*[1][0]) != Order.lt)
                 // lies within the range
-                return spotInfo.item_ptr.*[1][1];
+                return &spotInfo.item_ptr.*[1][1];
 
             return null;
+        }
+
+        pub fn find(self:*const @This(), key:RangeableKey) ?Value {
+            return (self.findSpot(key) orelse return null).*;
         }
     };
 }
@@ -635,6 +644,51 @@ test "range map"{
 
     try std.testing.expectError(error.OverlappingRanges, rm.insert(0, 10, 1, .{}));
     try std.testing.expectError(error.OverlappingRanges, rm.insert(3, 6, 1, .{}));
+}
+
+test "range map transitions" {
+    // adapted from NFA
+    const UniqueStateSet = ArraySet(u32, makeOrder(u32));
+    const EpsTransitionsForOneTerminal = Pair(?u8, UniqueStateSet);
+    _ = EpsTransitionsForOneTerminal;
+
+    const EntireTransitionMapOfAState = RangeMap(?u8, struct {
+        pub fn f(a:?u8, b:?u8) Order {
+            // i hope this gets compiled into something proper...
+            if(a == null){
+                if(b == null)
+                    return Order.eq;
+                return Order.lt;
+            }else if(b == null){
+                return Order.gt;
+            }
+            return std.math.order(a.?,b.?);
+        }
+    }.f, UniqueStateSet); // ?u8 for eps transitions
+
+    var map = try EntireTransitionMapOfAState.init(std.testing.allocator);
+    defer map.deinit();
+    try map.insert('a', 'z', try UniqueStateSet.init(std.testing.allocator), .{});
+    var res = try expectNotNull(map.findSpot('a'));
+    defer res.deinit();
+    try res.insert(1, .{});
+    res = try expectNotNull(map.findSpot('a'));
+    try expect(res.contains(1));
+    res = try expectNotNull(map.findSpot('a'));
+    try res.insert(3, .{});
+    res = try expectNotNull(map.findSpot('a'));
+    try expect(res.contains(3));
+    res = try expectNotNull(map.findSpot('a'));
+    try res.insert(2, .{});
+    res = try expectNotNull(map.findSpot('a'));
+    try expect(res.contains(2));
+
+    for('a'..('z'+1)) |c|{
+        var res2 = try expectNotNull(map.findSpot(@intCast(c)));
+        for(1..4) |i| {
+            try expect(res2.contains(@intCast(i)));
+        }
+    }
 }
 
 
