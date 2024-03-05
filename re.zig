@@ -386,7 +386,7 @@ fn keyCompare(comptime T:type, comptime compare:fn(structFieldType(T, 0), struct
     }.f;
 }
 
-test "test array set" {
+test "array set" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -963,9 +963,10 @@ const RegEx = struct {
             assert(self.right == null, "regex has no left operand, but right operand is not null", .{});
 
             var dfa = try RegExDFA.init(self.internalAllocator);
-            dfa.startState = try dfa.addState();
-            try dfa.designateStatesFinal(&[1]u32{@truncate(dfa.startState)});
-            try dfa.transitions[dfa.startState].insert(.{self.char, dfa.startState}, .{});
+            try dfa.addStates(2);
+            dfa.startState = 0;
+            try dfa.designateStatesFinal(&[1]u32{1});
+            try dfa.transitions[dfa.startState].insert(.{self.char, 1}, .{});
 
             // TODO handle AnyChar here as soon as it's implemented
             // TODO the best thing to do would probably to add some sort of relaxation on transitions, so that they can also be taken if the input char is in a certain range. This would allow groups like [0-9] to be handled somewhat efficiently, and AnyChar would just be the range 1-255
@@ -2014,6 +2015,34 @@ test "xyz|w*(abc)*de*f regex to dfa compiled" {
     var compiledDFA = try dfa.compile(&arena, false, .{});
 
     try xyzTestCases(compiledDFA, RegExDFA.CompiledRegExDFA.isInLanguageCompiled);
+}
+
+test "single char regex to dfa" {
+    const input = "x";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var tok = try Tokenizer.init(arena.allocator(), input);
+    defer tok.deinit();
+    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
+    assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
+
+    var dfa = try regex.toDFA(.{});
+    try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
+
+    var compiledDFA = try dfa.compile(&arena, false, .{});
+
+    try expect(compiledDFA.isInLanguageCompiled("x"));
+    try expect(dfa.isInLanguageInterpreted("x"));
+
+    try expect(!compiledDFA.isInLanguageCompiled(""));
+    try expect(!dfa.isInLanguageInterpreted(""));
+    try expect(!compiledDFA.isInLanguageCompiled("y"));
+    try expect(!dfa.isInLanguageInterpreted("y"));
+    try expect(!compiledDFA.isInLanguageCompiled("w"));
+    try expect(!dfa.isInLanguageInterpreted("w"));
 }
 
 test "regex dfa profiling" {
