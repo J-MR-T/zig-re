@@ -595,6 +595,19 @@ pub fn RangeMap(comptime RangeableKey:type, comptime keyOrder:(fn(RangeableKey, 
             };
         }
 
+        pub fn initCapacity(allocator:Allocator, capacity:usize) Allocator.Error!@This() {
+            return @This(){
+                .map = try Map.initCapacity(allocator, capacity),
+            };
+        }
+
+        // clones the set, uses the same allocator. Does not make any guarantees about the capacity of the new set, just that the actual elements are the same
+        pub fn clone(self:@This()) !@This() {
+            return @This(){
+                .map = try self.map.clone(),
+            };
+        }
+
         pub fn deinit(self:@This()) void {
             self.map.deinit();
         }
@@ -610,6 +623,10 @@ pub fn RangeMap(comptime RangeableKey:type, comptime keyOrder:(fn(RangeableKey, 
                     return error.OverlappingRanges;
             }
             try self.map.insert(.{upper, .{lower, value}}, .{});
+        }
+
+        pub fn insertSingle(self:*@This(), key:RangeableKey, value:Value) !void {
+            try self.insert(key, key, value, .{});
         }
 
         pub fn findSpot(self:*const @This(), key:RangeableKey) ?*Value {
@@ -966,7 +983,7 @@ const RegEx = struct {
             try dfa.addStates(2);
             dfa.startState = 0;
             try dfa.designateStatesFinal(&[1]u32{1});
-            try dfa.transitions[dfa.startState].insert(.{self.char, 1}, .{});
+            try dfa.transitions[dfa.startState].insertSingle(self.char, 1);
 
             // TODO handle AnyChar here as soon as it's implemented
             // TODO the best thing to do would probably to add some sort of relaxation on transitions, so that they can also be taken if the input char is in a certain range. This would allow groups like [0-9] to be handled somewhat efficiently, and AnyChar would just be the range 1-255
@@ -1116,8 +1133,7 @@ const RegEx = struct {
 // alphabet is implicitly the space of u8.
 // passing an arena allocator and *not* calling deinit on the DFA, just on the arena is recommended. If you need to use another allocator, call deinit on the DFA directly
 const RegExDFA = struct{
-    const Transition                  = Pair(u8, u32);
-    const EntireTransitionMapOfAState = ArraySet(Transition, keyCompare(Transition, makeOrder(u8)));
+    const EntireTransitionMapOfAState = RangeMap(u8, makeOrder(u8), u32);
     const UniqueStateSet              = ArraySet(u32, makeOrder(u32));
 
     const defaultTransitionCapacityForState = 2;
@@ -1171,13 +1187,13 @@ const RegExDFA = struct{
     pub fn isInLanguageInterpreted(self:@This(), word:[]const u8) bool{
         var curState:u32 = self.startState;
         for(word) |c| {
-            curState = self.transitions[curState].findByKey(c) orelse return false;
+            curState = self.transitions[curState].find(c) orelse return false;
         }
         return self.finalStates.contains(curState);
     }
 
     const ProfilingInformation = struct{
-        transitionFequencyPerState:[]ArraySet(Pair(u8, u32), keyCompare(Pair(u8, u32), makeOrder(u8))),
+        transitionFequencyPerState:[]EntireTransitionMapOfAState, // instead of mapping to a state, we map to a frequency (also a u32)
         // only counts if we left the state again (so that all transition frequencies add up to the number of visits)
         visitsPerState:[]u32,
 
@@ -1185,7 +1201,7 @@ const RegExDFA = struct{
 
         pub fn init(allocer:Allocator, numStates:u32) !@This() {
             var info = ProfilingInformation{
-                .transitionFequencyPerState = try allocer.alloc(ArraySet(Pair(u8, u32), keyCompare(Pair(u8, u32), makeOrder(u8))), numStates),
+                .transitionFequencyPerState = try allocer.alloc(EntireTransitionMapOfAState, numStates),
                 .visitsPerState = try allocer.alloc(u32, numStates),
                 .internalAllocator = allocer,
             };
@@ -1193,7 +1209,7 @@ const RegExDFA = struct{
             @memset(info.visitsPerState, 0);
 
             for (info.transitionFequencyPerState) |*transitions| {
-                transitions.* = try ArraySet(Pair(u8, u32), keyCompare(Pair(u8, u32), makeOrder(u8))).init(allocer);
+                transitions.* = try EntireTransitionMapOfAState.init(allocer);
             }
 
             return info;
@@ -1212,22 +1228,20 @@ const RegExDFA = struct{
         var curState:u32 = self.startState;
         for(word) |c| {
             // possibly return first so that the visit count only counts if we left the state again
-            const nextState = self.transitions[curState].findByKey(c) orelse return;
+            const nextState = self.transitions[curState].find(c) orelse return;
 
             profile.visitsPerState[curState] += 1;
-            var spot = try profile.transitionFequencyPerState[curState].findOrMakeSpot(.{c, undefined}, .{});
-            if(spot.found_existing){
-                spot.item_ptr.*[1] += 1;
+            if(profile.transitionFequencyPerState[curState].findSpot(c)) |spot| {
+                spot.* += 1;
             }else{
-                spot.item_ptr.*[0] = c;
-                spot.item_ptr.*[1] = 1;
+                try profile.transitionFequencyPerState[curState].insertSingle(c, 1);
             }
 
             curState = nextState;
         }
     }
 
-    const CompilationError = error{DFATooLargeError} || FeError || std.os.MMapError;
+    const CompilationError = error{DFATooLargeError, NotYetImplemented} || FeError || std.os.MMapError;
 
     const CompiledRegExDFA = struct{
         jitBuf:[]u8,
@@ -1316,6 +1330,7 @@ const RegExDFA = struct{
         //   - this would only incur a check if we actually reached the end of the word, but require the user to have a zero-terminated string, and it forbids using fallthrough for the last possible transition (although - with profiling info - that should be the most unlikely one)
         //   - currently only this option is implemented
 
+        // TODO re-do this calculation considering the new ranges feature
         const executableRegionSizeEstimate = 
             // data region
             // nothing for if-else chain or binary search based solutions
@@ -1368,7 +1383,7 @@ const RegExDFA = struct{
         try encode(&cur, fadec.FE_MOV64ri, .{fadec.FE_AX, @intFromBool(false)});
         try encode(&cur, fadec.FE_RET, .{});
 
-        // same for when we have reached the end of the word
+        // same idea for the code for reaching the end of the word
         const checkFinalStatePtr = cur;
         
         // we basically need to do:
@@ -1434,22 +1449,24 @@ const RegExDFA = struct{
                 curTransitionsOrdered = try self.transitions[curState].clone();
 
                 const transitionFequency = opts.profileInfo.transitionFequencyPerState[curState];
+                const RangedTransition = Pair(u8, Pair(u8, u32));
                 const lambda = struct{
-                    fn f(transitionFequencyLocal:@TypeOf(transitionFequency), a:Transition, b:Transition) bool {
-                        return transitionFequencyLocal.findByKey(a[0]) orelse 0 > transitionFequencyLocal.findByKey(b[0]) orelse 0;
+                    fn f(transitionFequencyLocal:@TypeOf(transitionFequency), a:RangedTransition, b:RangedTransition) bool {
+                        return transitionFequencyLocal.find(a[0]) orelse 0 > transitionFequencyLocal.find(b[0]) orelse 0;
                     }
                 }.f;
-                std.sort.pdq(Transition, curTransitionsOrdered.items, transitionFequency, lambda);
+                std.sort.pdq(RangedTransition, curTransitionsOrdered.map.items, transitionFequency, lambda);
 
-                assert(curTransitionsOrdered.items.len == 0 or transitionFequency.findByKey(curTransitionsOrdered.items[0][0]) orelse 0 >= transitionFequency.findByKey(curTransitionsOrdered.items[curTransitionsOrdered.items.len-1][0]) orelse 0, "sorting didnt work", .{});
+                assert(curTransitionsOrdered.map.items.len == 0 or transitionFequency.find(curTransitionsOrdered.map.items[0][0]) orelse 0 >= transitionFequency.find(curTransitionsOrdered.map.items[curTransitionsOrdered.map.items.len-1][0]) orelse 0, "sorting didnt work", .{});
             }else{
                 // copy shouldnt be a problem, is only copying fat pointers, right?
                 curTransitionsOrdered = self.transitions[curState];
             }
 
-            for(curTransitionsOrdered.items) |transition| {
+            for(curTransitionsOrdered.map.items) |transition| {
                 // add to the worklist
-                const targetState = transition[1];
+                const range:Pair(u8,u8) = .{transition[1][0], transition[0]};
+                const targetState = transition[1][1];
                 if(!scheduledForVisit[targetState]) {
                     worklist.appendAssumeCapacity(targetState);
                     scheduledForVisit[targetState] = true;
@@ -1457,17 +1474,24 @@ const RegExDFA = struct{
 
                 // do the actual work
 
-                // cmp cl, transitionChar
-                try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, transition[0]});
+                // single char transition
+                if(range[0] == range[1]){
+                    const char = range[0];
 
-                // je targetState
-                if(startOfState[targetState]) |jeTarget| {
-                    // just encode, and let fadec pick the best encoding
-                    try encode(&cur, fadec.FE_JZ, .{oldIntCast(@intFromPtr(jeTarget), fadec.FeOp)});
+                    // cmp cl, transitionChar
+                    try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, char});
+
+                    // je targetState
+                    if(startOfState[targetState]) |jeTarget| {
+                        // just encode, and let fadec pick the best encoding
+                        try encode(&cur, fadec.FE_JZ, .{oldIntCast(@intFromPtr(jeTarget), fadec.FeOp)});
+                    }else{
+                        try jumpsToPatch.append(.{.instrToPatch = @ptrCast(cur), .targetState = targetState});
+                        // use longest possible encoding to reserve space, patch it later
+                        try encode(&cur, fadec.FE_JZ | fadec.FE_JMPL, .{oldIntCast(@intFromPtr(cur), fadec.FeOp)});
+                    }
                 }else{
-                    try jumpsToPatch.append(.{.instrToPatch = @ptrCast(cur), .targetState = targetState});
-                    // use longest possible encoding to reserve space, patch it later
-                    try encode(&cur, fadec.FE_JZ | fadec.FE_JMPL, .{oldIntCast(@intFromPtr(cur), fadec.FeOp)});
+                    return error.NotYetImplemented;
                 }
             }
 
@@ -1801,7 +1825,7 @@ const RegExNFA = struct {
                 }
 
                 // add transition
-                try dfa.transitions[curDfaState].insert(.{transition[0], targetStateEntry.value_ptr.*}, .{});
+                try dfa.transitions[curDfaState].insertSingle(transition[0], targetStateEntry.value_ptr.*);
             }
 
         }
@@ -1826,8 +1850,8 @@ test "ab* DFA" {
     const a = 0;
     const b = 1;
 
-    try dfa.transitions[a].insert(.{'a', b}, .{});
-    try dfa.transitions[b].insert(.{'b', b}, .{});
+    try dfa.transitions[a].insertSingle('a', b);
+    try dfa.transitions[b].insertSingle('b', b);
     try dfa.designateStatesFinal(&[1]u32{b});
 
     try expect(dfa.isInLanguageInterpreted("a"));
@@ -2064,22 +2088,22 @@ test "regex dfa profiling" {
         const runNumber = i+1;
 
         try dfa.profileOneRun("xyz", &profileInfo);
-        try expect(runNumber == profileInfo.transitionFequencyPerState[dfa.startState].findByKey('x').?);
-        const stateOne = dfa.transitions[dfa.startState].findByKey('x').?;
-        try expect(runNumber == profileInfo.transitionFequencyPerState[stateOne].findByKey('y').?);
-        const stateTwo = dfa.transitions[stateOne].findByKey('y').?;
-        try expect(runNumber == profileInfo.transitionFequencyPerState[stateTwo].findByKey('z').?);
+        try expect(runNumber == profileInfo.transitionFequencyPerState[dfa.startState].find('x').?);
+        const stateOne = dfa.transitions[dfa.startState].find('x').?;
+        try expect(runNumber == profileInfo.transitionFequencyPerState[stateOne].find('y').?);
+        const stateTwo = dfa.transitions[stateOne].find('y').?;
+        try expect(runNumber == profileInfo.transitionFequencyPerState[stateTwo].find('z').?);
 
         try expect(runNumber == profileInfo.visitsPerState[dfa.startState]);
         try expect(runNumber == profileInfo.visitsPerState[stateOne]);
         try expect(runNumber == profileInfo.visitsPerState[stateTwo]);
         // don't increment the final state, as that is not left
-        try expect(0 == profileInfo.visitsPerState[dfa.transitions[stateTwo].findByKey('z').?]);
+        try expect(0 == profileInfo.visitsPerState[dfa.transitions[stateTwo].find('z').?]);
 
         // these should be the only entries -> check that all are runNumber
         for(profileInfo.transitionFequencyPerState) |transitions| {
-            for(transitions.items) |transition| {
-                try expect(transition[1] == runNumber);
+            for(transitions.map.items) |transition| {
+                try expect(transition[1][1] == runNumber);
             }
         }
     }
