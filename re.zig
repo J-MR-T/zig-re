@@ -53,11 +53,6 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             DontSort:bool              = false,
         };
 
-        const FindOpts = struct{
-            MakeSpaceForNewIfNotFound:bool = false,
-            AssumeCapacity:bool            = false,
-            LinearInsertionSearch:bool     = false,
-        };
         pub fn init(allocator:Allocator) !@This() {
             var self = @This(){
                 .items = undefined,
@@ -150,7 +145,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
                 return .{.item_ptr = &self.items[self.items.len-1], .found_existing = false};
             }
 
-            var findResults = try self.findSpot(itemToInsert, .{.MakeSpaceForNewIfNotFound = true, .AssumeCapacity = opts.AssumeCapacity, .LinearInsertionSearch = opts.LinearInsertionSearch});
+            var findResults = try self.findOrMakeSpot(itemToInsert, .{.AssumeCapacity = opts.AssumeCapacity, .LinearInsertionSearch = opts.LinearInsertionSearch});
             // if we didnt find it, or we should replace it, write to it
             if(!findResults.found_existing or opts.ReplaceExisting)
                 findResults.item_ptr.* = itemToInsert;
@@ -241,11 +236,8 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
         // this is not very efficient, as this set is not really designed to have elements removed from frequently. Has to move O(n) elements in the worst case
         // returns whether it removed something
         // never shrinks the internal array
-        pub fn remove(self:*@This(), itemToRemove:T, comptime findOpts:FindOpts) bool {
-            if(findOpts.MakeSpaceForNewIfNotFound)
-                @compileError("MakeSpaceForNewIfNotFound not applicable for remove");
-
-            const spot = self.findSpot(itemToRemove, findOpts) catch unreachable;
+        pub fn remove(self:*@This(), itemToRemove:T, comptime findOpts:struct{LinearInsertionSearch:bool = false}) bool {
+            const spot = self.findSpot(itemToRemove, .{.LinearInsertionSearch = findOpts.LinearInsertionSearch}) orelse return false;
             if(spot.found_existing){
                 const i = (@intFromPtr(spot.item_ptr) - @intFromPtr(self.items.ptr))/@sizeOf(T);
                 std.mem.copyForwards(T, self.items[i..self.items.len-1], self.items[i+1..self.items.len]);
@@ -255,43 +247,52 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             return false;
         }
 
-        // returns whether the set contains the item
+        // returns whether the set contains the item finds the item using binary search
         pub fn contains(self:*const @This(), itemToFind:T) bool {
-            return self.find(itemToFind) != null;
+            const spot = self.findSpot(itemToFind, .{.LinearInsertionSearch = false}) orelse return false;
+            return spot.found_existing;
         }
 
         pub fn containsKey(self:*const @This(), keyToFind:@typeInfo(T).Struct.fields[0].type) bool {
-            return self.findByKey(keyToFind) != null;
+            return self.contains(.{keyToFind, undefined});
         }
 
-        // finds the first item that is greater than or equal to the item to find using binary search
-        pub fn find(self:*const @This(), itemToCompareAgainst:T) ?T{
-            // can confidently @constCast, and ignore the error, because we don't modify anything (guaranteed by the implementation)
-            const spot = @constCast(self).findSpot(itemToCompareAgainst, .{.MakeSpaceForNewIfNotFound = false, .AssumeCapacity = false, .LinearInsertionSearch = false}) catch unreachable;
-            return if(spot.found_existing) spot.item_ptr.* else null;
-        }
-
-        // finds the first item that is greater than or equal to the item to find using linear search
-        pub fn findLinear(self:*const @This(), itemToCompareAgainst:T) ?T{
-            const spot = @constCast(self).findSpot(itemToCompareAgainst, .{.MakeSpaceForNewIfNotFound = false, .AssumeCapacity = false, .LinearInsertionSearch = true}) catch unreachable;
-            return if(spot.found_existing) spot.item_ptr.* else null;
-        }
-
-        // finds 
         pub fn findByKey(self:*const @This(), keyToCompareAgainst:structFieldType(T, 0)) ?structFieldType(T, 1){
             if(@typeInfo(T).Struct.fields.len != 2)
                 @compileError("findByKey only works when this set is being used as a key value map, i.e. with two-long tuple elements");
 
-            return (self.find(.{keyToCompareAgainst, undefined}) orelse return null)[1];
+            const spot = self.findSpot(.{keyToCompareAgainst, undefined}, .{.LinearInsertionSearch = false}) orelse return null;
+            return if(spot.found_existing) spot.item_ptr.*[1] else null;
+        }
+
+        // finds the first item that is greater than or equal to the item to find. If there is no greater or equal item, null is returned. If item_ptr.* is greater, found_existing is false. Otherwise, found_existing is true
+        pub fn findSpot(self:*const @This(), itemToCompareAgainst:T, comptime opts:struct{
+            LinearInsertionSearch:bool = false,
+        }) ?SpotInfo {
+            // can confidently @constCast, and ignore the error, because we don't modify anything (guaranteed by the implementation)
+            return @constCast(self).findSpotInternal(itemToCompareAgainst, .{.LinearInsertionSearch = opts.LinearInsertionSearch}) catch unreachable;
+        }
+
+        // finds the spot of the item that is equal to the item to find, or the spot where it should be inserted if it does not exist (expanding the array, possibly allocating new space)
+        pub fn findOrMakeSpot(self:*@This(), itemToCompareAgainst:T, comptime opts:struct{
+            AssumeCapacity:bool        = false,
+            LinearInsertionSearch:bool = false,
+        }) !SpotInfo {
+            return (try self.findSpotInternal(itemToCompareAgainst, .{.MakeSpaceForNewIfNotFound = true, .AssumeCapacity = opts.AssumeCapacity, .LinearInsertionSearch = opts.LinearInsertionSearch})) orelse unreachable; // cannot be null, because we make space if it doesnt exist
         }
 
         // only use this if you know what you're doing, try to use `contains`, the other `find...` function or `insert` if possible
         // finds the first item that is greater than or equal to the item to find and returns a pointer to it or the place it should be inserted if it does not exist, as well as whether or not it exists
         // if opts.MakeSpaceForNewIfNotFound is set, the array will be expanded and the returned pointer will point to the new item (undefined) item.
-        // if opts.MakeSpaceForNewIfNotFound is not set, the returned pointer will be invalid (but sensible!), if .found_existing is false
-        pub fn findSpot(self:*@This(), itemToCompareAgainst:T, comptime opts:FindOpts) !SpotInfo {
+        // if opts.MakeSpaceForNewIfNotFound is not set and .found_existing is false, the returned pointer is null, if the array contains no element greater than the passed element, and valid if there is such an element.
+        //   can not return an error if opts.MakeSpaceForNewIfNotFound is not set
+        fn findSpotInternal(self:*@This(), itemToCompareAgainst:T, comptime opts:struct{
+            MakeSpaceForNewIfNotFound:bool = false,
+            AssumeCapacity:bool            = false,
+            LinearInsertionSearch:bool     = false,
+        }) !?SpotInfo {
             if(!opts.MakeSpaceForNewIfNotFound and opts.AssumeCapacity)
-                @compileError("Can't assume capacity if findSpot can not insert");
+                @compileError("Can't assume capacity if findSpotInternal can not insert");
 
             var left: usize = 0;
             var right: usize = self.items.len;
@@ -339,6 +340,10 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
 
                 // shift everything to the right
                 std.mem.copyBackwards(T, self.internalSlice[firstGreater+1..], self.internalSlice[firstGreater..(self.items.len - 1)]); // -1: old item length
+            }else {
+                if(firstGreater == self.items.len) 
+                    // in this case, we don't want to return an invalid pointer, so we return null (as the whole spot info, because found existing is obviously implicitly false in this case), as the pointer would not make sense, if the array has not been expanded
+                    return null;
             }
 
             return .{.item_ptr = @ptrCast(self.items.ptr + firstGreater), .found_existing = false};
@@ -360,70 +365,6 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
         }
     };
 
-}
-
-pub fn UnionFind(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
-    return struct{
-        parent:ArraySet(Tuple(&[2]type{T, T}), keyCompare(Tuple(&[2]type{T, T}), comparatorFn)),
-
-        pub fn init(allocator:Allocator) !@This() {
-            return @This(){
-                .parent = try ArraySet(Tuple(&[2]type{T, T}), keyCompare(Tuple(&[2]type{T, T}), comparatorFn)).init(allocator),
-            };
-        }
-
-        pub fn find(self:*@This(), item:T) !*T {
-            const parent = try self.parent.findSpot(.{item, undefined}, .{.MakeSpaceForNewIfNotFound = true});
-            // smallest sets are simply one-element sets represented by themselves. These get inserted explicitly, so that a union (yunyin) can be done with them
-            if(!parent.found_existing){
-                parent.item_ptr.*[0] = item;
-                parent.item_ptr.*[1] = item;
-                return &parent.item_ptr.*[1];
-            }
-
-            // parents that point to themselves are also the representative of their set
-            if(comparatorFn(parent.item_ptr.*[1], item) == Order.eq)
-                return &parent.item_ptr.*[1];
-
-            const rep = try self.find(parent.item_ptr.*[1]);
-            // path compression
-            parent.item_ptr.*[1] = rep.*;
-            return rep;
-        }
-
-        // representative of a is now the representative of all of a \cup b
-        pub fn yunyin(self:*@This(), a:T, b:T) !void {
-            const aParent = try self.find(a);
-            var bParent = try self.find(b);
-
-            if(comparatorFn(aParent.*, bParent.*) == Order.eq)
-                return;
-
-            bParent.* = aParent.*;
-        }
-    };
-}
-
-test "union-find" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const T = u32;
-    var uf = try UnionFind(T, makeOrder(T)).init(arena.allocator());
-
-    try uf.yunyin(1, 2);
-    try expect(try uf.find(1) == try uf.find(2));
-    try expect((try uf.find(1)).* == 1);
-
-    try uf.yunyin(3, 4);
-    try expect(try uf.find(3) == try uf.find(4));
-    try expect((try uf.find(3)).* == 3);
-
-    try uf.yunyin(2, 4);
-    try expect((try uf.find(1)).* == 1);
-    for(1..5) |i| {
-        try expect(try uf.find(@intCast(i)) == try uf.find(1));
-    }
 }
 
 fn oldIntCast(x:anytype, comptime ResultType:type) ResultType {
@@ -569,6 +510,133 @@ test "use array set as map" {
         try expect(item[1] == item[0]*item[0]);
     }
 }
+
+pub fn UnionFind(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
+    return struct{
+        parent:ArraySet(Tuple(&[2]type{T, T}), keyCompare(Tuple(&[2]type{T, T}), comparatorFn)),
+
+        pub fn init(allocator:Allocator) !@This() {
+            return @This(){
+                .parent = try ArraySet(Tuple(&[2]type{T, T}), keyCompare(Tuple(&[2]type{T, T}), comparatorFn)).init(allocator),
+            };
+        }
+
+        pub fn deinit(self:@This()) void {
+            self.parent.deinit();
+        }
+
+        pub fn find(self:*@This(), item:T) !*T {
+            const parent = try self.parent.findOrMakeSpot(.{item, undefined}, .{});
+            // smallest sets are simply one-element sets represented by themselves. These get inserted explicitly, so that a union (yunyin) can be done with them
+            if(!parent.found_existing){
+                parent.item_ptr.*[0] = item;
+                parent.item_ptr.*[1] = item;
+                return &parent.item_ptr.*[1];
+            }
+
+            // parents that point to themselves are also the representative of their set
+            if(comparatorFn(parent.item_ptr.*[1], item) == Order.eq)
+                return &parent.item_ptr.*[1];
+
+            const rep = try self.find(parent.item_ptr.*[1]);
+            // path compression
+            parent.item_ptr.*[1] = rep.*;
+            return rep;
+        }
+
+        // representative of a is now the representative of all of a \cup b
+        pub fn yunyin(self:*@This(), a:T, b:T) !void {
+            const aParent = try self.find(a);
+            var bParent = try self.find(b);
+
+            if(comparatorFn(aParent.*, bParent.*) == Order.eq)
+                return;
+
+            bParent.* = aParent.*;
+        }
+    };
+}
+
+test "union-find" {
+    const T = u32;
+    var uf = try UnionFind(T, makeOrder(T)).init(std.testing.allocator);
+    defer uf.deinit();
+
+    try uf.yunyin(1, 2);
+    try expect(try uf.find(1) == try uf.find(2));
+    try expect((try uf.find(1)).* == 1);
+
+    try uf.yunyin(3, 4);
+    try expect(try uf.find(3) == try uf.find(4));
+    try expect((try uf.find(3)).* == 3);
+
+    try uf.yunyin(2, 4);
+    try expect((try uf.find(1)).* == 1);
+    for(1..5) |i| {
+        try expect(try uf.find(@intCast(i)) == try uf.find(1));
+    }
+}
+
+// ranges are inclusive and may not overlap (they are seen as disjoint sets)
+pub fn RangeMap(comptime RangeableKey:type, comptime keyOrder:(fn(RangeableKey, RangeableKey) Order), comptime Value:type) type {
+    return struct{
+        // maps highest element of range to (lowest, value)
+        const Map = ArraySet(Pair(RangeableKey, Pair(RangeableKey, Value)), keyCompare(Pair(RangeableKey, Pair(RangeableKey, Value)), keyOrder));
+        map:Map,
+        
+        pub fn init(allocator:Allocator) !@This() {
+            return @This(){
+                .map = try Map.init(allocator),
+            };
+        }
+
+        pub fn deinit(self:@This()) void {
+            self.map.deinit();
+        }
+
+        // inserts a range + value. ranges are inclusive and may not overlap
+        pub fn insert(self:*@This(), lower:RangeableKey, upper:RangeableKey, value:Value, comptime opts:struct {AssumeNoOverlap:bool = false}) !void {
+            assert(keyOrder(lower, upper) != Order.gt, "lower bound of range must be <= than upper bound", .{});
+            if(opts.AssumeNoOverlap){
+                assert(self.find(lower) == null, "tried to insert existing range; ranges cannot overlap", .{});
+                assert(self.find(upper) == null, "tried to insert existing range; ranges cannot overlap", .{});
+            }else{
+                if(self.find(lower) != null or self.find(upper) != null)
+                    return error.OverlappingRanges;
+            }
+            try self.map.insert(.{upper, .{lower, value}}, .{});
+        }
+
+        pub fn find(self:*const @This(), key:RangeableKey) ?Value {
+            // finds the first greater than or equal to key -> will be the highest element of the range that could contain key, if key >= lowest
+            const spotInfo = self.map.findSpot(.{key, undefined}, .{}) 
+                // passed key is higher than any highest element of a range
+                orelse return null;
+
+            if(key >= spotInfo.item_ptr.*[1][0])
+                // lies within the range
+                return spotInfo.item_ptr.*[1][1];
+
+            return null;
+        }
+    };
+}
+
+test "range map"{
+    var rm = try RangeMap(u32, makeOrder(u32), u32).init(std.testing.allocator); 
+    defer rm.deinit();
+
+    try rm.insert(0, 10, 1, .{});
+    for(0..11) |i| {
+        const ii = oldIntCast(i, u32);
+        try expect(rm.find(@intCast(ii)).? == 1);
+        try std.testing.expectError(error.OverlappingRanges, rm.insert(ii, ii, 1, .{}));
+    }
+
+    try std.testing.expectError(error.OverlappingRanges, rm.insert(0, 10, 1, .{}));
+    try std.testing.expectError(error.OverlappingRanges, rm.insert(3, 6, 1, .{}));
+}
+
 
 const Token = struct {
     char:u8,
@@ -1092,7 +1160,7 @@ const RegExDFA = struct{
             const nextState = self.transitions[curState].findByKey(c) orelse return;
 
             profile.visitsPerState[curState] += 1;
-            var spot = try profile.transitionFequencyPerState[curState].findSpot(.{c, undefined}, .{.MakeSpaceForNewIfNotFound = true});
+            var spot = try profile.transitionFequencyPerState[curState].findOrMakeSpot(.{c, undefined}, .{});
             if(spot.found_existing){
                 spot.item_ptr.*[1] += 1;
             }else{
@@ -1515,7 +1583,7 @@ const RegExNFA = struct {
 
     // returns whether it added anything
     pub fn addTransitionGetInfo(self:*@This(), from:u32, with:?u8, to:u32) !bool {
-        var entry = try self.transitions[from].findSpot(.{with, undefined}, .{.MakeSpaceForNewIfNotFound = true});
+        var entry = try self.transitions[from].findOrMakeSpot(.{with, undefined}, .{});
         if(!entry.found_existing){
             // set the char, if its new
             entry.item_ptr.*[0] = with;
@@ -1541,7 +1609,7 @@ const RegExNFA = struct {
 
             const transitionTargets = transition[1];
             
-            const transitionsUsingTerminalFromStateToCopyTo = try transitionsToCopyTo.findSpot(.{terminal, undefined}, .{.MakeSpaceForNewIfNotFound = true});
+            const transitionsUsingTerminalFromStateToCopyTo = try transitionsToCopyTo.findOrMakeSpot(.{terminal, undefined}, .{});
             const targetListToChangePtr:*UniqueStateSet = &transitionsUsingTerminalFromStateToCopyTo.item_ptr.*[1];
 
             if(transitionsUsingTerminalFromStateToCopyTo.found_existing){
@@ -1652,7 +1720,7 @@ const RegExNFA = struct {
                     if(transition.*[0]) |c| {
                         // first: find/insert the transition map for the current char
                         // results are still correct
-                        var entry = try combinedTransitionsForCurNfaState.findSpot(.{c, undefined}, .{.MakeSpaceForNewIfNotFound = true});
+                        var entry = try combinedTransitionsForCurNfaState.findOrMakeSpot(.{c, undefined}, .{});
                         // either create, if it doesn't exist yet or add all
                         if(!entry.found_existing){
                             // set the char
