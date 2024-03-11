@@ -44,7 +44,8 @@ fn makeOrder(comptime T:type) fn (T, T) Order {
     }.f;
 }
 
-// sorted array set. does not suppport removal
+// sorted array set. Should not be used if removal is important, try to treat it as an insert-only set
+// an insert-first-lookup-later sorted vector like map for performance (like https://www.llvm.org/docs/ProgrammersManual.html recommends)
 pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
     return struct {
         items:[]T,
@@ -337,14 +338,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             assert(firstGreater <= self.items.len, "Find reached too far outside the array", .{});
 
             if(opts.MakeSpaceForNewIfNotFound){
-                if(!opts.AssumeCapacity)
-                    try self.ensureUnusedCapacity(1);
-
-                // let the `items` slice know that it has grown
-                self.items.len += 1;
-
-                // shift everything to the right
-                std.mem.copyBackwards(T, self.internalSlice[firstGreater+1..], self.internalSlice[firstGreater..(self.items.len - 1)]); // -1: old item length
+                try self.insertBeforeInternal(firstGreater, opts.AssumeCapacity);
             }else {
                 if(firstGreater == self.items.len) 
                     // in this case, we don't want to return an invalid pointer, so we return null (as the whole spot info, because found existing is obviously implicitly false in this case), as the pointer would not make sense, if the array has not been expanded
@@ -352,6 +346,18 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             }
 
             return .{.item_ptr = @ptrCast(self.items.ptr + firstGreater), .found_existing = false};
+        }
+
+        // do not use this functino to simply insert an element, this can only be used if you have found the proper insertion point already
+        fn insertBeforeInternal(self:*@This(), index:usize, assumeCapacity:bool) Allocator.Error!void {
+            if(!assumeCapacity)
+                try self.ensureUnusedCapacity(1);
+
+            // let the `items` slice know that it has grown
+            self.items.len += 1;
+
+            // shift everything to the right
+            std.mem.copyBackwards(T, self.internalSlice[index+1..], self.internalSlice[index..(self.items.len - 1)]); // -1: old item length
         }
 
         // clones the set, uses the same allocator. Does not make any guarantees about the capacity of the new set, just that the actual elements are the same
@@ -586,7 +592,8 @@ test "union-find" {
 pub fn RangeMap(comptime RangeableKey:type, comptime keyOrder:(fn(RangeableKey, RangeableKey) Order), comptime Value:type) type {
     return struct{
         // maps highest element of range to (lowest, value)
-        const Map = ArraySet(Pair(RangeableKey, Pair(RangeableKey, Value)), keyCompare(Pair(RangeableKey, Pair(RangeableKey, Value)), keyOrder));
+        const Item = Pair(RangeableKey, Pair(RangeableKey, Value));
+        const Map = ArraySet(Item, keyCompare(Item, keyOrder));
         map:Map,
         
         pub fn init(allocator:Allocator) !@This() {
@@ -613,7 +620,7 @@ pub fn RangeMap(comptime RangeableKey:type, comptime keyOrder:(fn(RangeableKey, 
         }
 
         // inserts a range + value. ranges are inclusive and may not overlap
-        pub fn insert(self:*@This(), lower:RangeableKey, upper:RangeableKey, value:Value, comptime opts:struct {AssumeNoOverlap:bool = false}) !void {
+        pub fn insert(self:*@This(), lower:RangeableKey, upper:RangeableKey, value:Value, comptime opts:struct{AssumeNoOverlap:bool = false}) !void {
             assert(keyOrder(lower, upper) != Order.gt, "lower bound of range must be <= than upper bound", .{});
             if(opts.AssumeNoOverlap){
                 assert(self.find(lower) == null, "tried to insert existing range; ranges cannot overlap", .{});
@@ -625,11 +632,15 @@ pub fn RangeMap(comptime RangeableKey:type, comptime keyOrder:(fn(RangeableKey, 
             try self.map.insert(.{upper, .{lower, value}}, .{});
         }
 
-        pub fn insertSingle(self:*@This(), key:RangeableKey, value:Value) !void {
-            try self.insert(key, key, value, .{});
+        pub fn insertSingle(self:*@This(), key:RangeableKey, value:Value, comptime opts:struct{AssumeNoOverlap:bool = false}) !void {
+            try self.insert(key, key, value, .{.AssumeNoOverlap = opts.AssumeNoOverlap});
         }
 
-        pub fn findSpot(self:*const @This(), key:RangeableKey) ?*Value {
+        pub fn find(self:*const @This(), key:RangeableKey) ?Value {
+            return (self.findByPtr(key) orelse return null).*;
+        }
+
+        pub fn findByPtr(self:*const @This(), key:RangeableKey) ?*Value {
             // finds the first greater than or equal to key -> will be the highest element of the range that could contain key, if key >= lowest
             const spotInfo = self.map.findSpot(.{key, undefined}, .{}) 
                 // passed key is higher than any highest element of a range
@@ -642,8 +653,57 @@ pub fn RangeMap(comptime RangeableKey:type, comptime keyOrder:(fn(RangeableKey, 
             return null;
         }
 
-        pub fn find(self:*const @This(), key:RangeableKey) ?Value {
-            return (self.findSpot(key) orelse return null).*;
+        const SpotInfo = struct{item_ptr:*Item, found_existing:bool, 
+            fn setRange(self:*@This(), newLower:RangeableKey, newUpper:RangeableKey) void { self.item_ptr.*[0] = newUpper; self.item_ptr.*[1][0] = newLower; }
+            fn getRange(self:*const @This()) Pair(RangeableKey, RangeableKey) { return .{self.item_ptr.*[0], self.item_ptr.*[1][0]}; }
+            fn value(self:*@This()) *Value { return &self.item_ptr.*[1][1]; }
+            fn lower(self:*@This()) *RangeableKey { return &self.item_ptr.*[1][0]; }
+            fn upper(self:*@This()) *RangeableKey { return &self.item_ptr.*[0]; }
+        };
+        pub fn findOrMakeSpot(self:*@This(), key:RangeableKey, opts:struct{AssumeCapacity:bool = false}) !SpotInfo {
+            // TODO unfortunately duplicates code from findSpotInternal, because to avoid searching twice, we need to make nuanced modifications to the search
+            var left: usize = 0;
+            var right: usize = self.map.items.len;
+
+            // binary search, but we can't use the std.sort one, because we need to insert if not found
+            // so just copy that one and change it :
+            while (left < right) {
+                // Avoid overflowing in the midpoint calculation
+                const mid = left + (right - left) / 2;
+                // Compare the key with the midpoint element
+                switch(keyOrder(key, self.map.items[mid][0])){
+                    Order.lt => right = mid,
+                    Order.gt => left = mid + 1,
+                    Order.eq => return .{.item_ptr = &self.map.items[mid], .found_existing = true},
+                }
+            }
+            assert(left == right, "after binary search to insert, we should be left with a definitive insertion point", .{});
+            // left again points to first element that is greater than the item to insert -> insert before that
+
+            const firstGreater = left;
+            // assert sensible insertion point
+            assert(firstGreater <= self.map.items.len, "Find reached too far outside the array", .{});
+
+            // DIFFERENCE: check if the key lies in the found range, just return it
+            if(firstGreater < self.map.items.len and keyOrder(key, self.map.items[firstGreater][1][0]) != Order.lt)
+                return .{.item_ptr = @ptrCast(self.map.items.ptr + firstGreater), .found_existing = true};
+
+            // otherwise insert:
+            if(!opts.AssumeCapacity)
+                try self.map.ensureUnusedCapacity(1);
+
+            // let the `items` slice know that it has grown
+            self.map.items.len += 1;
+
+            // shift everything to the right
+            std.mem.copyBackwards(Item, self.map.internalSlice[firstGreater+1..], self.map.internalSlice[firstGreater..(self.map.items.len - 1)]); // -1: old item length
+
+            return .{.item_ptr = @ptrCast(self.map.items.ptr + firstGreater), .found_existing = false};
+        }
+
+        // simply accesses the internal slice by index (assumes the index exists). Only use if you understand the maps inner workings
+        pub fn valueByIndex(self:*const @This(), index:usize) Value {
+            return self.map.items[index][1][1];
         }
     };
 }
@@ -666,8 +726,6 @@ test "range map"{
 test "range map transitions" {
     // adapted from NFA
     const UniqueStateSet = ArraySet(u32, makeOrder(u32));
-    const EpsTransitionsForOneTerminal = Pair(?u8, UniqueStateSet);
-    _ = EpsTransitionsForOneTerminal;
 
     const EntireTransitionMapOfAState = RangeMap(?u8, struct {
         pub fn f(a:?u8, b:?u8) Order {
@@ -686,22 +744,22 @@ test "range map transitions" {
     var map = try EntireTransitionMapOfAState.init(std.testing.allocator);
     defer map.deinit();
     try map.insert('a', 'z', try UniqueStateSet.init(std.testing.allocator), .{});
-    var res = try expectNotNull(map.findSpot('a'));
+    var res = try expectNotNull(map.findByPtr('a'));
     defer res.deinit();
     try res.insert(1, .{});
-    res = try expectNotNull(map.findSpot('a'));
+    res = try expectNotNull(map.findByPtr('a'));
     try expect(res.contains(1));
-    res = try expectNotNull(map.findSpot('a'));
+    res = try expectNotNull(map.findByPtr('a'));
     try res.insert(3, .{});
-    res = try expectNotNull(map.findSpot('a'));
+    res = try expectNotNull(map.findByPtr('a'));
     try expect(res.contains(3));
-    res = try expectNotNull(map.findSpot('a'));
+    res = try expectNotNull(map.findByPtr('a'));
     try res.insert(2, .{});
-    res = try expectNotNull(map.findSpot('a'));
+    res = try expectNotNull(map.findByPtr('a'));
     try expect(res.contains(2));
 
     for('a'..('z'+1)) |c|{
-        var res2 = try expectNotNull(map.findSpot(@intCast(c)));
+        var res2 = try expectNotNull(map.findByPtr(@intCast(c)));
         for(1..4) |i| {
             try expect(res2.contains(@intCast(i)));
         }
@@ -983,7 +1041,7 @@ const RegEx = struct {
             try dfa.addStates(2);
             dfa.startState = 0;
             try dfa.designateStatesFinal(&[1]u32{1});
-            try dfa.transitions[dfa.startState].insertSingle(self.char, 1);
+            try dfa.transitions[dfa.startState].insertSingle(self.char, 1, .{});
 
             // TODO handle AnyChar here as soon as it's implemented
             // TODO the best thing to do would probably to add some sort of relaxation on transitions, so that they can also be taken if the input char is in a certain range. This would allow groups like [0-9] to be handled somewhat efficiently, and AnyChar would just be the range 1-255
@@ -1044,21 +1102,21 @@ const RegEx = struct {
                             const right = cur.regex.right.?;
 
                             if(!left.isOperator()){
-                                try nfa.addTransition(curStartState, left.char, curEndState);
+                                try nfa.addSingleTransition(curStartState, left.char, curEndState);
                             }else{
                                 // if it is an operator, we have visited it before, so it has a start/end state, so we can just connect it
-                                try nfa.addTransition(left.nfaEndState.?, null, curEndState);
+                                try nfa.addSingleTransition(left.nfaEndState.?, null, curEndState);
 
                                 // also connect the start state of the operator with the start state of the left operand
-                                try nfa.addTransition(curStartState, null, left.nfaStartState.?);
+                                try nfa.addSingleTransition(curStartState, null, left.nfaStartState.?);
                             }
 
                             if(!right.isOperator()){
-                                try nfa.addTransition(curStartState, right.char, curEndState);
+                                try nfa.addSingleTransition(curStartState, right.char, curEndState);
                             }else{
                                 // same as left
-                                try nfa.addTransition(right.nfaEndState.?, null, curEndState);
-                                try nfa.addTransition(curStartState, null, right.nfaStartState.?);
+                                try nfa.addSingleTransition(right.nfaEndState.?, null, curEndState);
+                                try nfa.addSingleTransition(curStartState, null, right.nfaStartState.?);
                             }
                             // sidenote: see? this is exactly why ever programming language needs the ability to use 'local functions'/lambdas for readability. Do you hear me, Zig? :. Don't even need to be real functions in the end, can just inline all of them (and forbid non-inlinable ones)
                         },
@@ -1067,39 +1125,39 @@ const RegEx = struct {
 
                             if(left.isOperator() and right.isOperator()){
                                 // if both are operators, we have visited them before, so they have start/end states, so we can just connect them
-                                try nfa.addTransition(left.nfaEndState.?, null, right.nfaStartState.?);
+                                try nfa.addSingleTransition(left.nfaEndState.?, null, right.nfaStartState.?);
                                 // and set the start/end of this operator to the start/end of the operands
                                 cur.regex.nfaStartState = left.nfaStartState.?;
                                 cur.regex.nfaEndState = right.nfaEndState.?;
                             }else if(left.isOperator()){
                                 // if only left is an operator, we can take the existing end state of left and connect it with the char of right to the new end state
-                                try nfa.addTransition(left.nfaEndState.?, right.char, curEndState);
+                                try nfa.addSingleTransition(left.nfaEndState.?, right.char, curEndState);
                                 cur.regex.nfaStartState = left.nfaStartState.?;
                             }else if(right.isOperator()){
                                 // same as left
-                                try nfa.addTransition(curStartState, left.char, right.nfaStartState.?);
+                                try nfa.addSingleTransition(curStartState, left.char, right.nfaStartState.?);
                                 cur.regex.nfaEndState = right.nfaEndState.?;
                             }else{
                                 // if both are chars, we need one more state in between
                                 const inBetweeny = try nfa.addState();
-                                try nfa.addTransition(curStartState, left.char, inBetweeny);
-                                try nfa.addTransition(inBetweeny, right.char, curEndState);
+                                try nfa.addSingleTransition(curStartState, left.char, inBetweeny);
+                                try nfa.addSingleTransition(inBetweeny, right.char, curEndState);
                             }
 
                         },
                         Token.Kind.Kleen => {
                             if(left.isOperator()){
                                 // we just reuse all of the operator and connect the end state with the start state
-                                try nfa.addTransition(left.nfaEndState.?, null, left.nfaStartState.?);
+                                try nfa.addSingleTransition(left.nfaEndState.?, null, left.nfaStartState.?);
                                 cur.regex.nfaStartState = left.nfaStartState.?;
                                 cur.regex.nfaEndState = left.nfaEndState.?;
 
                                 // also connect the start state with the end state, to be able to match the empty string by skipping the sequence of states entirley
-                                try nfa.addTransition(left.nfaStartState.?, null, left.nfaEndState.?);
+                                try nfa.addSingleTransition(left.nfaStartState.?, null, left.nfaEndState.?);
                             }else{
                                 // just use the start state as start/end
                                 // and add a transition to itself
-                                try nfa.addTransition(curStartState, left.char, curStartState);
+                                try nfa.addSingleTransition(curStartState, left.char, curStartState);
                                 cur.regex.nfaEndState = curStartState;
                             }
                         },
@@ -1231,10 +1289,12 @@ const RegExDFA = struct{
             const nextState = self.transitions[curState].find(c) orelse return;
 
             profile.visitsPerState[curState] += 1;
-            if(profile.transitionFequencyPerState[curState].findSpot(c)) |spot| {
-                spot.* += 1;
+            const spot = profile.transitionFequencyPerState[curState].findOrMakeSpot(c, .{});
+            if(spot.found_existing){
+                spot.value().* += 1;
             }else{
-                try profile.transitionFequencyPerState[curState].insertSingle(c, 1);
+                spot.setRange(c, c);
+                spot.value().* = 1;
             }
 
             curState = nextState;
@@ -1491,6 +1551,7 @@ const RegExDFA = struct{
                         try encode(&cur, fadec.FE_JZ | fadec.FE_JMPL, .{oldIntCast(@intFromPtr(cur), fadec.FeOp)});
                     }
                 }else{
+                    // TODO
                     return error.NotYetImplemented;
                 }
             }
@@ -1589,8 +1650,7 @@ const RegExNFA = struct {
     const EpsTransitionsForOneTerminal = Pair(?u8, UniqueStateSet);
     const NonEpsTransitionsForOneTerminal = Pair(u8, UniqueStateSet);
 
-    // an insert-first-lookup-later sorted vector like map for performance (like https://www.llvm.org/docs/ProgrammersManual.html recommends)
-    const EntireTransitionMapOfAState = ArraySet(EpsTransitionsForOneTerminal, keyCompare(EpsTransitionsForOneTerminal, struct {
+    const compare = struct {
         pub fn f(a:?u8, b:?u8) Order {
             // i hope this gets compiled into something proper...
             if(a == null){
@@ -1602,7 +1662,9 @@ const RegExNFA = struct {
             }
             return std.math.order(a.?,b.?);
         }
-    }.f)); // ?u8 for eps transitions
+    }.f;
+
+    const EntireTransitionMapOfAState = RangeMap(?u8, compare, UniqueStateSet); // ?u8 for eps transitions
     const FinalStates = UniqueStateSet;
 
     startState:u32,
@@ -1655,21 +1717,85 @@ const RegExNFA = struct {
         }
     }
 
-    pub fn addTransition(self:*@This(), from:u32, with:?u8, to:u32) !void {
-        _ = try self. addTransitionGetInfo(from, with, to);
+    pub fn addSingleTransition(self:*@This(), from:u32, with:?u8, to:u32) !void {
+        _ = try self. addSingleTransitionGetInfo(from, with, to);
     }
 
 
     // returns whether it added anything
-    pub fn addTransitionGetInfo(self:*@This(), from:u32, with:?u8, to:u32) !bool {
-        var entry = try self.transitions[from].findOrMakeSpot(.{with, undefined}, .{});
+    pub fn addSingleTransitionGetInfo(self:*@This(), from:u32, with:?u8, to:u32) !bool {
+        // for range based transitions, this needs to check if the transition exists and if it does but with a different target state, split up the ranges of the transitions etc.
+        // this is the simple case, where we're only adding a single char transition, so there is a maximum of three ranges to consider
+
+        var entry = try self.transitions[from].findOrMakeSpot(with, .{});
         if(!entry.found_existing){
+            // simple, just add the transition, there is no range overlap to split
+
             // set the char, if its new
-            entry.item_ptr.*[0] = with;
-            entry.item_ptr.*[1] = try UniqueStateSet.initElements(self.internalAllocator, &[1]u32{to});
+            entry.setRange(with, with);
+            entry.value().* = try UniqueStateSet.initElements(self.internalAllocator, &[1]u32{to});
             return true;
         }else{
-            return !(try entry.item_ptr.*[1].insertAndGet(to, .{})).found_existing;
+            const range = entry.getRange();
+
+            // lower split: only exists if existing transition really reaches lower
+            const lowerSplitExists = (compare(range[0], with) == Order.lt);
+            const upperSplitExists = (compare(range[1], with) == Order.gt);
+
+            if(lowerSplitExists and upperSplitExists) {
+                // only do anything complicated, if theres actually something to add
+                // this could be optimized by immediately inserting, after checking if there is something to add, but then we would have to conditionally clone the old set, which would be a bunch of control flow hassle, and in the end involve making yet another version of findOrMakeSpot
+                // we do this inside all the ifs, because in the last case, we can easily use this optimization and insert immediately, in the other cases we can't
+                if(!entry.value().contains(to)) return false;
+
+                // three in total
+                // -> reuse the existing range as the upper one, (because this does not require changing the key), add a new combined one, and add a new lower one, with the old target states
+
+                // move existing range to be the upper one
+                entry.lower().* = with.? + 1; // can safely do with.? because there is something below/above with, so it can't be null
+                                              // TODO but: -/+ 1 could be a problem because 0 - 1 needs to be null in this case. So go through all +/-1s here again and make sure to handle null elsewhere
+
+                // add lower one
+                self.transitions[from].insert(range[0], with.? - 1, try entry.value().clone(), .{.AssumeNoOverlap = true}) catch unreachable;
+
+                // add new combined one
+                var combined = try entry.value().clone();
+                try combined.insert(to, .{}); // it's guaranteed that there are no duplicates, because we just checked that it doesn't contain to
+                self.transitions[from].insertSingle(with, combined, .{}) catch unreachable;
+            }else if(lowerSplitExists) {
+                if(!entry.value().contains(to)) return false;
+
+                // two in total
+                // -> reuse
+
+                // move existing range to be the lower one
+                entry.upper().* = with.? - 1; // this shouldn't mess up any ordering, even though we're changing the key, because the relative position within the set hasn't changed
+
+                // add combined upper one
+                var combined = try entry.value().clone();
+                try combined.insert(to, .{}); // it's guaranteed that there are no duplicates, because we just checked that it doesn't contain to
+                self.transitions[from].insertSingle(with, combined, .{.AssumeNoOverlap = true}) catch unreachable;
+            }else if(upperSplitExists) {
+                if(!entry.value().contains(to)) return false;
+
+                // two in total
+                // -> reuse
+
+                // move existing range to be the upper one
+                entry.lower().* = with.? + 1; // this shouldn't mess up any ordering, even though we're changing the key, because the relative position within the set hasn't changed
+
+                // add combined lower one
+                var combined = try entry.value().clone();
+                try combined.insert(to, .{}); // it's guaranteed that there are no duplicates, because we just checked that it doesn't contain to
+                self.transitions[from].insertSingle(with, combined, .{.AssumeNoOverlap = true}) catch unreachable;
+            }else {
+                // only one
+                // -> just add the target to the existing set
+                return !(try entry.value().insertAndGet(to, .{})).found_existing;
+            }
+
+            // if we didn't add anything, we have returned somewhere in between
+            return true;
         }
     }
 
@@ -1681,29 +1807,38 @@ const RegExNFA = struct {
         var addedSomething = false;
         const transitionsToCopyFrom:EntireTransitionMapOfAState = self.transitions[from];
         const transitionsToCopyTo:*EntireTransitionMapOfAState = &self.transitions[to];
-        for(transitionsToCopyFrom.items) |transition| {
-            const terminal = transition[0];
-            if(opts.excludeEpsilonTransitions and terminal == null)
-                continue;
+        // TODO
+        for(transitionsToCopyFrom.map.items) |transition| {
+            const range:Pair(?u8,?u8) = .{transition[1][0], transition[0]};
+            if(range[0] == range[1]){ 
+                // single char transition to copy *from*
+                // TODO the code thats here atm only works if the transition to copy to is a single char transition, too, need to fix that (this is obviously also a compilation error rn)
+                const terminal = range[0];
+                if(opts.excludeEpsilonTransitions and terminal == null)
+                    continue;
 
-            const transitionTargets = transition[1];
-            
-            const transitionsUsingTerminalFromStateToCopyTo = try transitionsToCopyTo.findOrMakeSpot(.{terminal, undefined}, .{});
-            const targetListToChangePtr:*UniqueStateSet = &transitionsUsingTerminalFromStateToCopyTo.item_ptr.*[1];
+                const transitionTargets = transition[1];
 
-            if(transitionsUsingTerminalFromStateToCopyTo.found_existing){
-                const lengthBefore = targetListToChangePtr.items.len;
-                // if the terminal already exists, just add all the targets to the existing set
-                try targetListToChangePtr.addAll(transitionTargets);
+                const transitionsUsingTerminalFromStateToCopyTo = try transitionsToCopyTo.findOrMakeSpot(.{terminal, undefined}, .{});
+                const targetListToChangePtr:*UniqueStateSet = &transitionsUsingTerminalFromStateToCopyTo.item_ptr.*[1];
 
-                // can't just OR it, zig won't let me :(
-                if(targetListToChangePtr.items.len != lengthBefore)
+                if(transitionsUsingTerminalFromStateToCopyTo.found_existing){
+                    const lengthBefore = targetListToChangePtr.items.len;
+                    // if the terminal already exists, just add all the targets to the existing set
+                    try targetListToChangePtr.addAll(transitionTargets);
+
+                    // can't just OR it, zig won't let me :(
+                    if(targetListToChangePtr.items.len != lengthBefore)
+                        addedSomething = true;
+                }else{
+                    // otherwise, create a new transition list
+                    transitionsUsingTerminalFromStateToCopyTo.item_ptr.*[0] = terminal;
+                    targetListToChangePtr.* = try transitionTargets.clone();
                     addedSomething = true;
+                }
             }else{
-                // otherwise, create a new transition list
-                transitionsUsingTerminalFromStateToCopyTo.item_ptr.*[0] = terminal;
-                targetListToChangePtr.* = try transitionTargets.clone();
-                addedSomething = true;
+                // TODO
+                return error.NotYetImplemented;
             }
         }
         return addedSomething;
@@ -1711,14 +1846,14 @@ const RegExNFA = struct {
 
     // does not eliminate, but 'fill' epsilon transitions, so that they can be ignored from now on (because the language of the NFA after this function is the same with or without them)
     pub fn backUpEpsTransitions(self:*@This()) !void {
-        // TODO this is obviously very inefficient, I'm thinking about how to do it better, maybe a kind of modifierd post order traversal (that takes cycles into consideration)
+        // TODO this is obviously very inefficient, I'm thinking about how to do it better, maybe a kind of modified post order traversal (that takes cycles into consideration)
 
         // to handle transitive epsilons: just do this as long as it adds anything (this is why its inefficient)
         var changedSmth = true;
         while(changedSmth){
             changedSmth = false;
             for(0.., self.transitions) |state,*transitionsFromState| {
-                if(transitionsFromState.findByKey(null)) |epsTargetsFromState| {
+                if(transitionsFromState.find(null)) |epsTargetsFromState| {
                     // solution: copy all transitions of the targeted states (epsTargetsFromState) to the current state
                     // also if the target is a final state, make this one final too
                     for(epsTargetsFromState.items) |epsTargetState|{
@@ -1825,7 +1960,7 @@ const RegExNFA = struct {
                 }
 
                 // add transition
-                try dfa.transitions[curDfaState].insertSingle(transition[0], targetStateEntry.value_ptr.*);
+                try dfa.transitions[curDfaState].insertSingle(transition[0], targetStateEntry.value_ptr.*, .{});
             }
 
         }
@@ -1850,8 +1985,8 @@ test "ab* DFA" {
     const a = 0;
     const b = 1;
 
-    try dfa.transitions[a].insertSingle('a', b);
-    try dfa.transitions[b].insertSingle('b', b);
+    try dfa.transitions[a].insertSingle('a', b, .{});
+    try dfa.transitions[b].insertSingle('b', b, .{});
     try dfa.designateStatesFinal(&[1]u32{b});
 
     try expect(dfa.isInLanguageInterpreted("a"));
@@ -1869,19 +2004,19 @@ test "ab|aaa NFA" {
     defer nfa.deinit();
 
     try nfa.addStates(6);
-    try nfa.addTransition(0, 'a', 1);
-    try expect(nfa.transitions[0].findByKey('a') != null);
-    try expect(nfa.transitions[0].findByKey('a').?.items[0] == 1);
-    try expect(nfa.transitions[0].items[0][1].items[0] == 1);
-    try expect(nfa.transitions[0].findByKey('b') == null);
+    try nfa.addSingleTransition(0, 'a', 1);
+    try expect(nfa.transitions[0].find('a') != null);
+    try expect(nfa.transitions[0].find('a').?.items[0] == 1);
+    try expect(nfa.transitions[0].valueByIndex(0).items[0] == 1);
+    try expect(nfa.transitions[0].find('b') == null);
 
-    try nfa.addTransition(0, 'a', 2);
-    try nfa.addTransition(1, 'b', 3);
-    try nfa.addTransition(2, 'a', 4);
-    try nfa.addTransition(4, 'a', 5);
+    try nfa.addSingleTransition(0, 'a', 2);
+    try nfa.addSingleTransition(1, 'b', 3);
+    try nfa.addSingleTransition(2, 'a', 4);
+    try nfa.addSingleTransition(4, 'a', 5);
     try nfa.designateStatesFinal(&[_]u32{3,5});
 
-    try expect(std.mem.eql(u32, nfa.transitions[0].findByKey('a').?.items, &[2]u32{1,2}));
+    try expect(std.mem.eql(u32, nfa.transitions[0].find('a').?.items, &[2]u32{1,2}));
 }
 
 test "NFA eps removal" {
@@ -1890,18 +2025,18 @@ test "NFA eps removal" {
 
     var nfa = try RegExNFA.init(arena.allocator());
     try nfa.addStates(2);
-    try nfa.addTransition(0, null, 1);
-    try nfa.addTransition(1, 'a', 1);
+    try nfa.addSingleTransition(0, null, 1);
+    try nfa.addSingleTransition(1, 'a', 1);
     try nfa.designateStatesFinal(&[_]u32{1});
 
     try expect(!nfa.finalStates.contains(0));
-    try expect(nfa.transitions[0].findByKey('a') == null);
+    try expect(nfa.transitions[0].find('a') == null);
 
     try nfa.backUpEpsTransitions();
 
     try expect(nfa.finalStates.contains(0));
-    try expect(nfa.transitions[0].findByKey('a') != null);
-    try expect((nfa.transitions[0].findByKey('a').?).items[0] == 1);
+    try expect(nfa.transitions[0].find('a') != null);
+    try expect((nfa.transitions[0].find('a').?).items[0] == 1);
 }
 
 test "NFA transitive eps removal" {
@@ -1910,18 +2045,18 @@ test "NFA transitive eps removal" {
 
     var nfa = try RegExNFA.init(arena.allocator());
     try nfa.addStates(3);
-    try nfa.addTransition(0, null, 1);
-    try nfa.addTransition(1, null, 2);
-    try nfa.addTransition(2, 'a', 2);
+    try nfa.addSingleTransition(0, null, 1);
+    try nfa.addSingleTransition(1, null, 2);
+    try nfa.addSingleTransition(2, 'a', 2);
     try nfa.designateStatesFinal(&[_]u32{2});
 
     try expect(!nfa.finalStates.contains(0));
-    try expect(nfa.transitions[0].findByKey('a') == null);
+    try expect(nfa.transitions[0].find('a') == null);
 
     try nfa.backUpEpsTransitions();
 
     try expect(nfa.finalStates.contains(0));
-    try expect(nfa.transitions[0].findByKey('a').?.items[0] == 2);
+    try expect(nfa.transitions[0].find('a').?.items[0] == 2);
 }
 
 test "NFA simple powerset construction" {
@@ -1930,11 +2065,11 @@ test "NFA simple powerset construction" {
 
     var nfa = try RegExNFA.init(arena.allocator());
     try nfa.addStates(6);
-    try nfa.addTransition(0, 'a', 1);
-    try nfa.addTransition(0, 'a', 2);
-    try nfa.addTransition(1, 'b', 3);
-    try nfa.addTransition(2, 'a', 4);
-    try nfa.addTransition(4, 'a', 5);
+    try nfa.addSingleTransition(0, 'a', 1);
+    try nfa.addSingleTransition(0, 'a', 2);
+    try nfa.addSingleTransition(1, 'b', 3);
+    try nfa.addSingleTransition(2, 'a', 4);
+    try nfa.addSingleTransition(4, 'a', 5);
     try nfa.designateStatesFinal(&[_]u32{3,5});
 
     var dfa = try nfa.toPowersetConstructedDFA(.{});
@@ -1962,15 +2097,15 @@ test "complex eps-NFA powerset construction" {
 
     var nfa = try RegExNFA.init(arena.allocator());
     try nfa.addStates(4);
-    try nfa.addTransition(0, null, 2);
-    try nfa.addTransition(0, 'a', 1);
-    try nfa.addTransition(1, 'b', 1);
-    try nfa.addTransition(2, 'c', 1);
-    try nfa.addTransition(2, 'd', 3);
-    try nfa.addTransition(2, 'd', 1);
-    try nfa.addTransition(1, 'e', 0);
-    try nfa.addTransition(1, 'e', 3);
-    try nfa.addTransition(3, null, 1);
+    try nfa.addSingleTransition(0, null, 2);
+    try nfa.addSingleTransition(0, 'a', 1);
+    try nfa.addSingleTransition(1, 'b', 1);
+    try nfa.addSingleTransition(2, 'c', 1);
+    try nfa.addSingleTransition(2, 'd', 3);
+    try nfa.addSingleTransition(2, 'd', 1);
+    try nfa.addSingleTransition(1, 'e', 0);
+    try nfa.addSingleTransition(1, 'e', 3);
+    try nfa.addSingleTransition(3, null, 1);
 
     try nfa.designateStatesFinal(&[_]u32{3});
 
