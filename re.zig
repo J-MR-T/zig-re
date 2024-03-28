@@ -1871,6 +1871,30 @@ const RegExNFA = struct {
         try std.testing.expectEqual(nfa.transitions[0].find('d').?.items.ptr, nfa.transitions[0].find('e').?.items.ptr);
     }
 
+    test "range NFA splitting no edge cases, but add existing targets" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        var nfa = try RegExNFA.init(arena.allocator());
+        defer nfa.deinit();
+
+        try nfa.addStates(3);
+
+        try nfa.addSingleTransition(0, 'b', 1);
+
+        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'a', 'e'}, &[_]u32{1});
+
+        try expect(nfa.transitions[0].map.items.len == 2);
+
+
+        // we expect that we only added a range after all the inner ranges, and extended the existing range to the left
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('a').?.items, &[_]u32{1}));
+        try std.testing.expectEqual(nfa.transitions[0].find('a').?.items.ptr, nfa.transitions[0].find('b').?.items.ptr);
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('c').?.items, &[_]u32{1}));
+        try std.testing.expectEqual(nfa.transitions[0].find('c').?.items.ptr, nfa.transitions[0].find('d').?.items.ptr);
+        try std.testing.expectEqual(nfa.transitions[0].find('c').?.items.ptr, nfa.transitions[0].find('e').?.items.ptr);
+    }
+
     fn debugLogTransitions(self:@This()) void {
         for(0.., self.transitions) |i, transitionMap| {
             debugLog("state {}:", .{i});
