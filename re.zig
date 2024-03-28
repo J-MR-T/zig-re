@@ -15,6 +15,8 @@ fn structFieldType(comptime T:type, comptime fieldIndex:comptime_int) type{
 }
 
 const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
+const expectEqualDeep = std.testing.expectEqualDeep;
 // unwraps the optional and std.testing.expect's that its not null (similar to just doing .?, but with an explicit expect)
 fn expectNotNull(value:anytype) !@typeInfo(@TypeOf(value)).Optional.child {
     try expect(value != null);
@@ -1857,7 +1859,16 @@ const RegExNFA = struct {
         try nfa.addSingleTransition(0, 'b', 1);
         try nfa.addSingleTransition(0, 'c', 1);
 
-        //_ = try nfa.maybeSplitRange(nfa.transitions[0], .{'a', 'e'}, &[_]u32{2});
+        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'a', 'e'}, &[_]u32{2});
+
+        try expect(nfa.transitions[0].map.items.len == 4);
+
+
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('a').?.items, &[_]u32{2}));
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('b').?.items, &[_]u32{1,2}));
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('c').?.items, &[_]u32{1,2}));
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('d').?.items, &[_]u32{2}));
+        try std.testing.expectEqual(nfa.transitions[0].find('d').?.items.ptr, nfa.transitions[0].find('e').?.items.ptr);
     }
 
     fn debugLogTransitions(self:@This()) void {
