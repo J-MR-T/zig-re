@@ -48,6 +48,8 @@ fn makeOrder(comptime T:type) fn (T, T) Order {
 // an insert-first-lookup-later sorted vector like map for performance (like https://www.llvm.org/docs/ProgrammersManual.html recommends)
 pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
     return struct {
+        const Item = T;
+
         items:[]T,
         internalAllocator:Allocator,
         internalSlice:[]T,
@@ -263,6 +265,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             return self.contains(.{keyToFind, undefined});
         }
 
+        // finds the value of the first item that has a key greater than or equal to the key to compare against. If there is no greater or equal key, null is returned.
         pub fn findByKey(self:*const @This(), keyToCompareAgainst:structFieldType(T, 0)) ?structFieldType(T, 1){
             if(@typeInfo(T).Struct.fields.len != 2)
                 @compileError("findByKey only works when this set is being used as a key value map, i.e. with two-long tuple elements");
@@ -348,7 +351,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             return .{.item_ptr = @ptrCast(self.items.ptr + firstGreater), .found_existing = false};
         }
 
-        // do not use this functino to simply insert an element, this can only be used if you have found the proper insertion point already
+        // do not use this function to simply insert an element, this can only be used if you have found the proper insertion point already
         fn insertBeforeInternal(self:*@This(), index:usize, assumeCapacity:bool) Allocator.Error!void {
             if(!assumeCapacity)
                 try self.ensureUnusedCapacity(1);
@@ -621,6 +624,11 @@ pub fn RangeMap(comptime RangeableKey:type, comptime keyOrder:(fn(RangeableKey, 
 
         // inserts a range + value. ranges are inclusive and may not overlap
         pub fn insert(self:*@This(), lower:RangeableKey, upper:RangeableKey, value:Value, comptime opts:struct{AssumeNoOverlap:bool = false}) !void {
+            _ = try self.insertAndGet(lower, upper, value, .{.AssumeNoOverlap = opts.AssumeNoOverlap});
+        }
+
+        // inserts a range + value. ranges are inclusive and may not overlap
+        pub fn insertAndGet(self:*@This(), lower:RangeableKey, upper:RangeableKey, value:Value, comptime opts:struct{AssumeNoOverlap:bool = false}) !*Item {
             assert(keyOrder(lower, upper) != Order.gt, "lower bound of range must be <= than upper bound", .{});
             if(opts.AssumeNoOverlap){
                 assert(self.find(lower) == null, "tried to insert existing range; ranges cannot overlap", .{});
@@ -629,7 +637,7 @@ pub fn RangeMap(comptime RangeableKey:type, comptime keyOrder:(fn(RangeableKey, 
                 if(self.find(lower) != null or self.find(upper) != null)
                     return error.OverlappingRanges;
             }
-            try self.map.insert(.{upper, .{lower, value}}, .{});
+            return (try self.map.insertAndGet(.{upper, .{lower, value}}, .{})).item_ptr;
         }
 
         pub fn insertSingle(self:*@This(), key:RangeableKey, value:Value, comptime opts:struct{AssumeNoOverlap:bool = false}) !void {
@@ -1289,7 +1297,7 @@ const RegExDFA = struct{
             const nextState = self.transitions[curState].find(c) orelse return;
 
             profile.visitsPerState[curState] += 1;
-            const spot = profile.transitionFequencyPerState[curState].findOrMakeSpot(c, .{});
+            var spot = try profile.transitionFequencyPerState[curState].findOrMakeSpot(c, .{});
             if(spot.found_existing){
                 spot.value().* += 1;
             }else{
@@ -1688,8 +1696,8 @@ const RegExNFA = struct {
 
     pub fn deinit(self:@This()) void {
         for (self.transitions) |transitionsOfState| {
-            for(transitionsOfState.items) |transition| {
-                transition[1].deinit();
+            for(transitionsOfState.map.items) |transition| {
+                transition[1][1].deinit();
             }
             transitionsOfState.deinit();
         }
@@ -1717,10 +1725,158 @@ const RegExNFA = struct {
         }
     }
 
+
+    // splits the given transition map in preparation for the split range to gain new target states (if there is splitting to be done)
+    // if the split range is just a single char for instance (-> a split point), this will split any continuous range around the split point into three ranges, so that the upper and lower one can keep their target states, and the split point can have a target state added to it. Thus if the split range is larger, there can be arbitrarily many new ranges, some of which will have not existed before and the state to be added is their first target, others will simply have another target added.
+    // TODO check that the transitions gets passed by const pointer internally, would be a waste to copy it
+    pub fn maybeSplitRange(self:*@This(), transitions:*EntireTransitionMapOfAState, splitRange:Pair(?u8,?u8), newTargetsSlice:anytype) !
+        std.ArrayList(Pair(bool, // new?
+            *EntireTransitionMapOfAState.Item, // pointer to the new range
+        ))
+    { 
+        // TODO naming: splitRange is also the possible transition chars
+        // TODO could be done more efficiently with a 'findOverlappingRangesOrMakeRange' function in the range map, that returns the ranges that overlap with the given range, or creates the range if it doesn't overlap with anything
+        const newStateSet = try UniqueStateSet.initElements(self.internalAllocator, newTargetsSlice);
+        // will be cloned for the new ranges, thus we can deinit this later
+        defer newStateSet.deinit();
+        // constructing this once and cloning is preferable, as this only requires newTargets to be sorted once
+
+
+        // TODO split the literal edges, i.e. if an existing range overlaps with either of the splitRange bounds, split it up
+
+        // find inner cases (these only need adding to, not splitting)
+
+        // TODO this needs to respect the edge case at the left side in the end, for now we simply assume there is never an overlapping range at the left side for simplicity
+        // we find the next range that contains something >= splitRange[0] by using the internal map and its find function
+        // TODO for now we assume this exists (i.e. replace the .? at some point)
+        // by subtracting the pointer of the found item from the base pointer, we get 
+        // TODO maybe findIndex method
+        const baseIndex = (@intFromPtr((transitions.map.findSpot(.{splitRange[0], undefined}, .{}).?.item_ptr)) - @intFromPtr(transitions.map.items.ptr))/@sizeOf(EntireTransitionMapOfAState.Map.Item);
+
+        var newRangesToInsertLater = try EntireTransitionMapOfAState.initCapacity(self.internalAllocator,4);
+        defer newRangesToInsertLater.deinit();
+
+        var curIndex = baseIndex;
+        var curLowerEdge = splitRange[0]; // TODO again this needs to respect the edge case at the left side in the end
+        while(curIndex < transitions.map.items.len) : (curIndex+=1) { // not the only condition, we also break if we've found that the elements were looking at are too high
+            var element = &transitions.map.items[curIndex];
+            const range:Pair(?u8, ?u8) = .{element[1][0], element[0]};
+            var targetStates = &element[1][1];
+
+            if(compare(range[1], splitRange[1]) == Order.gt) {
+                // the range ends above the split range, this is the second edge case -> stop
+                // TODO
+                break;
+            }
+
+            // the way we're iterating, the current edge should always be lower than or equal to the range's lower edge
+            assert(compare(curLowerEdge, range[0]) != Order.gt, "the current lower edge ({?}) should always be lower than or equal to the range's lower edge ({?})", .{curLowerEdge, range[0]});
+
+            // okay we've found two ranges that need to be in the end result: the one that doesn't exist yet: (curLowerEdge, range[0]-1) and the one that does: (range[0], range[1])
+
+            // except: if all of the new targets are already present in the existing range, we don't need to do anything but extend it down to encompass the lower part: (curLowerEdge, range[1])
+
+            try targetStates.ensureUnusedCapacity(newTargetsSlice.len);
+
+            // we check whetther the new targets are already present and try to add them immediately if they aren't
+            var allNewTargetsPresent = true;
+            for(newTargetsSlice) |newTarget| {
+                allNewTargetsPresent = allNewTargetsPresent and (try targetStates.insertAndGet(newTarget, .{.ReplaceExisting = false, .AssumeCapacity = true})).found_existing;
+            }
+
+            if(allNewTargetsPresent){
+                // set lower to include the new part of the range
+                transitions.map.items[curIndex][1][0] = curLowerEdge;
+            }else{
+                // if not all were present, they are now, as we've added them during the search
+                // TODO could try out not to add them while searching, but just make the new lower range, and `addAll` them, could be faster
+
+                // but we still need to add the lower range in this case (if its not empty)
+                // we don't do this immediately, but save it in a list to do it later, so we don't move around the old elements all the time
+                if(compare(curLowerEdge, range[0].?-1) != Order.gt) // .? -1 is safe, because we know that curLowerEdge is strictly lower, and the comparison function never evaluates anything as strictly lower than null, so range[0] is not null
+                    // we simply insert at the end without sorting, because we know that we're getting these ranges in a sorted manner anyway
+                    try newRangesToInsertLater.map.insert(.{range[0].? - 1, .{curLowerEdge, try newStateSet.clone()}}, .{.DontSort = true});
+            }
+
+            // now go on just above the range we handled now
+            // TODO null thingy should be fine?
+            curLowerEdge = range[1].? + 1;
+        }
+
+        // TODO if we have iterated through everything, check whether the current lower edge is still below the split range's upper edge, and if so, add the last range
+        // TODO think about this again when we add the edge case
+        if(compare(curLowerEdge, splitRange[1]) != Order.gt)
+            try newRangesToInsertLater.map.insert(.{splitRange[1], .{curLowerEdge, try newStateSet.clone()}}, .{.DontSort = true});
+
+        // now we need to insert the ranges we saved earlier
+        try transitions.map.addAll(newRangesToInsertLater.map);
+
+        // and put everything into an array for the caller to handle
+        // TODO
+        var allNewRanges = std.ArrayList(Pair(bool, *EntireTransitionMapOfAState.Item)).init(self.internalAllocator);
+        // TODO
+        return allNewRanges;
+    }
+
+    test "range NFA splitting no edge cases" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        var nfa = try RegExNFA.init(arena.allocator());
+        defer nfa.deinit();
+
+        try nfa.addStates(3);
+
+        try nfa.addSingleTransition(0, 'b', 1);
+        try nfa.addSingleTransition(0, 'd', 1);
+
+        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'a', 'e'}, &[_]u32{2});
+
+        // now 'a', 'c', 'e' should lead to 2, 'b', 'd' should lead to 1 and 2
+        // and all should be single char ranges
+        for(nfa.transitions[0].map.items) |transition| {
+            try expect(transition[0]==transition[1][0]);
+            const char = transition[0];
+            if(char.? % 2 == 'a' % 2){
+                try expect(std.mem.eql(u32, transition[1][1].items, &[_]u32{2}));
+            }else{
+                try expect(std.mem.eql(u32, transition[1][1].items, &[_]u32{1,2}));
+            }
+        }
+    }
+
+    test "range NFA splitting no edge cases, but empty inner ranges" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        var nfa = try RegExNFA.init(arena.allocator());
+        defer nfa.deinit();
+
+        try nfa.addStates(3);
+
+        try nfa.addSingleTransition(0, 'b', 1);
+        try nfa.addSingleTransition(0, 'c', 1);
+
+        //_ = try nfa.maybeSplitRange(nfa.transitions[0], .{'a', 'e'}, &[_]u32{2});
+    }
+
+    fn debugLogTransitions(self:@This()) void {
+        for(0.., self.transitions) |i, transitionMap| {
+            debugLog("state {}:", .{i});
+            for(transitionMap.map.items) |transition| {
+                std.debug.print("    [{?c}-{?c}] to {{", .{transition[1][0], transition[0]});
+                for(transition[1][1].items) |target| {
+                    std.debug.print("{} ", .{target});
+                }
+                std.debug.print("}}\n", .{});
+            }
+        }
+    }
+
+
     pub fn addSingleTransition(self:*@This(), from:u32, with:?u8, to:u32) !void {
         _ = try self. addSingleTransitionGetInfo(from, with, to);
     }
-
 
     // returns whether it added anything
     pub fn addSingleTransitionGetInfo(self:*@This(), from:u32, with:?u8, to:u32) !bool {
@@ -1809,30 +1965,32 @@ const RegExNFA = struct {
         const transitionsToCopyTo:*EntireTransitionMapOfAState = &self.transitions[to];
         // TODO
         for(transitionsToCopyFrom.map.items) |transition| {
-            const range:Pair(?u8,?u8) = .{transition[1][0], transition[0]};
-            if(range[0] == range[1]){ 
+            const fromRange:Pair(?u8,?u8) = .{transition[1][0], transition[0]};
+            if(fromRange[0] == fromRange[1]){ 
                 // single char transition to copy *from*
-                // TODO the code thats here atm only works if the transition to copy to is a single char transition, too, need to fix that (this is obviously also a compilation error rn)
-                const terminal = range[0];
+                const terminal = fromRange[0];
                 if(opts.excludeEpsilonTransitions and terminal == null)
                     continue;
 
-                const transitionTargets = transition[1];
+                const transitionTargets = transition[1][1];
 
-                const transitionsUsingTerminalFromStateToCopyTo = try transitionsToCopyTo.findOrMakeSpot(.{terminal, undefined}, .{});
-                const targetListToChangePtr:*UniqueStateSet = &transitionsUsingTerminalFromStateToCopyTo.item_ptr.*[1];
+                var transitionsUsingTerminalFromStateToCopyTo = try transitionsToCopyTo.findOrMakeSpot(terminal, .{});
+                // TODO the code thats here atm only works if the transition to copy to is a single char transition as well, need to fix that (this is obviously also a compilation error rn)
+                if(compare(transitionsUsingTerminalFromStateToCopyTo.lower().*,transitionsUsingTerminalFromStateToCopyTo.upper().*) != Order.eq)
+                    return error.NotYetImplemented;
+
+                const targetListToChangePtr:*UniqueStateSet = transitionsUsingTerminalFromStateToCopyTo.value();
 
                 if(transitionsUsingTerminalFromStateToCopyTo.found_existing){
                     const lengthBefore = targetListToChangePtr.items.len;
                     // if the terminal already exists, just add all the targets to the existing set
                     try targetListToChangePtr.addAll(transitionTargets);
 
-                    // can't just OR it, zig won't let me :(
-                    if(targetListToChangePtr.items.len != lengthBefore)
-                        addedSomething = true;
+                    addedSomething = addedSomething or targetListToChangePtr.items.len != lengthBefore;
                 }else{
                     // otherwise, create a new transition list
                     transitionsUsingTerminalFromStateToCopyTo.item_ptr.*[0] = terminal;
+                    transitionsUsingTerminalFromStateToCopyTo.item_ptr.*[1][0] = terminal;
                     targetListToChangePtr.* = try transitionTargets.clone();
                     addedSomething = true;
                 }
@@ -1901,7 +2059,7 @@ const RegExNFA = struct {
 
         // add start state to new DFA
         dfa.startState = try dfa.addState();
-        var startStateSet = try UniqueStateSet.initElements(self.internalAllocator, &[1]u32{self.startState});
+        var startStateSet = try UniqueStateSet.initElements(dfa.internalAllocator, &[1]u32{self.startState});
         try nfaToDfaStates.putNoClobber(startStateSet.items, dfa.startState);
 
         // used like a stack
@@ -1922,26 +2080,35 @@ const RegExNFA = struct {
 
             // then go through the transitions of the states, and construct a transition map for the state step by step
             // after the transition map is complete, the actual dfa states can be created and the dfa transitions can be added
-            var combinedTransitionsForCurNfaState = try ArraySet(NonEpsTransitionsForOneTerminal, keyCompare(NonEpsTransitionsForOneTerminal, makeOrder(u8))).init(self.internalAllocator);
+            var combinedTransitionsForCurNfaState = try RangeMap(u8, makeOrder(u8), UniqueStateSet).init(self.internalAllocator);
             // the transition lists in here are kept sorted, for deduplication (as they represent sets)
 
             for(curNfaStates.items) |curNfaState| {
                 assert(self.transitions.len > curNfaState, "nfa state out of bounds, nfa is invalid", .{});
 
-                for(self.transitions[curNfaState].items) |*transition| {
+                for(self.transitions[curNfaState].map.items) |*transition| {
+                    // TODO adapt this for real range transitions
+                    if(transition[0] != transition[1][0])
+                        return error.NotYetImplemented;
+
                     // ignore empty, because eps transitions are already handled
 
                     if(transition.*[0]) |c| {
                         // first: find/insert the transition map for the current char
                         // results are still correct
-                        var entry = try combinedTransitionsForCurNfaState.findOrMakeSpot(.{c, undefined}, .{});
+                        var entry = try combinedTransitionsForCurNfaState.findOrMakeSpot(c, .{});
                         // either create, if it doesn't exist yet or add all
                         if(!entry.found_existing){
                             // set the char
-                            entry.item_ptr.*[0] = c;
-                            entry.item_ptr.*[1] = try transition.*[1].clone();
+                            entry.setRange(c, c);
+                            // set value
+                            entry.value().* = try transition.*[1][1].clone();
                         }else{
-                            try entry.item_ptr.*[1].addAll(transition.*[1]);
+                            // TODO
+                            if(compare(entry.lower().*,entry.upper().*) != Order.eq)
+                                return error.NotYetImplemented;
+
+                            try entry.value().addAll(transition.*[1][1]);
                         }
                     }
                 }
@@ -1949,18 +2116,24 @@ const RegExNFA = struct {
 
             // now we have the combined transitions for the current state, so we can create the actual states and add the transitions in the dfa
 
-            for(combinedTransitionsForCurNfaState.items) |transition| {
+            for(combinedTransitionsForCurNfaState.map.items) |transition| {
+                // TODO for now, we can simply assume all these transitions to only have non-ranged chars
+                if(compare(transition[0],transition[1][0]) != Order.eq)
+                    return error.NotYetImplemented;
+
+                const targetStates = transition[1][1];
+
                 // create or get state
-                var targetStateEntry = try nfaToDfaStates.getOrPut(transition[1].items);
+                var targetStateEntry = try nfaToDfaStates.getOrPut(targetStates.items);
                 if(!targetStateEntry.found_existing){
                     targetStateEntry.value_ptr.* = try dfa.addState();
 
                     // add (the possibly combined state of the nfa) to worklist, because its new -> we haven't visited it yet
-                    try worklist.append(transition[1]);
+                    try worklist.append(targetStates);
                 }
 
                 // add transition
-                try dfa.transitions[curDfaState].insertSingle(transition[0], targetStateEntry.value_ptr.*, .{});
+                try dfa.transitions[curDfaState].insertSingle(transition[0], targetStateEntry.value_ptr.*, .{}); // TODO range stuff
             }
 
         }
