@@ -23,6 +23,11 @@ fn expectNotNull(value:anytype) !@typeInfo(@TypeOf(value)).Optional.child {
     return value.?;
 }
 
+fn expectOrSkip(condition:bool) !void{
+    if(!condition)
+        return error.SkipZigTest;
+}
+
 const Tuple = std.meta.Tuple;
 fn Pair(comptime T:type, comptime U:type) type {
     return Tuple(&[2]type{T, U});
@@ -651,14 +656,18 @@ pub fn RangeMap(comptime RangeableKey:type, comptime keyOrder:(fn(RangeableKey, 
         }
 
         pub fn findByPtr(self:*const @This(), key:RangeableKey) ?*Value {
-            // finds the first greater than or equal to key -> will be the highest element of the range that could contain key, if key >= lowest
+            return &(self.findItem(key) orelse return null).*[1][1];
+        }
+
+        pub fn findItem(self:*const @This(), key:RangeableKey) ?*Item {
+            // the inner self.map method finds the first greater than or equal to key -> will be the highest element of the range that could contain key, if key >= lowest
             const spotInfo = self.map.findSpot(.{key, undefined}, .{}) 
                 // passed key is higher than any highest element of a range
                 orelse return null;
 
             if(keyOrder(key, spotInfo.item_ptr.*[1][0]) != Order.lt)
                 // lies within the range
-                return &spotInfo.item_ptr.*[1][1];
+                return spotInfo.item_ptr;
 
             return null;
         }
@@ -670,6 +679,7 @@ pub fn RangeMap(comptime RangeableKey:type, comptime keyOrder:(fn(RangeableKey, 
             fn lower(self:*@This()) *RangeableKey { return &self.item_ptr.*[1][0]; }
             fn upper(self:*@This()) *RangeableKey { return &self.item_ptr.*[0]; }
         };
+
         pub fn findOrMakeSpot(self:*@This(), key:RangeableKey, opts:struct{AssumeCapacity:bool = false}) !SpotInfo {
             // TODO unfortunately duplicates code from findSpotInternal, because to avoid searching twice, we need to make nuanced modifications to the search
             var left: usize = 0;
@@ -1731,6 +1741,7 @@ const RegExNFA = struct {
     // splits the given transition map in preparation for the split range to gain new target states (if there is splitting to be done)
     // if the split range is just a single char for instance (-> a split point), this will split any continuous range around the split point into three ranges, so that the upper and lower one can keep their target states, and the split point can have a target state added to it. Thus if the split range is larger, there can be arbitrarily many new ranges, some of which will have not existed before and the state to be added is their first target, others will simply have another target added.
     // TODO check that the transitions gets passed by const pointer internally, would be a waste to copy it
+    // TODO the name is stupid
     pub fn maybeSplitRange(self:*@This(), transitions:*EntireTransitionMapOfAState, splitRange:Pair(?u8,?u8), newTargetsSlice:anytype) !
         std.ArrayList(Pair(bool, // new?
             *EntireTransitionMapOfAState.Item, // pointer to the new range
@@ -1743,36 +1754,81 @@ const RegExNFA = struct {
         defer newStateSet.deinit();
         // constructing this once and cloning is preferable, as this only requires newTargets to be sorted once
 
-
-        // TODO split the literal edges, i.e. if an existing range overlaps with either of the splitRange bounds, split it up
-
-        // find inner cases (these only need adding to, not splitting)
-
-        // TODO this needs to respect the edge case at the left side in the end, for now we simply assume there is never an overlapping range at the left side for simplicity
-        // we find the next range that contains something >= splitRange[0] by using the internal map and its find function
-        // TODO for now we assume this exists (i.e. replace the .? at some point)
-        // by subtracting the pointer of the found item from the base pointer, we get 
-        // TODO maybe findIndex method
-        const baseIndex = (@intFromPtr((transitions.map.findSpot(.{splitRange[0], undefined}, .{}).?.item_ptr)) - @intFromPtr(transitions.map.items.ptr))/@sizeOf(EntireTransitionMapOfAState.Map.Item);
-
         var newRangesToInsertLater = try EntireTransitionMapOfAState.initCapacity(self.internalAllocator,4);
         defer newRangesToInsertLater.deinit();
 
-        var curIndex = baseIndex;
-        var curLowerEdge = splitRange[0]; // TODO again this needs to respect the edge case at the left side in the end
+
+        // split the literal edges, i.e. if an existing range overlaps with either of the splitRange bounds, split it up
+
+        // this is only for iterating over the inner ranges later, but it needs to be adjusted, if the left edge case happens
+        var curLowerEdge = splitRange[0];
+
+        // lower bound edge case/overlap:
+        if(transitions.findItem(curLowerEdge)) |*lowerEdgeOverlapItem|{
+            const range:Pair(?u8, ?u8) = .{lowerEdgeOverlapItem.*[1][0], lowerEdgeOverlapItem.*[0]};
+            var targetStates = &lowerEdgeOverlapItem.*[1][1];
+            
+            // if the lower end of the split range is exactly the lower end of the existing range, we only need to add the new targets to the existing range, the main loop can do that for us
+            if(compare(curLowerEdge, range[0]) != Order.eq){
+                // we know that the lower end of the split range is strictly higher than the lower end of the existing range, so we need to split the existing range into two
+                assert(compare(curLowerEdge, range[0]) == Order.gt, "the lower end of the split range ({?}) has to be strictly higher than the lower end of the existing range ({?}), if it's contained and not equal", .{curLowerEdge, range[0]});
+
+                // insert new lower range (range[0], curLowerEdge.? - 1), clone the target states from the existing range (.? is safe because we know that curLowerEdge is strictly higher)
+                try newRangesToInsertLater.map.insert(.{curLowerEdge.? - 1, .{range[0], try targetStates.clone()}}, .{.DontSort = true});
+
+                // edit the existing range, and let it get handled again by the main loop
+                lowerEdgeOverlapItem.*[1][0] = curLowerEdge;
+            }
+        }
+
+        // now find inner cases (these only need adding to, not splitting)
+
+        // we find the next range that contains something >= curLowerEdge by using the internal map and its find function
+        const maybeFirstHigherThanLowerEdge = transitions.map.findSpot(.{curLowerEdge, undefined}, .{});
+
+        var curIndex = 
+            if(maybeFirstHigherThanLowerEdge) |firstHigherThanLowerEdge|
+                // by subtracting the pointer of the found item from the base pointer, we get 
+                // TODO maybe findIndex method
+                (@intFromPtr((firstHigherThanLowerEdge.item_ptr)) - @intFromPtr(transitions.map.items.ptr))/@sizeOf(EntireTransitionMapOfAState.Map.Item)
+            else
+                std.math.maxInt(u32); // in this case, just skip the loop, because the current lower edge is higher than all existing ranges
+
         while(curIndex < transitions.map.items.len) : (curIndex+=1) { // not the only condition, we also break if we've found that the elements were looking at are too high
             var element = &transitions.map.items[curIndex];
             const range:Pair(?u8, ?u8) = .{element[1][0], element[0]};
             var targetStates = &element[1][1];
 
             if(compare(range[1], splitRange[1]) == Order.gt) {
-                // the range ends above the split range, this is the second edge case -> stop
-                // TODO
+                // the range ends above the split range:
+                // if they don't overlap: just break, we're done
+
+                if(compare(range[0], splitRange[1]) == Order.gt)
+                   break;
+
+                // if they do overlap: this is the second edge case -> handle it -> then stop
+
+                // we don't need to concern ourselves with the case where the splitRange[1] == range[1], that can simply be handled in a normal iteration
+
+                // we cannot normally iterate in this case, because the existing range shouldn't be edited in this case. But: in not iterating normally, we could also miss a non-empty lower part of the range. So this edge case can result in 3 ranges in total.
+                
+                // if there is a lower range, insert it (see normal case below for an explanation of these 2 lines):
+                if(compare(curLowerEdge, range[0].?-1) != Order.gt)
+                    try newRangesToInsertLater.map.insert(.{range[0].? - 1, .{curLowerEdge, try newStateSet.clone()}}, .{.DontSort = true});
+
+
+                // insert new middle range (range[0], splitRange[1]), clone target states from the existing range, then add the new targets
+                var middle = try newRangesToInsertLater.map.insertAndGet(.{splitRange[1], .{range[0], try targetStates.clone()}}, .{.DontSort = true});
+                try middle.item_ptr.*[1][1].addAll(newStateSet);
+
+                // edit the existing range to be the upper one, but don't change the target states
+                element[1][0] = if(splitRange[1]) |c| c + 1 else 0; // null is basically -1, so this is the same as +1
+
                 break;
             }
 
             // the way we're iterating, the current edge should always be lower than or equal to the range's lower edge
-            assert(compare(curLowerEdge, range[0]) != Order.gt, "the current lower edge ({?}) should always be lower than or equal to the range's lower edge ({?})", .{curLowerEdge, range[0]});
+            assert(compare(curLowerEdge, range[0]) != Order.gt, "the current lower edge ({?c}) should always be lower than or equal to the range's lower edge ({?c})", .{curLowerEdge, range[0]});
 
             // okay we've found two ranges that need to be in the end result: the one that doesn't exist yet: (curLowerEdge, range[0]-1) and the one that does: (range[0], range[1])
 
@@ -1780,7 +1836,7 @@ const RegExNFA = struct {
 
             try targetStates.ensureUnusedCapacity(newTargetsSlice.len);
 
-            // we check whetther the new targets are already present and try to add them immediately if they aren't
+            // we check whether the new targets are already present and try to add them immediately if they aren't
             var allNewTargetsPresent = true;
             for(newTargetsSlice) |newTarget| {
                 allNewTargetsPresent = allNewTargetsPresent and (try targetStates.insertAndGet(newTarget, .{.ReplaceExisting = false, .AssumeCapacity = true})).found_existing;
@@ -1791,18 +1847,22 @@ const RegExNFA = struct {
                 transitions.map.items[curIndex][1][0] = curLowerEdge;
             }else{
                 // if not all were present, they are now, as we've added them during the search
-                // TODO could try out not to add them while searching, but just make the new lower range, and `addAll` them, could be faster
+                // TODO could try out not to add the targets while searching, but just make the new lower range, and `addAll` them, could be faster
 
                 // but we still need to add the lower range in this case (if its not empty)
                 // we don't do this immediately, but save it in a list to do it later, so we don't move around the old elements all the time
-                if(compare(curLowerEdge, range[0].?-1) != Order.gt) // .? -1 is safe, because we know that curLowerEdge is strictly lower, and the comparison function never evaluates anything as strictly lower than null, so range[0] is not null
+                if(compare(curLowerEdge, range[0]) == Order.lt)
+                    // .? -1 is safe, because we know that curLowerEdge is strictly lower, and the comparison function never evaluates anything as strictly lower than null, so range[0] is not null
                     // we simply insert at the end without sorting, because we know that we're getting these ranges in a sorted manner anyway
                     try newRangesToInsertLater.map.insert(.{range[0].? - 1, .{curLowerEdge, try newStateSet.clone()}}, .{.DontSort = true});
             }
 
             // now go on just above the range we handled now
-            // TODO null thingy should be fine?
-            curLowerEdge = range[1].? + 1;
+            if(range[1]) |upperEdge| {
+                curLowerEdge = upperEdge + 1;
+            }else{
+                curLowerEdge = 0; // null is kinda like -1, so this is the same as +1
+            }
         }
 
         // TODO if we have iterated through everything, check whether the current lower edge is still below the split range's upper edge, and if so, add the last range
@@ -1868,7 +1928,7 @@ const RegExNFA = struct {
         try expect(std.mem.eql(u32, nfa.transitions[0].find('b').?.items, &[_]u32{1,2}));
         try expect(std.mem.eql(u32, nfa.transitions[0].find('c').?.items, &[_]u32{1,2}));
         try expect(std.mem.eql(u32, nfa.transitions[0].find('d').?.items, &[_]u32{2}));
-        try std.testing.expectEqual(nfa.transitions[0].find('d').?.items.ptr, nfa.transitions[0].find('e').?.items.ptr);
+        try expectEqual(nfa.transitions[0].find('d').?.items.ptr, nfa.transitions[0].find('e').?.items.ptr);
     }
 
     test "range NFA splitting no edge cases, but add existing targets" {
@@ -1878,7 +1938,7 @@ const RegExNFA = struct {
         var nfa = try RegExNFA.init(arena.allocator());
         defer nfa.deinit();
 
-        try nfa.addStates(3);
+        try nfa.addStates(2);
 
         try nfa.addSingleTransition(0, 'b', 1);
 
@@ -1889,10 +1949,166 @@ const RegExNFA = struct {
 
         // we expect that we only added a range after all the inner ranges, and extended the existing range to the left
         try expect(std.mem.eql(u32, nfa.transitions[0].find('a').?.items, &[_]u32{1}));
-        try std.testing.expectEqual(nfa.transitions[0].find('a').?.items.ptr, nfa.transitions[0].find('b').?.items.ptr);
+        try expectEqual(nfa.transitions[0].find('a').?.items.ptr, nfa.transitions[0].find('b').?.items.ptr);
         try expect(std.mem.eql(u32, nfa.transitions[0].find('c').?.items, &[_]u32{1}));
-        try std.testing.expectEqual(nfa.transitions[0].find('c').?.items.ptr, nfa.transitions[0].find('d').?.items.ptr);
-        try std.testing.expectEqual(nfa.transitions[0].find('c').?.items.ptr, nfa.transitions[0].find('e').?.items.ptr);
+        try expectEqual(nfa.transitions[0].find('c').?.items.ptr, nfa.transitions[0].find('d').?.items.ptr);
+        try expectEqual(nfa.transitions[0].find('c').?.items.ptr, nfa.transitions[0].find('e').?.items.ptr);
+    }
+
+    test "range NFA splitting empty" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        var nfa = try RegExNFA.init(arena.allocator());
+        defer nfa.deinit();
+
+        try nfa.addStates(2);
+
+        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'a', 'e'}, &[_]u32{1});
+
+        try expect(nfa.transitions[0].map.items.len == 1);
+
+        // we expect that we only added a range after all the inner ranges, and extended the existing range to the left
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('a').?.items, &[_]u32{1}));
+        for('b'..'f') |c| {
+            try expectEqual(nfa.transitions[0].find(@intCast(c)).?.items.ptr, nfa.transitions[0].find('a').?.items.ptr);
+        }
+    }
+
+    test "range NFA splitting lower edge case" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        var nfa = try RegExNFA.init(arena.allocator());
+        defer nfa.deinit();
+
+        try nfa.addStates(3);
+
+        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'a', 'e'}, &[_]u32{1});
+        try expectOrSkip(nfa.transitions[0].map.items.len == 1);
+
+        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'b', 'f'}, &[_]u32{2});
+
+        try expect(nfa.transitions[0].map.items.len == 3);
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('a').?.items, &[_]u32{1}));
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('b').?.items, &[_]u32{1,2}));
+        try expectEqual(nfa.transitions[0].find('b').?.items.ptr, nfa.transitions[0].find('c').?.items.ptr);
+        try expectEqual(nfa.transitions[0].find('b').?.items.ptr, nfa.transitions[0].find('d').?.items.ptr);
+        try expectEqual(nfa.transitions[0].find('b').?.items.ptr, nfa.transitions[0].find('e').?.items.ptr);
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('f').?.items, &[_]u32{2}));
+    }
+
+    test "range NFA splitting upper edge case 1" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        var nfa = try RegExNFA.init(arena.allocator());
+        defer nfa.deinit();
+
+        try nfa.addStates(3);
+
+        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'b', 'f'}, &[_]u32{2});
+
+        try expectOrSkip(nfa.transitions[0].map.items.len == 1);
+
+        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'a', 'e'}, &[_]u32{1});
+
+        try expect(nfa.transitions[0].map.items.len == 3);
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('a').?.items, &[_]u32{1}));
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('b').?.items, &[_]u32{1,2}));
+        try expectEqual(nfa.transitions[0].find('b').?.items.ptr, nfa.transitions[0].find('c').?.items.ptr);
+        try expectEqual(nfa.transitions[0].find('b').?.items.ptr, nfa.transitions[0].find('d').?.items.ptr);
+        try expectEqual(nfa.transitions[0].find('b').?.items.ptr, nfa.transitions[0].find('e').?.items.ptr);
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('f').?.items, &[_]u32{2}));
+    }
+
+    test "range NFA splitting upper and lower edge case" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        var nfa = try RegExNFA.init(arena.allocator());
+        defer nfa.deinit();
+
+        try nfa.addStates(3);
+
+        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'b', 'f'}, &[_]u32{2});
+
+        try expectOrSkip(nfa.transitions[0].map.items.len == 1);
+
+        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'c', 'e'}, &[_]u32{1});
+
+        try expect(nfa.transitions[0].map.items.len == 3);
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('b').?.items, &[_]u32{2}));
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('c').?.items, &[_]u32{1,2}));
+        try expectEqual(nfa.transitions[0].find('c').?.items.ptr, nfa.transitions[0].find('d').?.items.ptr);
+        try expectEqual(nfa.transitions[0].find('c').?.items.ptr, nfa.transitions[0].find('e').?.items.ptr);
+        try expect(std.mem.eql(u32, nfa.transitions[0].find('f').?.items, &[_]u32{2}));
+    }
+
+    test "range NFA splitting epsilon cases" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        var nfa = try RegExNFA.init(arena.allocator());
+        defer nfa.deinit();
+
+        try nfa.addStates(3);
+
+        try nfa.addSingleTransition(0, null, 1);
+
+        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{null, 'b'}, &[_]u32{2});
+
+        try expect(nfa.transitions[0].map.items.len == 2);
+
+        try expect(std.mem.eql(u32, nfa.transitions[0].find(null).?.items, &[_]u32{1,2}));
+        for(0..'c') |c| {
+            try expect(std.mem.eql(u32, nfa.transitions[0].find(@intCast(c)).?.items, &[_]u32{2}));
+        }
+
+        var nfa2 = try RegExNFA.init(arena.allocator());
+        defer nfa2.deinit();
+
+        try nfa2.addStates(3);
+
+        _ = try nfa2.maybeSplitRange(&nfa2.transitions[0], .{null, 'b'}, &[_]u32{1});
+
+        try expectOrSkip(nfa2.transitions[0].map.items.len == 1);
+
+        _ = try nfa2.maybeSplitRange(&nfa2.transitions[0], .{'a', 'c'}, &[_]u32{2});
+
+        try expect(nfa2.transitions[0].map.items.len == 3);
+        try expect(std.mem.eql(u32, nfa2.transitions[0].find(null).?.items, &[_]u32{1}));
+        for(0..'a') |c| {
+            try expectEqual(nfa2.transitions[0].find(@intCast(c)).?.items.ptr, nfa2.transitions[0].find(null).?.items.ptr);
+        }
+
+        try expect(std.mem.eql(u32, nfa2.transitions[0].find('a').?.items, &[_]u32{1,2}));
+        try expectEqual(nfa2.transitions[0].find(@intCast('a')).?.items.ptr, nfa2.transitions[0].find('b').?.items.ptr);
+
+        try expect(std.mem.eql(u32, nfa2.transitions[0].find('c').?.items, &[_]u32{2}));
+
+        var nfa3 = try RegExNFA.init(arena.allocator());
+        defer nfa3.deinit();
+
+        try nfa3.addStates(3);
+
+        _ = try nfa3.maybeSplitRange(&nfa3.transitions[0], .{null, 'd'}, &[_]u32{1});
+
+        try expectOrSkip(nfa2.transitions[0].map.items.len == 1);
+
+        _ = try nfa3.maybeSplitRange(&nfa3.transitions[0], .{'a', 'c'}, &[_]u32{2});
+
+        try expect(nfa3.transitions[0].map.items.len == 3);
+        try expect(std.mem.eql(u32, nfa3.transitions[0].find(null).?.items, &[_]u32{1}));
+        for(0..'a') |c| {
+            try expectEqual(nfa3.transitions[0].find(@intCast(c)).?.items.ptr, nfa3.transitions[0].find(null).?.items.ptr);
+        }
+
+        try expect(std.mem.eql(u32, nfa3.transitions[0].find('a').?.items, &[_]u32{1,2}));
+        try expectEqual(nfa3.transitions[0].find(@intCast('a')).?.items.ptr, nfa3.transitions[0].find('b').?.items.ptr);
+        try expectEqual(nfa3.transitions[0].find(@intCast('a')).?.items.ptr, nfa3.transitions[0].find('c').?.items.ptr);
+
+        try expect(std.mem.eql(u32, nfa3.transitions[0].find('d').?.items, &[_]u32{1}));
     }
 
     fn debugLogTransitions(self:@This()) void {
@@ -2494,26 +2710,49 @@ test "fadec basic functionality and abstractions" {
 pub fn main() !void {
     //const writer = std.io.getStdOut().writer();
 
-    var arena = std.heap.ArenaAllocator.init(easyAllocer);
-    defer arena.deinit();
-
-    const input = "xyz|w*(abc)*de*f";
-
-    var tok = try Tokenizer.init(arena.allocator(), input);
-    defer tok.deinit();
-    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
-    assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
-
-    var dfa = try regex.toDFA(.{});
-
-    assert(dfa.internalAllocator.ptr == arena.allocator().ptr, "dfa should use the same allocator as the regex", .{});
-
-    var compiled = try dfa.compile(&arena, false, .{});
-    debugLog("{}", .{compiled.isInLanguageCompiled("xyz")});
+    //var arena = std.heap.ArenaAllocator.init(easyAllocer);
+    //defer arena.deinit();
+    //
+    //const input = "xyz|w*(abc)*de*f";
+    //
+    //var tok = try Tokenizer.init(arena.allocator(), input);
+    //defer tok.deinit();
+    //const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    //assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
+    //
+    //var dfa = try regex.toDFA(.{});
+    //
+    //assert(dfa.internalAllocator.ptr == arena.allocator().ptr, "dfa should use the same allocator as the regex", .{});
+    //
+    //var compiled = try dfa.compile(&arena, false, .{});
+    //debugLog("{}", .{compiled.isInLanguageCompiled("xyz")});
     //compiled.debugPrint();
 
     //const fa = FiniteAutomaton{.dfa = &dfa};
     //
     //try fa.printDOT(writer);
 
+    var arena = std.heap.ArenaAllocator.init(easyAllocer);
+    defer arena.deinit();
+
+    var nfa = try RegExNFA.init(arena.allocator());
+    defer nfa.deinit();
+
+    try nfa.addStates(3);
+
+    _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'b', 'f'}, &[_]u32{2});
+
+    try expectOrSkip(nfa.transitions[0].map.items.len == 1);
+
+    _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'c', 'e'}, &[_]u32{1});
+
+    nfa.debugLogTransitions();
+
+    try expect(nfa.transitions[0].map.items.len == 3);
+    try expect(std.mem.eql(u32, nfa.transitions[0].find('a').?.items, &[_]u32{1}));
+    try expect(std.mem.eql(u32, nfa.transitions[0].find('b').?.items, &[_]u32{1,2}));
+    try expectEqual(nfa.transitions[0].find('b').?.items.ptr, nfa.transitions[0].find('c').?.items.ptr);
+    try expectEqual(nfa.transitions[0].find('b').?.items.ptr, nfa.transitions[0].find('d').?.items.ptr);
+    try expectEqual(nfa.transitions[0].find('b').?.items.ptr, nfa.transitions[0].find('e').?.items.ptr);
+    try expect(std.mem.eql(u32, nfa.transitions[0].find('f').?.items, &[_]u32{2}));
 }
