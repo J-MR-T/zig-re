@@ -1737,16 +1737,15 @@ const RegExNFA = struct {
         }
     }
 
+    pub fn addRangeTransitionToState(self:*@This(), state:u32, transition:Pair(?u8,?u8), targetStates:[]const u32) !bool {
+        return try self.addRangeTransition(&self.transitions[state], transition, targetStates);
+    }
+
 
     // splits the given transition map in preparation for the split range to gain new target states (if there is splitting to be done)
     // if the split range is just a single char for instance (-> a split point), this will split any continuous range around the split point into three ranges, so that the upper and lower one can keep their target states, and the split point can have a target state added to it. Thus if the split range is larger, there can be arbitrarily many new ranges, some of which will have not existed before and the state to be added is their first target, others will simply have another target added.
-    // TODO check that the transitions gets passed by const pointer internally, would be a waste to copy it
-    // TODO the name is stupid
-    pub fn maybeSplitRange(self:*@This(), transitions:*EntireTransitionMapOfAState, splitRange:Pair(?u8,?u8), newTargetsSlice:anytype) !
-        std.ArrayList(Pair(bool, // new?
-            *EntireTransitionMapOfAState.Item, // pointer to the new range
-        ))
-    { 
+    // returns whether it changed anything
+    pub fn addRangeTransition(self:*@This(), transitions:*EntireTransitionMapOfAState, splitRange:Pair(?u8,?u8), newTargetsSlice:anytype) !bool {
         // TODO naming: splitRange is also the possible transition chars
         // TODO could be done more efficiently with a 'findOverlappingRangesOrMakeRange' function in the range map, that returns the ranges that overlap with the given range, or creates the range if it doesn't overlap with anything
         const newStateSet = try UniqueStateSet.initElements(self.internalAllocator, newTargetsSlice);
@@ -1756,7 +1755,6 @@ const RegExNFA = struct {
 
         var newRangesToInsertLater = try EntireTransitionMapOfAState.initCapacity(self.internalAllocator,4);
         defer newRangesToInsertLater.deinit();
-
 
         // split the literal edges, i.e. if an existing range overlaps with either of the splitRange bounds, split it up
 
@@ -1780,6 +1778,8 @@ const RegExNFA = struct {
                 lowerEdgeOverlapItem.*[1][0] = curLowerEdge;
             }
         }
+
+        var changedSmth = false;
 
         // now find inner cases (these only need adding to, not splitting)
 
@@ -1822,6 +1822,7 @@ const RegExNFA = struct {
                 try middle.item_ptr.*[1][1].addAll(newStateSet);
 
                 // edit the existing range to be the upper one, but don't change the target states
+                // TODO what about 255?
                 element[1][0] = if(splitRange[1]) |c| c + 1 else 0; // null is basically -1, so this is the same as +1
 
                 break;
@@ -1844,6 +1845,8 @@ const RegExNFA = struct {
 
             if(allNewTargetsPresent){
                 // set lower to include the new part of the range
+                changedSmth = changedSmth or transitions.map.items[curIndex][1][0] != curLowerEdge;
+
                 transitions.map.items[curIndex][1][0] = curLowerEdge;
             }else{
                 // if not all were present, they are now, as we've added them during the search
@@ -1870,14 +1873,12 @@ const RegExNFA = struct {
         if(compare(curLowerEdge, splitRange[1]) != Order.gt)
             try newRangesToInsertLater.map.insert(.{splitRange[1], .{curLowerEdge, try newStateSet.clone()}}, .{.DontSort = true});
 
+        changedSmth = changedSmth or newRangesToInsertLater.map.items.len > 0;
+
         // now we need to insert the ranges we saved earlier
         try transitions.map.addAll(newRangesToInsertLater.map);
 
-        // and put everything into an array for the caller to handle
-        // TODO
-        var allNewRanges = std.ArrayList(Pair(bool, *EntireTransitionMapOfAState.Item)).init(self.internalAllocator);
-        // TODO
-        return allNewRanges;
+        return changedSmth;
     }
 
     test "range NFA splitting no edge cases" {
@@ -1892,7 +1893,7 @@ const RegExNFA = struct {
         try nfa.addSingleTransition(0, 'b', 1);
         try nfa.addSingleTransition(0, 'd', 1);
 
-        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'a', 'e'}, &[_]u32{2});
+        _ = try nfa.addRangeTransitionToState(0, .{'a', 'e'}, &[_]u32{2});
 
         // now 'a', 'c', 'e' should lead to 2, 'b', 'd' should lead to 1 and 2
         // and all should be single char ranges
@@ -1919,7 +1920,7 @@ const RegExNFA = struct {
         try nfa.addSingleTransition(0, 'b', 1);
         try nfa.addSingleTransition(0, 'c', 1);
 
-        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'a', 'e'}, &[_]u32{2});
+        _ = try nfa.addRangeTransitionToState(0, .{'a', 'e'}, &[_]u32{2});
 
         try expect(nfa.transitions[0].map.items.len == 4);
 
@@ -1942,7 +1943,7 @@ const RegExNFA = struct {
 
         try nfa.addSingleTransition(0, 'b', 1);
 
-        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'a', 'e'}, &[_]u32{1});
+        _ = try nfa.addRangeTransitionToState(0, .{'a', 'e'}, &[_]u32{1});
 
         try expect(nfa.transitions[0].map.items.len == 2);
 
@@ -1962,9 +1963,9 @@ const RegExNFA = struct {
         var nfa = try RegExNFA.init(arena.allocator());
         defer nfa.deinit();
 
-        try nfa.addStates(2);
+        try nfa.addStates(5);
 
-        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'a', 'e'}, &[_]u32{1});
+        _ = try nfa.addRangeTransitionToState(0, .{'a', 'e'}, &[_]u32{1});
 
         try expect(nfa.transitions[0].map.items.len == 1);
 
@@ -1973,6 +1974,37 @@ const RegExNFA = struct {
         for('b'..'f') |c| {
             try expectEqual(nfa.transitions[0].find(@intCast(c)).?.items.ptr, nfa.transitions[0].find('a').?.items.ptr);
         }
+
+        _ = try nfa.addRangeTransitionToState(0, .{'f', 'g'}, &[_]u32{2});
+
+        try expect(nfa.transitions[0].map.items.len == 2);
+
+        _ = try nfa.addRangeTransitionToState(0, .{'o', 'x'}, &[_]u32{4});
+
+        try expect(nfa.transitions[0].map.items.len == 3);
+
+        _ = try nfa.addRangeTransitionToState(0, .{'j', 'k'}, &[_]u32{3});
+
+        try expect(nfa.transitions[0].map.items.len == 4);
+
+        const aToE = nfa.transitions[0].map.items[0];
+        try expectEqual(aToE[1][0], 'a');
+        try expectEqual(aToE[0], 'e');
+        try expect(std.mem.eql(u32, aToE[1][1].items, &[_]u32{1}));
+
+        const fToG = nfa.transitions[0].map.items[1];
+        try expectEqual(fToG[1][0], 'f');
+        try expectEqual(fToG[0], 'g');
+        try expect(std.mem.eql(u32, fToG[1][1].items, &[_]u32{2}));
+
+        const jToK = nfa.transitions[0].map.items[2];
+        try expectEqual(jToK[1][0], 'j');
+        try expectEqual(jToK[0], 'k');
+        try expect(std.mem.eql(u32, jToK[1][1].items, &[_]u32{3}));
+
+        const oToX = nfa.transitions[0].map.items[3];
+        try expectEqual(oToX[1][0], 'o');
+        try expectEqual(oToX[0], 'x');
     }
 
     test "range NFA splitting lower edge case" {
@@ -1984,10 +2016,10 @@ const RegExNFA = struct {
 
         try nfa.addStates(3);
 
-        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'a', 'e'}, &[_]u32{1});
+        _ = try nfa.addRangeTransitionToState(0, .{'a', 'e'}, &[_]u32{1});
         try expectOrSkip(nfa.transitions[0].map.items.len == 1);
 
-        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'b', 'f'}, &[_]u32{2});
+        _ = try nfa.addRangeTransitionToState(0, .{'b', 'f'}, &[_]u32{2});
 
         try expect(nfa.transitions[0].map.items.len == 3);
         try expect(std.mem.eql(u32, nfa.transitions[0].find('a').?.items, &[_]u32{1}));
@@ -1998,7 +2030,7 @@ const RegExNFA = struct {
         try expect(std.mem.eql(u32, nfa.transitions[0].find('f').?.items, &[_]u32{2}));
     }
 
-    test "range NFA splitting upper edge case 1" {
+    test "range NFA splitting upper edge case" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
 
@@ -2007,11 +2039,11 @@ const RegExNFA = struct {
 
         try nfa.addStates(3);
 
-        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'b', 'f'}, &[_]u32{2});
+        _ = try nfa.addRangeTransitionToState(0, .{'b', 'f'}, &[_]u32{2});
 
         try expectOrSkip(nfa.transitions[0].map.items.len == 1);
 
-        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'a', 'e'}, &[_]u32{1});
+        _ = try nfa.addRangeTransitionToState(0, .{'a', 'e'}, &[_]u32{1});
 
         try expect(nfa.transitions[0].map.items.len == 3);
         try expect(std.mem.eql(u32, nfa.transitions[0].find('a').?.items, &[_]u32{1}));
@@ -2031,11 +2063,11 @@ const RegExNFA = struct {
 
         try nfa.addStates(3);
 
-        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'b', 'f'}, &[_]u32{2});
+        _ = try nfa.addRangeTransitionToState(0, .{'b', 'f'}, &[_]u32{2});
 
         try expectOrSkip(nfa.transitions[0].map.items.len == 1);
 
-        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'c', 'e'}, &[_]u32{1});
+        _ = try nfa.addRangeTransitionToState(0, .{'c', 'e'}, &[_]u32{1});
 
         try expect(nfa.transitions[0].map.items.len == 3);
         try expect(std.mem.eql(u32, nfa.transitions[0].find('b').?.items, &[_]u32{2}));
@@ -2056,7 +2088,7 @@ const RegExNFA = struct {
 
         try nfa.addSingleTransition(0, null, 1);
 
-        _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{null, 'b'}, &[_]u32{2});
+        _ = try nfa.addRangeTransitionToState(0, .{null, 'b'}, &[_]u32{2});
 
         try expect(nfa.transitions[0].map.items.len == 2);
 
@@ -2070,11 +2102,11 @@ const RegExNFA = struct {
 
         try nfa2.addStates(3);
 
-        _ = try nfa2.maybeSplitRange(&nfa2.transitions[0], .{null, 'b'}, &[_]u32{1});
+        _ = try nfa2.addRangeTransitionToState(0, .{null, 'b'}, &[_]u32{1});
 
         try expectOrSkip(nfa2.transitions[0].map.items.len == 1);
 
-        _ = try nfa2.maybeSplitRange(&nfa2.transitions[0], .{'a', 'c'}, &[_]u32{2});
+        _ = try nfa2.addRangeTransitionToState(0, .{'a', 'c'}, &[_]u32{2});
 
         try expect(nfa2.transitions[0].map.items.len == 3);
         try expect(std.mem.eql(u32, nfa2.transitions[0].find(null).?.items, &[_]u32{1}));
@@ -2092,11 +2124,11 @@ const RegExNFA = struct {
 
         try nfa3.addStates(3);
 
-        _ = try nfa3.maybeSplitRange(&nfa3.transitions[0], .{null, 'd'}, &[_]u32{1});
+        _ = try nfa3.addRangeTransitionToState(0, .{null, 'd'}, &[_]u32{1});
 
-        try expectOrSkip(nfa2.transitions[0].map.items.len == 1);
+        try expectOrSkip(nfa3.transitions[0].map.items.len == 1);
 
-        _ = try nfa3.maybeSplitRange(&nfa3.transitions[0], .{'a', 'c'}, &[_]u32{2});
+        _ = try nfa3.addRangeTransitionToState(0, .{'a', 'c'}, &[_]u32{2});
 
         try expect(nfa3.transitions[0].map.items.len == 3);
         try expect(std.mem.eql(u32, nfa3.transitions[0].find(null).?.items, &[_]u32{1}));
@@ -2126,83 +2158,20 @@ const RegExNFA = struct {
 
 
     pub fn addSingleTransition(self:*@This(), from:u32, with:?u8, to:u32) !void {
-        _ = try self. addSingleTransitionGetInfo(from, with, to);
-    }
-
-    // returns whether it added anything
-    pub fn addSingleTransitionGetInfo(self:*@This(), from:u32, with:?u8, to:u32) !bool {
         // for range based transitions, this needs to check if the transition exists and if it does but with a different target state, split up the ranges of the transitions etc.
         // this is the simple case, where we're only adding a single char transition, so there is a maximum of three ranges to consider
 
-        var entry = try self.transitions[from].findOrMakeSpot(with, .{});
+        var transitions = &self.transitions[from];
+
+        var entry = try transitions.findOrMakeSpot(with, .{});
         if(!entry.found_existing){
             // simple, just add the transition, there is no range overlap to split
 
             // set the char, if its new
             entry.setRange(with, with);
             entry.value().* = try UniqueStateSet.initElements(self.internalAllocator, &[1]u32{to});
-            return true;
         }else{
-            const range = entry.getRange();
-
-            // lower split: only exists if existing transition really reaches lower
-            const lowerSplitExists = (compare(range[0], with) == Order.lt);
-            const upperSplitExists = (compare(range[1], with) == Order.gt);
-
-            if(lowerSplitExists and upperSplitExists) {
-                // only do anything complicated, if theres actually something to add
-                // this could be optimized by immediately inserting, after checking if there is something to add, but then we would have to conditionally clone the old set, which would be a bunch of control flow hassle, and in the end involve making yet another version of findOrMakeSpot
-                // we do this inside all the ifs, because in the last case, we can easily use this optimization and insert immediately, in the other cases we can't
-                if(!entry.value().contains(to)) return false;
-
-                // three in total
-                // -> reuse the existing range as the upper one, (because this does not require changing the key), add a new combined one, and add a new lower one, with the old target states
-
-                // move existing range to be the upper one
-                entry.lower().* = with.? + 1; // can safely do with.? because there is something below/above with, so it can't be null
-                                              // TODO but: -/+ 1 could be a problem because 0 - 1 needs to be null in this case. So go through all +/-1s here again and make sure to handle null elsewhere
-
-                // add lower one
-                self.transitions[from].insert(range[0], with.? - 1, try entry.value().clone(), .{.AssumeNoOverlap = true}) catch unreachable;
-
-                // add new combined one
-                var combined = try entry.value().clone();
-                try combined.insert(to, .{}); // it's guaranteed that there are no duplicates, because we just checked that it doesn't contain to
-                self.transitions[from].insertSingle(with, combined, .{}) catch unreachable;
-            }else if(lowerSplitExists) {
-                if(!entry.value().contains(to)) return false;
-
-                // two in total
-                // -> reuse
-
-                // move existing range to be the lower one
-                entry.upper().* = with.? - 1; // this shouldn't mess up any ordering, even though we're changing the key, because the relative position within the set hasn't changed
-
-                // add combined upper one
-                var combined = try entry.value().clone();
-                try combined.insert(to, .{}); // it's guaranteed that there are no duplicates, because we just checked that it doesn't contain to
-                self.transitions[from].insertSingle(with, combined, .{.AssumeNoOverlap = true}) catch unreachable;
-            }else if(upperSplitExists) {
-                if(!entry.value().contains(to)) return false;
-
-                // two in total
-                // -> reuse
-
-                // move existing range to be the upper one
-                entry.lower().* = with.? + 1; // this shouldn't mess up any ordering, even though we're changing the key, because the relative position within the set hasn't changed
-
-                // add combined lower one
-                var combined = try entry.value().clone();
-                try combined.insert(to, .{}); // it's guaranteed that there are no duplicates, because we just checked that it doesn't contain to
-                self.transitions[from].insertSingle(with, combined, .{.AssumeNoOverlap = true}) catch unreachable;
-            }else {
-                // only one
-                // -> just add the target to the existing set
-                return !(try entry.value().insertAndGet(to, .{})).found_existing;
-            }
-
-            // if we didn't add anything, we have returned somewhere in between
-            return true;
+            _ = try self.addRangeTransition(transitions, .{with, with}, &[1]u32{to});
         }
     }
 
@@ -2214,41 +2183,19 @@ const RegExNFA = struct {
         var addedSomething = false;
         const transitionsToCopyFrom:EntireTransitionMapOfAState = self.transitions[from];
         const transitionsToCopyTo:*EntireTransitionMapOfAState = &self.transitions[to];
-        // TODO
         for(transitionsToCopyFrom.map.items) |transition| {
-            const fromRange:Pair(?u8,?u8) = .{transition[1][0], transition[0]};
-            if(fromRange[0] == fromRange[1]){ 
-                // single char transition to copy *from*
-                const terminal = fromRange[0];
-                if(opts.excludeEpsilonTransitions and terminal == null)
+            var fromRange:Pair(?u8,?u8) = .{transition[1][0], transition[0]};
+
+            if(opts.excludeEpsilonTransitions and fromRange[0] == null){
+                if(fromRange[1] == null)
                     continue;
 
-                const transitionTargets = transition[1][1];
-
-                var transitionsUsingTerminalFromStateToCopyTo = try transitionsToCopyTo.findOrMakeSpot(terminal, .{});
-                // TODO the code thats here atm only works if the transition to copy to is a single char transition as well, need to fix that (this is obviously also a compilation error rn)
-                if(compare(transitionsUsingTerminalFromStateToCopyTo.lower().*,transitionsUsingTerminalFromStateToCopyTo.upper().*) != Order.eq)
-                    return error.NotYetImplemented;
-
-                const targetListToChangePtr:*UniqueStateSet = transitionsUsingTerminalFromStateToCopyTo.value();
-
-                if(transitionsUsingTerminalFromStateToCopyTo.found_existing){
-                    const lengthBefore = targetListToChangePtr.items.len;
-                    // if the terminal already exists, just add all the targets to the existing set
-                    try targetListToChangePtr.addAll(transitionTargets);
-
-                    addedSomething = addedSomething or targetListToChangePtr.items.len != lengthBefore;
-                }else{
-                    // otherwise, create a new transition list
-                    transitionsUsingTerminalFromStateToCopyTo.item_ptr.*[0] = terminal;
-                    transitionsUsingTerminalFromStateToCopyTo.item_ptr.*[1][0] = terminal;
-                    targetListToChangePtr.* = try transitionTargets.clone();
-                    addedSomething = true;
-                }
-            }else{
-                // TODO
-                return error.NotYetImplemented;
+                // otherwise, the range includes non-epsilon transitions, so we add that part
+                // TODO honestly those ranges don't make a whole lot of sense, because 0 chars aren't even allowed in the final string to check...
+                fromRange[0] = 0;
             }
+
+            addedSomething = addedSomething or self.addRangeTransition(transitionsToCopyTo, fromRange, transition[1][1].items) catch unreachable;
         }
         return addedSomething;
     }
@@ -2336,6 +2283,8 @@ const RegExNFA = struct {
 
             for(curNfaStates.items) |curNfaState| {
                 assert(self.transitions.len > curNfaState, "nfa state out of bounds, nfa is invalid", .{});
+
+                // TODO should be able to adapt this for range transitions by using a modified version of the addAllTransitionsFromOtherState function, the only problem is that the type is slightly different (u8 keys instead of ?u8), and zig is terrible with generic function parameter constraints, so I'd have to change basically all type declarations to anytype, which is completely unreadable...
 
                 for(self.transitions[curNfaState].map.items) |*transition| {
                     // TODO adapt this for real range transitions
@@ -2480,7 +2429,23 @@ test "NFA transitive eps removal" {
     try nfa.backUpEpsTransitions();
 
     try expect(nfa.finalStates.contains(0));
+    try expect(nfa.transitions[0].find('a') != null);
     try expect(nfa.transitions[0].find('a').?.items[0] == 2);
+
+    var nfa2 = try RegExNFA.init(arena.allocator());
+    try nfa2.addStates(3);
+    try nfa2.addSingleTransition(0, null, 1);
+    try nfa2.addSingleTransition(1, null, 2);
+    try nfa2.addSingleTransition(2, 'a', 2);
+
+    try expect(nfa2.transitions[0].find('a') == null);
+
+    try nfa2.backUpEpsTransitions();
+
+    try expect(nfa2.transitions[0].find('a') != null);
+    try expect(nfa2.transitions[0].find('a').?.items[0] == 2);
+
+
 }
 
 test "NFA simple powerset construction" {
@@ -2740,11 +2705,11 @@ pub fn main() !void {
 
     try nfa.addStates(3);
 
-    _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'b', 'f'}, &[_]u32{2});
+    _ = try nfa.addRangeTransition(&nfa.transitions[0], .{'b', 'f'}, &[_]u32{2});
 
     try expectOrSkip(nfa.transitions[0].map.items.len == 1);
 
-    _ = try nfa.maybeSplitRange(&nfa.transitions[0], .{'c', 'e'}, &[_]u32{1});
+    _ = try nfa.addRangeTransition(&nfa.transitions[0], .{'c', 'e'}, &[_]u32{1});
 
     nfa.debugLogTransitions();
 
