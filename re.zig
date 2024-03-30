@@ -747,19 +747,7 @@ test "range map transitions" {
     // adapted from NFA
     const UniqueStateSet = ArraySet(u32, makeOrder(u32));
 
-    const EntireTransitionMapOfAState = RangeMap(?u8, struct {
-        pub fn f(a:?u8, b:?u8) Order {
-            // i hope this gets compiled into something proper...
-            if(a == null){
-                if(b == null)
-                    return Order.eq;
-                return Order.lt;
-            }else if(b == null){
-                return Order.gt;
-            }
-            return std.math.order(a.?,b.?);
-        }
-    }.f, UniqueStateSet); // ?u8 for eps transitions
+    const EntireTransitionMapOfAState = RangeMap(u8, makeOrder(u8), UniqueStateSet);
 
     var map = try EntireTransitionMapOfAState.init(std.testing.allocator);
     defer map.deinit();
@@ -1116,6 +1104,8 @@ const RegEx = struct {
                     cur.regex.nfaEndState = nfa.numStates - 1;
                     const curEndState = cur.regex.nfaEndState.?;
 
+                    const epsilon = RegExNFA.epsilon;
+
                     // in the operator, connect the start/end states of the operands with the operator
                     switch(cur.regex.kind){
                         Token.Kind.Union => {
@@ -1125,18 +1115,18 @@ const RegEx = struct {
                                 try nfa.addSingleTransition(curStartState, left.char, curEndState);
                             }else{
                                 // if it is an operator, we have visited it before, so it has a start/end state, so we can just connect it
-                                try nfa.addSingleTransition(left.nfaEndState.?, null, curEndState);
+                                try nfa.addSingleTransition(left.nfaEndState.?, epsilon, curEndState);
 
                                 // also connect the start state of the operator with the start state of the left operand
-                                try nfa.addSingleTransition(curStartState, null, left.nfaStartState.?);
+                                try nfa.addSingleTransition(curStartState, epsilon, left.nfaStartState.?);
                             }
 
                             if(!right.isOperator()){
                                 try nfa.addSingleTransition(curStartState, right.char, curEndState);
                             }else{
                                 // same as left
-                                try nfa.addSingleTransition(right.nfaEndState.?, null, curEndState);
-                                try nfa.addSingleTransition(curStartState, null, right.nfaStartState.?);
+                                try nfa.addSingleTransition(right.nfaEndState.?, epsilon, curEndState);
+                                try nfa.addSingleTransition(curStartState, epsilon, right.nfaStartState.?);
                             }
                             // sidenote: see? this is exactly why ever programming language needs the ability to use 'local functions'/lambdas for readability. Do you hear me, Zig? :. Don't even need to be real functions in the end, can just inline all of them (and forbid non-inlinable ones)
                         },
@@ -1145,7 +1135,7 @@ const RegEx = struct {
 
                             if(left.isOperator() and right.isOperator()){
                                 // if both are operators, we have visited them before, so they have start/end states, so we can just connect them
-                                try nfa.addSingleTransition(left.nfaEndState.?, null, right.nfaStartState.?);
+                                try nfa.addSingleTransition(left.nfaEndState.?, epsilon, right.nfaStartState.?);
                                 // and set the start/end of this operator to the start/end of the operands
                                 cur.regex.nfaStartState = left.nfaStartState.?;
                                 cur.regex.nfaEndState = right.nfaEndState.?;
@@ -1168,12 +1158,12 @@ const RegEx = struct {
                         Token.Kind.Kleen => {
                             if(left.isOperator()){
                                 // we just reuse all of the operator and connect the end state with the start state
-                                try nfa.addSingleTransition(left.nfaEndState.?, null, left.nfaStartState.?);
+                                try nfa.addSingleTransition(left.nfaEndState.?, epsilon, left.nfaStartState.?);
                                 cur.regex.nfaStartState = left.nfaStartState.?;
                                 cur.regex.nfaEndState = left.nfaEndState.?;
 
                                 // also connect the start state with the end state, to be able to match the empty string by skipping the sequence of states entirley
-                                try nfa.addSingleTransition(left.nfaStartState.?, null, left.nfaEndState.?);
+                                try nfa.addSingleTransition(left.nfaStartState.?, epsilon, left.nfaEndState.?);
                             }else{
                                 // just use the start state as start/end
                                 // and add a transition to itself
@@ -1666,25 +1656,13 @@ const FiniteAutomaton = union(enum){
 // alphabet is implicitly the space of u8.
 // passing an arena allocator and *not* calling deinit on the NFA, just on the arena is recommended. If you need to use another allocator, call deinit on the NFA directly
 const RegExNFA = struct {
+
     const UniqueStateSet = ArraySet(u32, makeOrder(u32));
-    const EpsTransitionsForOneTerminal = Pair(?u8, UniqueStateSet);
-    const NonEpsTransitionsForOneTerminal = Pair(u8, UniqueStateSet);
+    const TransitionsForOneTerminal = Pair(u8, UniqueStateSet);
 
-    const compare = struct {
-        pub fn f(a:?u8, b:?u8) Order {
-            // i hope this gets compiled into something proper...
-            if(a == null){
-                if(b == null)
-                    return Order.eq;
-                return Order.lt;
-            }else if(b == null){
-                return Order.gt;
-            }
-            return std.math.order(a.?,b.?);
-        }
-    }.f;
-
-    const EntireTransitionMapOfAState = RangeMap(?u8, compare, UniqueStateSet); // ?u8 for eps transitions
+    const compare = makeOrder(u8);
+    const epsilon = 0;
+    const EntireTransitionMapOfAState = RangeMap(u8, compare, UniqueStateSet); // eps transitions are represented by a transition char of 0 (not null), as 0 is used as a delimiter in the final machine code compilation anyway, so is not a valid char
     const FinalStates = UniqueStateSet;
 
     startState:u32,
@@ -1737,11 +1715,11 @@ const RegExNFA = struct {
         }
     }
 
-    pub fn addRangeTransitionByState(self:*@This(), state:u32, transition:Pair(?u8,?u8), targetStates:[]const u32) !bool {
+    pub fn addRangeTransitionByState(self:*@This(), state:u32, transition:Pair(u8,u8), targetStates:[]const u32) !bool {
         return try addRangeTransition(&self.transitions[state], transition, targetStates);
     }
 
-    pub fn addRangeTransitionFromStateSet(transitions:*EntireTransitionMapOfAState, splitRange:Pair(?u8,?u8), newTargetStateSet:UniqueStateSet) !bool {
+    pub fn addRangeTransitionFromStateSet(transitions:*EntireTransitionMapOfAState, splitRange:Pair(u8,u8), newTargetStateSet:UniqueStateSet) !bool {
         // TODO naming: splitRange is also the possible transition chars
         // TODO could be done more efficiently with a 'findOverlappingRangesOrMakeRange' function in the range map, that returns the ranges that overlap with the given range, or creates the range if it doesn't overlap with anything
 
@@ -1756,7 +1734,7 @@ const RegExNFA = struct {
 
         // lower bound edge case/overlap:
         if(transitions.findItem(curLowerEdge)) |*lowerEdgeOverlapItem|{
-            const range:Pair(?u8, ?u8) = .{lowerEdgeOverlapItem.*[1][0], lowerEdgeOverlapItem.*[0]};
+            const range:Pair(u8, u8) = .{lowerEdgeOverlapItem.*[1][0], lowerEdgeOverlapItem.*[0]};
             var targetStates = &lowerEdgeOverlapItem.*[1][1];
             
             // if the lower end of the split range is exactly the lower end of the existing range, we only need to add the new targets to the existing range, the main loop can do that for us
@@ -1764,8 +1742,8 @@ const RegExNFA = struct {
                 // we know that the lower end of the split range is strictly higher than the lower end of the existing range, so we need to split the existing range into two
                 assert(compare(curLowerEdge, range[0]) == Order.gt, "the lower end of the split range ({?}) has to be strictly higher than the lower end of the existing range ({?}), if it's contained and not equal", .{curLowerEdge, range[0]});
 
-                // insert new lower range (range[0], curLowerEdge.? - 1), clone the target states from the existing range (.? is safe because we know that curLowerEdge is strictly higher)
-                try newRangesToInsertLater.map.insert(.{curLowerEdge.? - 1, .{range[0], try targetStates.clone()}}, .{.DontSort = true});
+                // insert new lower range (range[0], curLowerEdge - 1), clone the target states from the existing range
+                try newRangesToInsertLater.map.insert(.{curLowerEdge - 1, .{range[0], try targetStates.clone()}}, .{.DontSort = true});
 
                 // edit the existing range, and let it get handled again by the main loop
                 lowerEdgeOverlapItem.*[1][0] = curLowerEdge;
@@ -1789,7 +1767,7 @@ const RegExNFA = struct {
 
         while(curIndex < transitions.map.items.len) : (curIndex+=1) { // not the only condition, we also break if we've found that the elements were looking at are too high
             var element = &transitions.map.items[curIndex];
-            const range:Pair(?u8, ?u8) = .{element[1][0], element[0]};
+            const range:Pair(u8, u8) = .{element[1][0], element[0]};
             var targetStates = &element[1][1];
 
             if(compare(range[1], splitRange[1]) == Order.gt) {
@@ -1806,8 +1784,8 @@ const RegExNFA = struct {
                 // we cannot normally iterate in this case, because the existing range shouldn't be edited in this case. But: in not iterating normally, we could also miss a non-empty lower part of the range. So this edge case can result in 3 ranges in total.
                 
                 // if there is a lower range, insert it (see normal case below for an explanation of these 2 lines):
-                if(compare(curLowerEdge, range[0].?-1) != Order.gt)
-                    try newRangesToInsertLater.map.insert(.{range[0].? - 1, .{curLowerEdge, try newTargetStateSet.clone()}}, .{.DontSort = true});
+                if(compare(curLowerEdge, range[0]) == Order.lt)
+                    try newRangesToInsertLater.map.insert(.{range[0] - 1, .{curLowerEdge, try newTargetStateSet.clone()}}, .{.DontSort = true});
 
 
                 // insert new middle range (range[0], splitRange[1]), clone target states from the existing range, then add the new targets
@@ -1816,7 +1794,7 @@ const RegExNFA = struct {
 
                 // edit the existing range to be the upper one, but don't change the target states
                 // TODO what about 255?
-                element[1][0] = if(splitRange[1]) |c| c + 1 else 0; // null is basically -1, so this is the same as +1
+                element[1][0] = splitRange[1] + 1;
 
                 break;
             }
@@ -1848,17 +1826,12 @@ const RegExNFA = struct {
                 // but we still need to add the lower range in this case (if its not empty)
                 // we don't do this immediately, but save it in a list to do it later, so we don't move around the old elements all the time
                 if(compare(curLowerEdge, range[0]) == Order.lt)
-                    // .? -1 is safe, because we know that curLowerEdge is strictly lower, and the comparison function never evaluates anything as strictly lower than null, so range[0] is not null
                     // we simply insert at the end without sorting, because we know that we're getting these ranges in a sorted manner anyway
-                    try newRangesToInsertLater.map.insert(.{range[0].? - 1, .{curLowerEdge, try newTargetStateSet.clone()}}, .{.DontSort = true});
+                    try newRangesToInsertLater.map.insert(.{range[0] - 1, .{curLowerEdge, try newTargetStateSet.clone()}}, .{.DontSort = true});
             }
 
             // now go on just above the range we handled now
-            if(range[1]) |upperEdge| {
-                curLowerEdge = upperEdge + 1;
-            }else{
-                curLowerEdge = 0; // null is kinda like -1, so this is the same as +1
-            }
+            curLowerEdge = range[1] + 1;
         }
 
         // TODO if we have iterated through everything, check whether the current lower edge is still below the split range's upper edge, and if so, add the last range
@@ -1879,7 +1852,7 @@ const RegExNFA = struct {
     // splits the given transition map in preparation for the split range to gain new target states (if there is splitting to be done)
     // if the split range is just a single char for instance (-> a split point), this will split any continuous range around the split point into three ranges, so that the upper and lower one can keep their target states, and the split point can have a target state added to it. Thus if the split range is larger, there can be arbitrarily many new ranges, some of which will have not existed before and the state to be added is their first target, others will simply have another target added.
     // returns whether it changed anything
-    pub fn addRangeTransition(transitions:*EntireTransitionMapOfAState, splitRange:Pair(?u8,?u8), newTargetsSlice:anytype) !bool {
+    pub fn addRangeTransition(transitions:*EntireTransitionMapOfAState, splitRange:Pair(u8,u8), newTargetsSlice:anytype) !bool {
         // TODO would giving a choice of allocator make sense here?
         const newTargetStateSet = try UniqueStateSet.initElements(cAllocer, newTargetsSlice);
         // will be cloned for the new ranges, thus we can deinit this later
@@ -1908,7 +1881,7 @@ const RegExNFA = struct {
         for(nfa.transitions[0].map.items) |transition| {
             try expect(transition[0]==transition[1][0]);
             const char = transition[0];
-            if(char.? % 2 == 'a' % 2){
+            if(char % 2 == 'a' % 2){
                 try expect(std.mem.eql(u32, transition[1][1].items, &[_]u32{2}));
             }else{
                 try expect(std.mem.eql(u32, transition[1][1].items, &[_]u32{1,2}));
@@ -2094,14 +2067,14 @@ const RegExNFA = struct {
 
         try nfa.addStates(3);
 
-        try nfa.addSingleTransition(0, null, 1);
+        try nfa.addSingleTransition(0, RegExNFA.epsilon, 1);
 
-        _ = try nfa.addRangeTransitionByState(0, .{null, 'b'}, &[_]u32{2});
+        _ = try nfa.addRangeTransitionByState(0, .{RegExNFA.epsilon, 'b'}, &[_]u32{2});
 
         try expect(nfa.transitions[0].map.items.len == 2);
 
-        try expect(std.mem.eql(u32, nfa.transitions[0].find(null).?.items, &[_]u32{1,2}));
-        for(0..'c') |c| {
+        try expect(std.mem.eql(u32, nfa.transitions[0].find(RegExNFA.epsilon).?.items, &[_]u32{1,2}));
+        for(1..'c') |c| {
             try expect(std.mem.eql(u32, nfa.transitions[0].find(@intCast(c)).?.items, &[_]u32{2}));
         }
 
@@ -2110,16 +2083,16 @@ const RegExNFA = struct {
 
         try nfa2.addStates(3);
 
-        _ = try nfa2.addRangeTransitionByState(0, .{null, 'b'}, &[_]u32{1});
+        _ = try nfa2.addRangeTransitionByState(0, .{RegExNFA.epsilon, 'b'}, &[_]u32{1});
 
         try expectOrSkip(nfa2.transitions[0].map.items.len == 1);
 
         _ = try nfa2.addRangeTransitionByState(0, .{'a', 'c'}, &[_]u32{2});
 
         try expect(nfa2.transitions[0].map.items.len == 3);
-        try expect(std.mem.eql(u32, nfa2.transitions[0].find(null).?.items, &[_]u32{1}));
+        try expect(std.mem.eql(u32, nfa2.transitions[0].find(RegExNFA.epsilon).?.items, &[_]u32{1}));
         for(0..'a') |c| {
-            try expectEqual(nfa2.transitions[0].find(@intCast(c)).?.items.ptr, nfa2.transitions[0].find(null).?.items.ptr);
+            try expectEqual(nfa2.transitions[0].find(@intCast(c)).?.items.ptr, nfa2.transitions[0].find(RegExNFA.epsilon).?.items.ptr);
         }
 
         try expect(std.mem.eql(u32, nfa2.transitions[0].find('a').?.items, &[_]u32{1,2}));
@@ -2132,16 +2105,16 @@ const RegExNFA = struct {
 
         try nfa3.addStates(3);
 
-        _ = try nfa3.addRangeTransitionByState(0, .{null, 'd'}, &[_]u32{1});
+        _ = try nfa3.addRangeTransitionByState(0, .{RegExNFA.epsilon, 'd'}, &[_]u32{1});
 
         try expectOrSkip(nfa3.transitions[0].map.items.len == 1);
 
         _ = try nfa3.addRangeTransitionByState(0, .{'a', 'c'}, &[_]u32{2});
 
         try expect(nfa3.transitions[0].map.items.len == 3);
-        try expect(std.mem.eql(u32, nfa3.transitions[0].find(null).?.items, &[_]u32{1}));
+        try expect(std.mem.eql(u32, nfa3.transitions[0].find(RegExNFA.epsilon).?.items, &[_]u32{1}));
         for(0..'a') |c| {
-            try expectEqual(nfa3.transitions[0].find(@intCast(c)).?.items.ptr, nfa3.transitions[0].find(null).?.items.ptr);
+            try expectEqual(nfa3.transitions[0].find(@intCast(c)).?.items.ptr, nfa3.transitions[0].find(RegExNFA.epsilon).?.items.ptr);
         }
 
         try expect(std.mem.eql(u32, nfa3.transitions[0].find('a').?.items, &[_]u32{1,2}));
@@ -2155,7 +2128,20 @@ const RegExNFA = struct {
         for(0.., self.transitions) |i, transitionMap| {
             debugLog("state {}:", .{i});
             for(transitionMap.map.items) |transition| {
-                std.debug.print("    [{?c}-{?c}] to {{", .{transition[1][0], transition[0]});
+                const upper = transition[0];
+                const lower = transition[1][0];
+                std.debug.print("    [", .{});
+                if(lower == epsilon){
+                    std.debug.print("ε-", .{});
+                }else{
+                    std.debug.print("{c}-", .{lower});
+                }
+                if(upper == epsilon){
+                    std.debug.print("ε", .{});
+                }else{
+                    std.debug.print("{c}", .{upper});
+                }
+                std.debug.print("] to {{", .{});
                 for(transition[1][1].items) |target| {
                     std.debug.print("{} ", .{target});
                 }
@@ -2165,7 +2151,7 @@ const RegExNFA = struct {
     }
 
 
-    pub fn addSingleTransition(self:*@This(), from:u32, with:?u8, to:u32) !void {
+    pub fn addSingleTransition(self:*@This(), from:u32, with:u8, to:u32) !void {
         // for range based transitions, this needs to check if the transition exists and if it does but with a different target state, split up the ranges of the transitions etc.
         // this is the simple case, where we're only adding a single char transition, so there is a maximum of three ranges to consider
 
@@ -2192,10 +2178,10 @@ const RegExNFA = struct {
         const transitionsToCopyFrom:EntireTransitionMapOfAState = self.transitions[from];
         const transitionsToCopyTo:*EntireTransitionMapOfAState = &self.transitions[to];
         for(transitionsToCopyFrom.map.items) |transition| {
-            var fromRange:Pair(?u8,?u8) = .{transition[1][0], transition[0]};
+            var fromRange:Pair(u8,u8) = .{transition[1][0], transition[0]};
 
-            if(opts.excludeEpsilonTransitions and fromRange[0] == null){
-                if(fromRange[1] == null)
+            if(opts.excludeEpsilonTransitions and fromRange[0] == epsilon){
+                if(fromRange[1] == epsilon)
                     continue;
 
                 // otherwise, the range includes non-epsilon transitions, so we add that part
@@ -2217,7 +2203,7 @@ const RegExNFA = struct {
         while(changedSmth){
             changedSmth = false;
             for(0.., self.transitions) |state,*transitionsFromState| {
-                if(transitionsFromState.find(null)) |epsTargetsFromState| {
+                if(transitionsFromState.find(epsilon)) |epsTargetsFromState| {
                     // solution: copy all transitions of the targeted states (epsTargetsFromState) to the current state
                     // also if the target is a final state, make this one final too
                     for(epsTargetsFromState.items) |epsTargetState|{
@@ -2286,7 +2272,7 @@ const RegExNFA = struct {
 
             // then go through the transitions of the states, and construct a transition map for the state step by step
             // after the transition map is complete, the actual dfa states can be created and the dfa transitions can be added
-            var combinedTransitionsForCurNfaState = try RangeMap(u8, makeOrder(u8), UniqueStateSet).init(self.internalAllocator);
+            var combinedTransitionsForCurNfaState = try EntireTransitionMapOfAState.init(self.internalAllocator);
             // the transition lists in here are kept sorted, for deduplication (as they represent sets)
 
             for(curNfaStates.items) |curNfaState| {
@@ -2302,7 +2288,8 @@ const RegExNFA = struct {
 
                     // ignore empty, because eps transitions are already handled
 
-                    if(transition.*[0]) |c| {
+                    const c = transition.*[0];
+                    if(c != RegExNFA.epsilon){
                         // first: find/insert the transition map for the current char
                         // results are still correct
                         var entry = try combinedTransitionsForCurNfaState.findOrMakeSpot(c, .{});
@@ -2407,7 +2394,7 @@ test "NFA eps removal" {
 
     var nfa = try RegExNFA.init(arena.allocator());
     try nfa.addStates(2);
-    try nfa.addSingleTransition(0, null, 1);
+    try nfa.addSingleTransition(0, RegExNFA.epsilon, 1);
     try nfa.addSingleTransition(1, 'a', 1);
     try nfa.designateStatesFinal(&[_]u32{1});
 
@@ -2427,8 +2414,8 @@ test "NFA transitive eps removal" {
 
     var nfa = try RegExNFA.init(arena.allocator());
     try nfa.addStates(3);
-    try nfa.addSingleTransition(0, null, 1);
-    try nfa.addSingleTransition(1, null, 2);
+    try nfa.addSingleTransition(0, RegExNFA.epsilon, 1);
+    try nfa.addSingleTransition(1, RegExNFA.epsilon, 2);
     try nfa.addSingleTransition(2, 'a', 2);
     try nfa.designateStatesFinal(&[_]u32{2});
 
@@ -2443,8 +2430,8 @@ test "NFA transitive eps removal" {
 
     var nfa2 = try RegExNFA.init(arena.allocator());
     try nfa2.addStates(3);
-    try nfa2.addSingleTransition(0, null, 1);
-    try nfa2.addSingleTransition(1, null, 2);
+    try nfa2.addSingleTransition(0, RegExNFA.epsilon, 1);
+    try nfa2.addSingleTransition(1, RegExNFA.epsilon, 2);
     try nfa2.addSingleTransition(2, 'a', 2);
 
     try expect(nfa2.transitions[0].find('a') == null);
@@ -2495,7 +2482,7 @@ test "complex eps-NFA powerset construction" {
 
     var nfa = try RegExNFA.init(arena.allocator());
     try nfa.addStates(4);
-    try nfa.addSingleTransition(0, null, 2);
+    try nfa.addSingleTransition(0, RegExNFA.epsilon, 2);
     try nfa.addSingleTransition(0, 'a', 1);
     try nfa.addSingleTransition(1, 'b', 1);
     try nfa.addSingleTransition(2, 'c', 1);
@@ -2503,7 +2490,7 @@ test "complex eps-NFA powerset construction" {
     try nfa.addSingleTransition(2, 'd', 1);
     try nfa.addSingleTransition(1, 'e', 0);
     try nfa.addSingleTransition(1, 'e', 3);
-    try nfa.addSingleTransition(3, null, 1);
+    try nfa.addSingleTransition(3, RegExNFA.epsilon, 1);
 
     try nfa.designateStatesFinal(&[_]u32{3});
 
