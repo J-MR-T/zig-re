@@ -14,6 +14,16 @@ fn structFieldType(comptime T:type, comptime fieldIndex:comptime_int) type{
     return @typeInfo(T).Struct.fields[fieldIndex].type;
 }
 
+test "semantically analyze relevant types without explicit calls" {
+    std.testing.refAllDeclsRecursive(RegEx);
+    std.testing.refAllDeclsRecursive(RegExDFA);
+    std.testing.refAllDeclsRecursive(RegExNFA);
+    // doesn't use a simple u32 u32 array set, because that includes methods that assume a key-value type store, and thus consciously don't pass semantic analysis in some cases.
+    std.testing.refAllDeclsRecursive(ArraySet(Pair(u32, u32), keyCompare(Pair(u32, u32), makeOrder(u32))));
+    std.testing.refAllDeclsRecursive(UnionFind(u32, makeOrder(u32)));
+    std.testing.refAllDeclsRecursive(RangeMap(u32, makeOrder(u32), u32));
+}
+
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const expectEqualDeep = std.testing.expectEqualDeep;
@@ -1097,7 +1107,7 @@ const RegEx = struct {
 
                     // we can check whether left/right have a start/end state yet to determine whether we can just connect them, or we need to create a new start/end state (+transitions)
 
-                    // TODO this can be optimized, we don't need a new start/end state in every case. But it does not save huge amounts of time, we will just have a bunch of unused states in the nfa, that won't be added to the dfa, because they're never reached from the start state
+                    // TODO this can be optimized (for compile-time), we don't need a new start/end state in every case. But it does not save huge amounts of time, we will just have a bunch of unused states in the nfa, that won't be added to the dfa, because they're never reached from the start state
                     try nfa.addStates(2);
                     cur.regex.nfaStartState = nfa.numStates - 2;
                     const curStartState = cur.regex.nfaStartState.?;
@@ -1496,7 +1506,7 @@ const RegExDFA = struct{
         defer self.internalAllocator.free(startOfState);
         @memset(startOfState, null);
 
-        var jumpsToPatch = try std.ArrayList(struct{instrToPatch:*u8, targetState:u32}).initCapacity(self.internalAllocator, self.numStates);
+        var jumpsToPatch = try std.ArrayList(struct{instrToPatch:*u8, opcode:FeMnem, targetState:u32}).initCapacity(self.internalAllocator, self.numStates);
         defer jumpsToPatch.deinit();
 
         var worklistI:usize = 0;
@@ -1556,19 +1566,49 @@ const RegExDFA = struct{
                         // just encode, and let fadec pick the best encoding
                         try encode(&cur, fadec.FE_JZ, .{oldIntCast(@intFromPtr(jeTarget), fadec.FeOp)});
                     }else{
-                        try jumpsToPatch.append(.{.instrToPatch = @ptrCast(cur), .targetState = targetState});
+                        try jumpsToPatch.append(.{.instrToPatch = @ptrCast(cur), .opcode = fadec.FE_JZ, .targetState = targetState});
                         // use longest possible encoding to reserve space, patch it later
                         try encode(&cur, fadec.FE_JZ | fadec.FE_JMPL, .{oldIntCast(@intFromPtr(cur), fadec.FeOp)});
                     }
                 }else{
-                    // TODO
-                    return error.NotYetImplemented;
+                    const startChar = range[0];
+                    const endChar = range[1];
+
+                    // TODO think about this range code again, and write tests for it
+                    // TODO include an additional check for '.'/AnyChar, i.e. if the range is 1-255, just check that its not 0, if its not, jump to the target. If it is, skip the normal insertion of another cmp cl, 0, and do the JZ immediately
+
+                    // cmp cl, startChar
+                    try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, startChar});
+
+                    // if cl < startChar, jump to next transition (jump needs to be patched later)
+                    // don't need to use FE_JMPL, because we know the target is <128 away
+                    const FE_JB = fadec.FE_JC; // jump below == jump carry
+                    var toPatch = cur;
+                    try encode(&cur, FE_JB, .{oldIntCast(@intFromPtr(cur), fadec.FeOp)}); // TODO could also hard code this instead of patching it, if we always use a long jump for the JBE later
+
+                    // cmp cl, endChar
+                    try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, endChar});
+
+                    // if cl <= endChar, jump to target like above
+                    if(startOfState[targetState]) |jeTarget| {
+                        // just encode, and let fadec pick the best encoding
+                        try encode(&cur, fadec.FE_JBE , .{oldIntCast(@intFromPtr(jeTarget), fadec.FeOp)});
+                    }else{
+                        try jumpsToPatch.append(.{.instrToPatch = @ptrCast(cur), .opcode = fadec.FE_JBE, .targetState = targetState});
+                        // use longest possible encoding to reserve space, patch it later
+                        try encode(&cur, fadec.FE_JBE | fadec.FE_JMPL, .{oldIntCast(@intFromPtr(cur), fadec.FeOp)});
+                    }
+
+                    // patch jump from before to jump to here
+                    const nextTransitionPatchTarget = cur;
+                    try encode(&toPatch, FE_JB, .{oldIntCast(@intFromPtr(nextTransitionPatchTarget), fadec.FeOp)});
                 }
             }
 
             // check if we have reached the end of the word
             try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, 0});
             // if we have, jump to the checkFinalStatePtr and move the current state into RSI
+            // TODO instruction scheduling-wise: shouldn't we move the code for moving into RSI earlier, so that there's more time for it to be executed out of order?
             try encode(&cur, fadec.FE_MOV64ri, .{fadec.FE_SI, curState});
             try encode(&cur, fadec.FE_JZ, .{oldIntCast(@intFromPtr(checkFinalStatePtr), fadec.FeOp)});
 
@@ -1578,7 +1618,7 @@ const RegExDFA = struct{
 
         // patch jumps
         for(jumpsToPatch.items) |*jump| {
-            try encode(@ptrCast(&jump.instrToPatch), fadec.FE_JZ | fadec.FE_JMPL, .{oldIntCast(@intFromPtr(startOfState[jump.targetState].?), fadec.FeOp)});
+            try encode(@ptrCast(&jump.instrToPatch), jump.opcode | fadec.FE_JMPL, .{oldIntCast(@intFromPtr(startOfState[jump.targetState].?), fadec.FeOp)});
         }
 
         compiledDFA.recognize = @ptrCast(recognizerFunctionEntryPtr);
@@ -1624,8 +1664,15 @@ const FiniteAutomaton = union(enum){
 
             switch(self){
                 FiniteAutomaton.dfa => |dfa| {
-                    for(dfa.transitions[curState].items) |transition| {
-                        try writer.print("n{} -> n{}[label=\"{c}\"]; ", .{curState, transition[1], transition[0]});
+                    for(dfa.transitions[curState].map.items) |transition| {
+                        // single char transition
+                        if(transition[0] == transition[1][0]){
+                            try writer.print("n{} -> n{}[label=\"{c}\"]; ", .{curState, transition[1][1], transition[0]});
+                        }
+                        // range transition
+                        else{
+                            try writer.print("n{} -> n{}[label=\"{c}-{c}\"]; ", .{curState, transition[1][1], transition[1][0], transition[0]});
+                        }
                     }
                 },
                 FiniteAutomaton.nfa => |nfa| {
@@ -1633,12 +1680,19 @@ const FiniteAutomaton = union(enum){
                         continue;
 
                     // could also put the same transitions on the same edge, reduce clutter a bit, but this is only for debugging anyway
-                    for(nfa.transitions[curState].items) |transitions| {
-                        for(transitions[1].items) |targetState| {
-                            if(transitions[0]) |c| {
-                                try writer.print("n{} -> n{}[label=\"{c}\"]; ", .{curState, targetState, c});
-                            }else{
-                                try writer.print("n{} -> n{}[label=\"&epsilon;\"]; ", .{curState, targetState});
+                    for(nfa.transitions[curState].map.items) |transitions| {
+                        for(transitions[1][1].items) |targetState| {
+                            // single char transition
+                            if(transitions[0] == transitions[1][0]){
+                                const c = transitions[0];
+                                if(transitions[0] == 0){
+                                    try writer.print("n{} -> n{}[label=\"&epsilon;\"]; ", .{curState, targetState});
+                                }else{
+                                    try writer.print("n{} -> n{}[label=\"{c}\"]; ", .{curState, targetState, c});
+                                }
+                            } // range transition 
+                            else{
+                                try writer.print("n{} -> n{}[label=\"{c}-{c}\"]; ", .{curState, targetState, transitions[1][0], transitions[0]});
                             }
                         }
                     }
@@ -1811,7 +1865,7 @@ const RegExNFA = struct {
             // we check whether the new targets are already present and try to add them immediately if they aren't
             var allNewTargetsPresent = true;
             for(newTargetStateSet.items) |newTarget| {
-                allNewTargetsPresent = allNewTargetsPresent and (try targetStates.insertAndGet(newTarget, .{.ReplaceExisting = false, .AssumeCapacity = true})).found_existing;
+                allNewTargetsPresent = (try targetStates.insertAndGet(newTarget, .{.ReplaceExisting = false, .AssumeCapacity = true})).found_existing and allNewTargetsPresent;
             }
 
             if(allNewTargetsPresent){
@@ -2170,13 +2224,12 @@ const RegExNFA = struct {
     }
 
     // returns whether it added anything
-    pub fn addAllTransitionsFromOtherState(self:*@This(), to:u32, from:u32, comptime opts:struct{excludeEpsilonTransitions:bool = false}) !bool {
-        if(to == from)
-            return false; 
+    pub fn addAllTransitions(transitionsToCopyTo:*EntireTransitionMapOfAState, transitionsToCopyFrom:EntireTransitionMapOfAState, comptime opts:struct{excludeEpsilonTransitions:bool = false}) !bool {
+        if(transitionsToCopyTo.map.items.ptr == transitionsToCopyFrom.map.items.ptr){
+            return false;
+        }
 
         var addedSomething = false;
-        const transitionsToCopyFrom:EntireTransitionMapOfAState = self.transitions[from];
-        const transitionsToCopyTo:*EntireTransitionMapOfAState = &self.transitions[to];
         for(transitionsToCopyFrom.map.items) |transition| {
             var fromRange:Pair(u8,u8) = .{transition[1][0], transition[0]};
 
@@ -2185,11 +2238,15 @@ const RegExNFA = struct {
                     continue;
 
                 // otherwise, the range includes non-epsilon transitions, so we add that part
-                // TODO honestly those ranges don't make a whole lot of sense, because '\0' aren't even allowed in the final string to check...
-                fromRange[0] = 0;
+                // TODO honestly those ranges don't make a whole lot of sense, as few strings will include '\1' and so on
+                fromRange[0] = epsilon + 1;
             }
 
-            addedSomething = addedSomething or addRangeTransitionFromStateSet(transitionsToCopyTo, fromRange, transition[1][1]) catch unreachable;
+            if(transition[0] == epsilon)
+                continue;
+
+            // be careful not to do addedSomething = addedSomething or ... because the or is short circuiting, so its not actually equivalent to doing something like addedSomething |= ... in C...
+            addedSomething = try addRangeTransitionFromStateSet(transitionsToCopyTo, .{transition[1][0], transition[0]}, transition[1][1]) or addedSomething;
         }
         return addedSomething;
     }
@@ -2208,7 +2265,7 @@ const RegExNFA = struct {
                     // also if the target is a final state, make this one final too
                     for(epsTargetsFromState.items) |epsTargetState|{
                         // exclude eps transitions here, they just make the whole thing bigger, and adding them anywhere might modify the epsTargetsFromState while we're iterating over them.
-                        if(try self.addAllTransitionsFromOtherState(@intCast(state), epsTargetState, .{.excludeEpsilonTransitions = true}))
+                        if(try addAllTransitions(&self.transitions[state], self.transitions[epsTargetState], .{.excludeEpsilonTransitions = true}))
                             changedSmth = true;
 
                         // make final if target is final
@@ -2262,61 +2319,28 @@ const RegExNFA = struct {
             // get the state, has to be in there (but not visited yet) if its in the worklist
             const curDfaState = nfaToDfaStates.get(curNfaStates.items).?;
 
-            // if any of the current nfa states is final, make the dfa state final
-            loop: for(curNfaStates.items) |curNfaState| {
-                if(self.finalStates.contains(curNfaState)){
-                    try dfa.designateStatesFinal(&[1]u32{@truncate(curDfaState)});
-                    break :loop;
-                }
-            }
-
-            // then go through the transitions of the states, and construct a transition map for the state step by step
+            // go through the transitions of the states, and construct a transition map for the state step by step
             // after the transition map is complete, the actual dfa states can be created and the dfa transitions can be added
             var combinedTransitionsForCurNfaState = try EntireTransitionMapOfAState.init(self.internalAllocator);
             // the transition lists in here are kept sorted, for deduplication (as they represent sets)
 
+            var madeFinalAlready = false;
+
             for(curNfaStates.items) |curNfaState| {
                 assert(self.transitions.len > curNfaState, "nfa state out of bounds, nfa is invalid", .{});
 
-                // TODO should be able to adapt this for range transitions by using a modified version of the addAllTransitionsFromOtherState function, the only problem is that the type is slightly different (u8 keys instead of ?u8), and zig is terrible with generic function parameter constraints, so I'd have to change basically all type declarations to anytype, which is completely unreadable...
-                // TODO that whole problem could be solved if I do away with that stupid nullable u8 thing and just use 0 as the value for espilon, because it can't be a valid char anyway
-
-                for(self.transitions[curNfaState].map.items) |*transition| {
-                    // TODO adapt this for real range transitions
-                    if(transition[0] != transition[1][0])
-                        return error.NotYetImplemented;
-
-                    // ignore empty, because eps transitions are already handled
-
-                    const c = transition.*[0];
-                    if(c != RegExNFA.epsilon){
-                        // first: find/insert the transition map for the current char
-                        // results are still correct
-                        var entry = try combinedTransitionsForCurNfaState.findOrMakeSpot(c, .{});
-                        // either create, if it doesn't exist yet or add all
-                        if(!entry.found_existing){
-                            // set the char
-                            entry.setRange(c, c);
-                            // set value
-                            entry.value().* = try transition.*[1][1].clone();
-                        }else{
-                            // TODO
-                            if(compare(entry.lower().*,entry.upper().*) != Order.eq)
-                                return error.NotYetImplemented;
-
-                            try entry.value().addAll(transition.*[1][1]);
-                        }
-                    }
+                // if any of the current nfa states is final, make the dfa state final
+                if(!madeFinalAlready and self.finalStates.contains(curNfaState)){
+                    try dfa.designateStatesFinal(&[1]u32{@truncate(curDfaState)});
+                    madeFinalAlready = true;
                 }
+
+                _ = try addAllTransitions(&combinedTransitionsForCurNfaState, self.transitions[curNfaState], .{.excludeEpsilonTransitions = true});
             }
 
             // now we have the combined transitions for the current state, so we can create the actual states and add the transitions in the dfa
 
             for(combinedTransitionsForCurNfaState.map.items) |transition| {
-                // TODO for now, we can simply assume all these transitions to only have non-ranged chars
-                if(compare(transition[0],transition[1][0]) != Order.eq)
-                    return error.NotYetImplemented;
-
                 const targetStates = transition[1][1];
 
                 // create or get state
@@ -2329,7 +2353,7 @@ const RegExNFA = struct {
                 }
 
                 // add transition
-                try dfa.transitions[curDfaState].insertSingle(transition[0], targetStateEntry.value_ptr.*, .{}); // TODO range stuff
+                try dfa.transitions[curDfaState].insert(transition[1][0], transition[0], targetStateEntry.value_ptr.*, .{.AssumeNoOverlap = true});
             }
 
         }
@@ -2589,6 +2613,74 @@ test "single char regex to dfa" {
     try expect(!dfa.isInLanguageInterpreted("w"));
 }
 
+test "nfas with ranges compiled" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var nfa = try RegExNFA.init(arena.allocator());
+    try nfa.addStates(6);
+    _ =try nfa.addRangeTransitionByState(0, .{'a', 'z'}, &[_]u32{1});
+    _ =try nfa.addRangeTransitionByState(0, .{'A', 'Z'}, &[_]u32{1});
+    _ =try nfa.addRangeTransitionByState(0, .{'b', 'z'}, &[_]u32{2});
+    _ =try nfa.addRangeTransitionByState(0, .{'b', 'z'}, &[_]u32{2});
+
+    // these are transitions to useless trap states (4, 5), just to throw the thing off
+    _ =try nfa.addRangeTransitionByState(1, .{'0', '9'}, &[_]u32{4});
+    _ =try nfa.addRangeTransitionByState(2, .{'0', '9'}, &[_]u32{5});
+
+    _ =try nfa.addRangeTransitionByState(1, .{'5', '9'}, &[_]u32{3});
+    _ =try nfa.addRangeTransitionByState(2, .{'0', '4'}, &[_]u32{3});
+    _ =try nfa.designateStatesFinal(&[_]u32{3});
+
+    try nfa.backUpEpsTransitions(); // technically unnecessary, but just to test it
+    var dfa = try nfa.toPowersetConstructedDFA(.{});
+
+    //const fa = FiniteAutomaton{.dfa = &dfa};
+    //try fa.printDOT(std.io.getStdOut().writer());
+
+    var compiled = try dfa.compile(&arena, false, .{});
+    
+
+    // tests
+    for(1..'z') |c| {
+        // holy shit is that an annoying way to initialize 'c', '\0' ...
+        const str:[:0]const u8 = &[_:0]u8{@intCast(c)};
+        try expect(!dfa.isInLanguageInterpreted(str));
+        try expect(!compiled.isInLanguageCompiled(str));
+    }
+
+    for('a'..'z') |c1| {
+        for('0'..'5') |c2| {
+            const str:[:0]const u8 = &[_:0]u8{@intCast(c1), @intCast(c2)};
+            if(c1 == 'a'){
+                try expect(!dfa.isInLanguageInterpreted(str));
+                try expect(!compiled.isInLanguageCompiled(str));
+            }else{
+                try expect(dfa.isInLanguageInterpreted(str));
+                try expect(compiled.isInLanguageCompiled(str));
+            }
+        }
+        for('5'..('9'+1)) |c2| {
+            const str:[:0]const u8 = &[_:0]u8{@intCast(c1), @intCast(c2)};
+            try expect(dfa.isInLanguageInterpreted(str));
+            try expect(compiled.isInLanguageCompiled(str));
+        }
+    }
+
+    for('A'..'Z') |c1| {
+        for('0'..'5') |c2| {
+            const str:[:0]const u8 = &[_:0]u8{@intCast(c1), @intCast(c2)};
+            try expect(!dfa.isInLanguageInterpreted(str));
+            try expect(!compiled.isInLanguageCompiled(str));
+        }
+        for('5'..('9'+1)) |c2| {
+            const str:[:0]const u8 = &[_:0]u8{@intCast(c1), @intCast(c2)};
+            try expect(dfa.isInLanguageInterpreted(str));
+            try expect(compiled.isInLanguageCompiled(str));
+        }
+    }
+}
+
 test "regex dfa profiling" {
     const input = "xyz|w*(abc)*de*f";
 
@@ -2670,7 +2762,7 @@ test "fadec basic functionality and abstractions" {
 
 pub fn main() !void {
     //const writer = std.io.getStdOut().writer();
-
+//
     //var arena = std.heap.ArenaAllocator.init(cAllocer);
     //defer arena.deinit();
     //
@@ -2685,10 +2777,10 @@ pub fn main() !void {
     //
     //assert(dfa.internalAllocator.ptr == arena.allocator().ptr, "dfa should use the same allocator as the regex", .{});
     //
-    //var compiled = try dfa.compile(&arena, false, .{});
-    //debugLog("{}", .{compiled.isInLanguageCompiled("xyz")});
-    //compiled.debugPrint();
-
+    ////var compiled = try dfa.compile(&arena, false, .{});
+    ////debugLog("{}", .{compiled.isInLanguageCompiled("xyz")});
+    ////compiled.debugPrint();
+    //
     //const fa = FiniteAutomaton{.dfa = &dfa};
     //
     //try fa.printDOT(writer);
@@ -2697,23 +2789,30 @@ pub fn main() !void {
     defer arena.deinit();
 
     var nfa = try RegExNFA.init(arena.allocator());
-    defer nfa.deinit();
+    try nfa.addStates(6);
+    _ =try nfa.addRangeTransitionByState(0, .{'a', 'z'}, &[_]u32{1});
+    _ =try nfa.addRangeTransitionByState(0, .{'A', 'Z'}, &[_]u32{1});
+    _ =try nfa.addRangeTransitionByState(0, .{'b', 'z'}, &[_]u32{2});
+    _ =try nfa.addRangeTransitionByState(0, .{'b', 'z'}, &[_]u32{2});
 
-    try nfa.addStates(3);
+    // these are transitions to useless trap states (4, 5), just to throw the thing off
+    _ =try nfa.addRangeTransitionByState(1, .{'0', '9'}, &[_]u32{4});
+    _ =try nfa.addRangeTransitionByState(2, .{'0', '9'}, &[_]u32{5});
 
-    _ = try nfa.addRangeTransition(&nfa.transitions[0], .{'b', 'f'}, &[_]u32{2});
+    _ =try nfa.addRangeTransitionByState(1, .{'5', '9'}, &[_]u32{3});
+    _ =try nfa.addRangeTransitionByState(2, .{'0', '4'}, &[_]u32{3});
+    _ =try nfa.designateStatesFinal(&[_]u32{3});
 
-    try expectOrSkip(nfa.transitions[0].map.items.len == 1);
+    //const fa = FiniteAutomaton{.nfa = &nfa};
+    //try fa.printDOT(std.io.getStdOut().writer());
 
-    _ = try nfa.addRangeTransition(&nfa.transitions[0], .{'c', 'e'}, &[_]u32{1});
+    try nfa.backUpEpsTransitions(); // technically unnecessary, but just to test it
+    var dfa = try nfa.toPowersetConstructedDFA(.{});
 
-    nfa.debugLogTransitions();
+    var compiled = try dfa.compile(&arena, false, .{});
+    compiled.debugPrint();
 
-    try expect(nfa.transitions[0].map.items.len == 3);
-    try expect(std.mem.eql(u32, nfa.transitions[0].find('a').?.items, &[_]u32{1}));
-    try expect(std.mem.eql(u32, nfa.transitions[0].find('b').?.items, &[_]u32{1,2}));
-    try expectEqual(nfa.transitions[0].find('b').?.items.ptr, nfa.transitions[0].find('c').?.items.ptr);
-    try expectEqual(nfa.transitions[0].find('b').?.items.ptr, nfa.transitions[0].find('d').?.items.ptr);
-    try expectEqual(nfa.transitions[0].find('b').?.items.ptr, nfa.transitions[0].find('e').?.items.ptr);
-    try expect(std.mem.eql(u32, nfa.transitions[0].find('f').?.items, &[_]u32{2}));
+
+    //const fa = FiniteAutomaton{.dfa = &dfa};
+    //try fa.printDOT(std.io.getStdOut().writer());
 }
