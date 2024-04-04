@@ -18,14 +18,14 @@ test "semantically analyze relevant types without explicit calls" {
     std.testing.refAllDeclsRecursive(RegEx);
     std.testing.refAllDeclsRecursive(RegExDFA);
     std.testing.refAllDeclsRecursive(RegExNFA);
-    // doesn't use a simple u32 u32 array set, because that includes methods that assume a key-value type store, and thus consciously don't pass semantic analysis in some cases.
+    // doesn't use a simple u32 array set, because that includes methods that assume a key-value type store, and thus consciously don't pass semantic analysis in some cases.
     std.testing.refAllDeclsRecursive(ArraySet(Pair(u32, u32), keyCompare(Pair(u32, u32), makeOrder(u32))));
     std.testing.refAllDeclsRecursive(UnionFind(u32, makeOrder(u32)));
     std.testing.refAllDeclsRecursive(RangeMap(u32, makeOrder(u32), u32));
 }
 
-const expect = std.testing.expect;
-const expectEqual = std.testing.expectEqual;
+const expect          = std.testing.expect;
+const expectEqual     = std.testing.expectEqual;
 const expectEqualDeep = std.testing.expectEqualDeep;
 // unwraps the optional and std.testing.expect's that its not null (similar to just doing .?, but with an explicit expect)
 fn expectNotNull(value:anytype) !@typeInfo(@TypeOf(value)).Optional.child {
@@ -60,6 +60,13 @@ fn makeOrder(comptime T:type) fn (T, T) Order {
         }
     }.f;
 }
+
+const Termcolor = struct{
+    const Reset = "\x1b[0m";
+    // use the defaults from GCC
+    const Error = "\x1b[01;31m";
+    const Caret = "\x1b[01;33m";
+};
 
 // sorted array set. Should not be used if removal is important, try to treat it as an insert-only set
 // an insert-first-lookup-later sorted vector like map for performance (like https://www.llvm.org/docs/ProgrammersManual.html recommends)
@@ -791,54 +798,64 @@ const Token = struct {
 
     pub const Kind = enum {
         Char,
-        // TODO implement
         //AnyChar,
         Concat,
         Union,
         Kleen,
+        RangeMinus,
         LParen,
         RParen,
+        LSquareBrack,
+        RSquareBrack,
 
         // hope that the compiler knows that this is often used at comptime
         pub fn precedenceAndChar(self:@This()) struct{prec:u8, char:u8} {
             return switch(self){
-                Kind.Char    => .{.prec = 0, .char = 'x'},
-                //Kind.AnyChar => .{.prec = 0, .char = '.'},
-                Kind.Union   => .{.prec = 1, .char = '|'},
-                Kind.Concat  => .{.prec = 2, .char = ' '},
-                Kind.Kleen   => .{.prec = 3, .char = '*'},
-                Kind.LParen  => .{.prec = 0, .char = '('},
-                Kind.RParen  => .{.prec = 0, .char = ')'},
+                Kind.Char         => .{.prec = 0, .char = 'x'},
+                //Kind.AnyChar      => .{.prec = 0, .char = '.'},
+                Kind.Union        => .{.prec = 1, .char = '|'},
+                Kind.Concat       => .{.prec = 2, .char = ' '},
+                Kind.Kleen        => .{.prec = 3, .char = '*'},
+                Kind.RangeMinus   => .{.prec = 0, .char = '-'},
+                Kind.LParen       => .{.prec = 0, .char = '('},
+                Kind.RParen       => .{.prec = 0, .char = ')'},
+                Kind.LSquareBrack => .{.prec = 0, .char = '['},
+                Kind.RSquareBrack => .{.prec = 0, .char = ']'},
             };
         }
 
         pub fn fromChar(theChar:u8) @This() {
             // this seems to get compiled into smth proper
             return switch(theChar){
-                //Kind.AnyChar.precedenceAndChar().char => Kind.AnyChar,
-                Kind.Union.precedenceAndChar().char   => Kind.Union,
-                Kind.Kleen.precedenceAndChar().char   => Kind.Kleen,
-                Kind.LParen.precedenceAndChar().char  => Kind.LParen,
-                Kind.RParen.precedenceAndChar().char  => Kind.RParen,
-                else                                  => Kind.Char
+                //Kind.AnyChar.precedenceAndChar().char      => Kind.AnyChar,
+                Kind.Union.precedenceAndChar().char        => Kind.Union,
+                Kind.Kleen.precedenceAndChar().char        => Kind.Kleen,
+                Kind.RangeMinus.precedenceAndChar().char   => Kind.RangeMinus,
+                Kind.LParen.precedenceAndChar().char       => Kind.LParen,
+                Kind.RParen.precedenceAndChar().char       => Kind.RParen,
+                Kind.LSquareBrack.precedenceAndChar().char => Kind.LSquareBrack,
+                Kind.RSquareBrack.precedenceAndChar().char => Kind.RSquareBrack,
+                else                                       => Kind.Char
             };
         }
 
         pub fn canConcatToRight(self:@This()) bool {
             return switch(self){
-                Kind.Char    => true,
-                //Kind.AnyChar => true,
-                Kind.Kleen   => true,
-                Kind.RParen  => true,
-                else         => false
+                Kind.Char         => true,
+                //Kind.AnyChar      => true,
+                Kind.Kleen        => true,
+                Kind.RParen       => true,
+                Kind.RSquareBrack => true,
+                else              => false
             };
         }
         pub fn canConcatToLeft(self:@This()) bool {
             return switch(self){
-                Kind.Char    => true,
-                //Kind.AnyChar => true,
-                Kind.LParen  => true,
-                else         => false
+                Kind.Char         => true,
+                //Kind.AnyChar      => true,
+                Kind.LParen       => true,
+                Kind.LSquareBrack => true,
+                else              => false
             };
         }
     };
@@ -858,7 +875,7 @@ const Token = struct {
     }
 };
 
-const SyntaxError = error{InvalidToken};
+const SyntaxError = error{InvalidToken, PrematureEnd, InvalidRange};
 const ParseError = error{OutOfMemory} || SyntaxError;
 
 const Tokenizer = struct {
@@ -871,16 +888,22 @@ const Tokenizer = struct {
         // we need to fill in concat tokens, as they are implicit in the input
         var tokens:[]Token = try allocer.alloc(Token, input.len << 1); // multiply by 2 to account for concat tokens
         var i:u32 = 0;
+        var isInCharGroupingSquareBrack = false;
         for (input) |char| {
             const curToken = Token.initChar(char);
             // hope this gets unrolled
-            if(i > 0 and curToken.kind.canConcatToLeft() and tokens[i-1].kind.canConcatToRight()) {
+            if(i > 0 and curToken.kind.canConcatToLeft() and tokens[i-1].kind.canConcatToRight() and !isInCharGroupingSquareBrack) {
                 tokens[i] = Token.initKind(Token.Kind.Concat);
                 i+=1;
                 tokens[i] = curToken;
             }else{
                 tokens[i] = curToken;
             }
+            // inside a char group, a period is a literal char
+            if(isInCharGroupingSquareBrack and char == '.')
+                tokens[i].kind = Token.Kind.Char;
+
+            isInCharGroupingSquareBrack = (isInCharGroupingSquareBrack or (!isInCharGroupingSquareBrack and curToken.kind == Token.Kind.LSquareBrack)) and !(isInCharGroupingSquareBrack and curToken.kind == Token.Kind.RSquareBrack);
             i+=1;
         }
         return try allocer.realloc(tokens, i);
@@ -895,22 +918,38 @@ const Tokenizer = struct {
         };
     }
 
-    pub fn peek(self:*const Tokenizer) Token {
+    // TODO think about these 5 things again 
+    pub fn hasNext(self:*const Tokenizer) bool {
+        return self.cur < self.tokens.len;
+    }
+
+    pub fn peekAssume(self:*const Tokenizer) Token {
         return self.tokens[self.cur];
     }
 
-    pub fn next(self:*Tokenizer) Token {
-        const tok = self.tokens[self.cur];
+    pub fn peek(self:*const Tokenizer) SyntaxError!Token {
+        if(!self.hasNext()){
+            return SyntaxError.PrematureEnd;
+        }
+
+        return self.peekAssume();
+    }
+
+    pub fn nextAssume(self:*Tokenizer) Token {
+        const tok = self.peekAssume();
         self.cur += 1;
         return tok;
     }
 
-    pub fn hasNext(self:*const Tokenizer) bool {
-        return self.cur < self.tokens.len;
+    pub fn next(self:*Tokenizer) SyntaxError!Token {
+        if(!self.hasNext())
+            return SyntaxError.PrematureEnd;
+
+        return self.nextAssume();
     }
-    
+
     pub fn matchNext(self:*Tokenizer, kind:Token.Kind, comptime advance:bool) bool {
-        if(self.hasNext() and self.peek().kind == kind) {
+        if(self.hasNext() and self.peekAssume().kind == kind) {
             if (advance)
                 self.cur += 1;
             return true;
@@ -920,12 +959,22 @@ const Tokenizer = struct {
 
     pub fn assertNext(self:*Tokenizer, kind:Token.Kind) SyntaxError!void {
         if(!self.matchNext(kind, true)) {
-            return SyntaxError.InvalidToken;
+            if(!self.hasNext()){
+                return SyntaxError.PrematureEnd;
+            }else{
+                self.setErrorPositionToCur();
+                return SyntaxError.InvalidToken;
+            }
         }
     }
 
     pub fn deinit(self:@This()) void {
         self.internalAllocator.free(self.tokens);
+    }
+
+    pub fn setErrorPositionToCur(self:*const Tokenizer) void {
+        errorPosition.charStart = self.cur;
+        errorPosition.charEnd = self.cur;
     }
 
     fn debugFmt(self:@This()) !std.ArrayList(u8) {
@@ -938,11 +987,14 @@ const Tokenizer = struct {
     }
 };
 
+// zig doesn't have error payloads, so just use a global, to indicate where a possible error in the input is located (if the error is not a PrematureEnd error)
+var errorPosition:struct{charStart:u32, charEnd:u32} = .{.charStart = 0, .charEnd = 0};
+
 const RegEx = struct {
+    kind:Token.Kind,
     left:?*RegEx,
     right:?*RegEx,
-    kind:Token.Kind,
-    char:u8,
+    chars:Pair(u8,u8),
 
     internalAllocator:Allocator,
 
@@ -955,7 +1007,19 @@ const RegEx = struct {
             .left = null,
             .right = null,
             .kind = Token.Kind.Char,
-            .char = char,
+            .chars = .{char, char},
+            .internalAllocator = allocer,
+            .nfaStartState = null,
+            .nfaEndState = null,
+        };
+    }
+
+    pub fn initLiteralChars(allocer:Allocator, chars:Pair(u8, u8)) @This() {
+        return RegEx{
+            .left = null,
+            .right = null,
+            .kind = Token.Kind.Char,
+            .chars = chars,
             .internalAllocator = allocer,
             .nfaStartState = null,
             .nfaEndState = null,
@@ -967,11 +1031,21 @@ const RegEx = struct {
             .left = left,
             .right = right,
             .kind = kind,
-            .char = kind.precedenceAndChar().char,
+            .chars = .{0,0},
             .internalAllocator = allocer,
             .nfaStartState = null,
             .nfaEndState = null,
         };
+    }
+
+    pub fn deinit(self:*@This()) void {
+        if(self.left) |left| {
+            left.deinit();
+        }
+        if(self.right) |right| {
+            right.deinit();
+        }
+        self.internalAllocator.destroy(self);
     }
 
     pub fn parsePrimaryExpr(allocer:Allocator, tok:*Tokenizer) ParseError!*@This() {
@@ -979,9 +1053,100 @@ const RegEx = struct {
         if(tok.matchNext(Token.Kind.LParen, true)) {
             primary = try parseExpr(allocer, 0, tok);
             try tok.assertNext(Token.Kind.RParen);
+        }else if(tok.matchNext(Token.Kind.LSquareBrack, true)) {
+            // char groups implemented as loop, that basically does [a-xyz] -> a-x|y|z
+            // first of all: find all ranges
+            var options = std.ArrayList(Pair(u8, u8)).init(allocer);
+            defer options.deinit();
+
+            while(tok.hasNext()) {
+                // get current range
+                const start = tok.nextAssume();
+                if(start.kind != Token.Kind.Char) { //can't be anychar inside char group
+                    tok.setErrorPositionToCur();
+                    return SyntaxError.InvalidToken;
+                }
+
+                var range:Pair(u8, u8) = .{start.char, start.char};
+
+                if(tok.matchNext(Token.Kind.RangeMinus, true)){
+                    const end = try tok.next();
+                    if(end.kind != Token.Kind.Char) { //can't be anychar inside char group
+                        tok.setErrorPositionToCur();
+                        return SyntaxError.InvalidToken;
+                    }else if(end.char < range[0]) {
+                        tok.setErrorPositionToCur();
+                        return SyntaxError.InvalidRange;
+                    }
+
+                    range[1] = end.char;
+                }
+
+                try options.append(range);
+
+                // check if group ends here
+                if(tok.matchNext(Token.Kind.RSquareBrack, false)) {
+                    break;
+                }
+            }
+
+            try tok.assertNext(Token.Kind.RSquareBrack);
+
+            // TODO could also sort the options here and try to unify the ranges
+
+            // now we have all ranges, we need to convert them to a regex
+            // we do this by successively creating full subtrees (every inner node is a union), and then union-ing them together again, basically bottom-up
+            // we create these by descending size
+
+            var currentRoot = try allocer.create(RegEx);
+            var currentSubtree = currentRoot;
+            while(options.items.len>0){
+                const subtreeHeight = std.math.log2_int(usize, options.items.len) + 1; // the log is basically the depth, but we want a height, so we add 1
+                if(subtreeHeight > 32) 
+                    return error.OutOfMemory;
+
+                const numInnerNodes = (oldIntCast(1, usize) << (subtreeHeight - 1)) - 1;
+                const numTotalNodes = (oldIntCast(1, usize) << subtreeHeight) - 1;
+                var worklist = try std.ArrayList(*RegEx).initCapacity(allocer, numTotalNodes);
+                defer worklist.deinit();
+                worklist.appendAssumeCapacity(currentSubtree);
+                var handled:usize = 0;
+                // this loop initializes the inner nodes
+                while(handled < numInnerNodes) : (handled+=1) {
+                    const left = try allocer.create(RegEx);
+                    const right = try allocer.create(RegEx);
+
+                    worklist.items[handled].* = initOperator(allocer, Token.Kind.Union, left, right);
+
+                    worklist.appendAssumeCapacity(left);
+                    worklist.appendAssumeCapacity(right);
+                }
+
+                // we've handled all inner nodes, everything that's remaining are the leaves
+                for(worklist.items[handled..]) |leaf| {
+                    // don't need to check whether there are options left, the construction of the subtree guarantees that there are
+                    // TODO could not do pop and keep track of an index ourselves (then the order would also not be reversed), but this is fine, and a bit more readable
+                    leaf.* = initLiteralChars(allocer, options.pop());
+                }
+
+                // -> we've constructed a full subtree
+                // if there are more ranges left, we need to union the current subtree with the next one
+                if(options.items.len > 0){
+                    var newRoot = try allocer.create(RegEx);
+                    currentSubtree = try allocer.create(RegEx);
+                    newRoot.* = initOperator(allocer, Token.Kind.Union, currentRoot, currentSubtree);
+                    currentRoot = newRoot;
+
+                    // -> the next iteration will fill the newRoots right subtree as the currentSubtree
+                }
+            }
+
+            primary = currentRoot;
+        }else if(!tok.hasNext()) {
+            return SyntaxError.PrematureEnd;
         }else{
             primary = try allocer.create(RegEx);
-            primary.* = initLiteralChar(allocer, tok.next().char);
+            primary.* = initLiteralChar(allocer, tok.nextAssume().char);
         }
 
         if(tok.matchNext(Token.Kind.Kleen, true)) { // kleens prec is ignored because its the highest anyway
@@ -996,7 +1161,7 @@ const RegEx = struct {
         var lhs = try parsePrimaryExpr(allocer, tok);
         while (tok.hasNext()) {
             // let the upper level parse 'unknown operators' (in this case anything but the binary operators)
-            var operatorKind = tok.peek().kind; // we peek, because if we return inside the loop, the upper level needs to consume that token
+            var operatorKind = tok.peekAssume().kind; // we peek, because if we return inside the loop, the upper level needs to consume that token
             if(operatorKind != Token.Kind.Union and operatorKind != Token.Kind.Concat)
                 return lhs;
 
@@ -1004,7 +1169,7 @@ const RegEx = struct {
             if (prec < minPrec)
                 return lhs;
 
-            _ = tok.next(); // consume operator
+            _ = tok.nextAssume(); // consume operator
 
 
 
@@ -1018,13 +1183,14 @@ const RegEx = struct {
 
     fn printDOTInternal(self:RegEx, writer:anytype, num:u128) !void {
         // depth above 127 is undefined for now
-        try writer.print("n{}[label=\"{?c}\"];", .{num,self.char});
+        try writer.print("n{}[label=\"{}\"];", .{num, self});
+
         if (self.left) |left| {
-            try writer.print("n{} -> n{};",   .{num,     num << 1});
+            try writer.print("n{} -> n{};",   .{num, num << 1});
             try left.printDOTInternal(writer, num << 1);
         }
         if (self.right) |right| {
-            try writer.print("n{} -> n{};",    .{num,           (num << 1) + 1});
+            try writer.print("n{} -> n{};",    .{num, (num << 1) + 1});
             try right.printDOTInternal(writer, (num << 1) + 1);
         }
     }
@@ -1059,7 +1225,7 @@ const RegEx = struct {
             try dfa.addStates(2);
             dfa.startState = 0;
             try dfa.designateStatesFinal(&[1]u32{1});
-            try dfa.transitions[dfa.startState].insertSingle(self.char, 1, .{});
+            try dfa.transitions[dfa.startState].insert(self.chars[0], self.chars[1], 1, .{});
 
             // TODO handle AnyChar here as soon as it's implemented
             // TODO the best thing to do would probably to add some sort of relaxation on transitions, so that they can also be taken if the input char is in a certain range. This would allow groups like [0-9] to be handled somewhat efficiently, and AnyChar would just be the range 1-255
@@ -1122,7 +1288,7 @@ const RegEx = struct {
                             const right = cur.regex.right.?;
 
                             if(!left.isOperator()){
-                                try nfa.addSingleTransition(curStartState, left.char, curEndState);
+                                try nfa.addRangeTransitionByState(curStartState, left.chars, &[_]u32{curEndState});
                             }else{
                                 // if it is an operator, we have visited it before, so it has a start/end state, so we can just connect it
                                 try nfa.addSingleTransition(left.nfaEndState.?, epsilon, curEndState);
@@ -1132,13 +1298,13 @@ const RegEx = struct {
                             }
 
                             if(!right.isOperator()){
-                                try nfa.addSingleTransition(curStartState, right.char, curEndState);
+                                try nfa.addRangeTransitionByState(curStartState, right.chars, &[_]u32{curEndState});
                             }else{
                                 // same as left
                                 try nfa.addSingleTransition(right.nfaEndState.?, epsilon, curEndState);
                                 try nfa.addSingleTransition(curStartState, epsilon, right.nfaStartState.?);
                             }
-                            // sidenote: see? this is exactly why ever programming language needs the ability to use 'local functions'/lambdas for readability. Do you hear me, Zig? :. Don't even need to be real functions in the end, can just inline all of them (and forbid non-inlinable ones)
+                            // sidenote: see? this is exactly why every programming language needs the ability to use 'local functions'/lambdas for readability. Do you hear me, Zig? :. Don't even need to be real functions in the end, can just inline all of them (and forbid non-inlinable ones)
                         },
                         Token.Kind.Concat => {
                             const right = cur.regex.right.?;
@@ -1151,17 +1317,17 @@ const RegEx = struct {
                                 cur.regex.nfaEndState = right.nfaEndState.?;
                             }else if(left.isOperator()){
                                 // if only left is an operator, we can take the existing end state of left and connect it with the char of right to the new end state
-                                try nfa.addSingleTransition(left.nfaEndState.?, right.char, curEndState);
+                                try nfa.addRangeTransitionByState(left.nfaEndState.?, right.chars, &[_]u32{curEndState});
                                 cur.regex.nfaStartState = left.nfaStartState.?;
                             }else if(right.isOperator()){
                                 // same as left
-                                try nfa.addSingleTransition(curStartState, left.char, right.nfaStartState.?);
+                                try nfa.addRangeTransitionByState(curStartState, left.chars, &[_]u32{right.nfaStartState.?});
                                 cur.regex.nfaEndState = right.nfaEndState.?;
                             }else{
                                 // if both are chars, we need one more state in between
                                 const inBetweeny = try nfa.addState();
-                                try nfa.addSingleTransition(curStartState, left.char, inBetweeny);
-                                try nfa.addSingleTransition(inBetweeny, right.char, curEndState);
+                                try nfa.addRangeTransitionByState(curStartState, left.chars,  &[_]u32{inBetweeny});
+                                try nfa.addRangeTransitionByState(inBetweeny,    right.chars, &[_]u32{curEndState});
                             }
 
                         },
@@ -1177,7 +1343,7 @@ const RegEx = struct {
                             }else{
                                 // just use the start state as start/end
                                 // and add a transition to itself
-                                try nfa.addSingleTransition(curStartState, left.char, curStartState);
+                                try nfa.addRangeTransitionByState(curStartState, left.chars, &[_]u32{curStartState});
                                 cur.regex.nfaEndState = curStartState;
                             }
                         },
@@ -1195,14 +1361,38 @@ const RegEx = struct {
         return try nfa.toPowersetConstructedDFA(.{.overrideAllocator = opts.overrideAllocator orelse self.internalAllocator});
     }
 
-    // mostly for debugging
-    pub fn format(value: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) std.os.WriteError!void {
-        try writer.print("Itself: {c}", .{value.char});
-        if(value.left) |left| if(!left.isOperator())
-            try writer.print(" Left: {c}", .{left.char});
+    pub fn format(self: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) std.os.WriteError!void {
+        if(self.isOperator()){
+            try writer.print("{c}", .{self.kind.precedenceAndChar().char});
+        }else{
+            if(self.chars[0] == self.chars[1]){
+                try writer.print("{c}", .{self.chars[0]});
+            }else{
+                try writer.print("[{c}-{c}]", .{self.chars[0], self.chars[1]});
+            }
+        }
+    }
 
-        if(value.right) |right| if(!right.isOperator())
-            try writer.print(" Right: {c}", .{right.char});
+    // mostly for debugging/testing
+    pub fn traverse(self: *@This(), comptime visitor: fn(*RegEx, // node
+            bool, // isLeaf
+            usize, // depth
+        ) anyerror!void) !void {
+        try self.traverseInner(visitor, 0);
+    }
+
+    fn traverseInner(self: *@This(), comptime visitor: fn(*RegEx, bool, usize) anyerror!void, depth:usize) !void {
+        const hasLeft = self.left != null; 
+        const hasRight = self.right != null;
+
+        try visitor(self, !hasLeft and !hasRight, depth);
+        if(hasLeft) {
+            try self.left.?.traverseInner(visitor, depth + 1); 
+        }
+        
+        if(hasRight) {
+            try self.right.?.traverseInner(visitor, depth + 1);
+        }
     }
 };
 
@@ -1769,8 +1959,24 @@ const RegExNFA = struct {
         }
     }
 
-    pub fn addRangeTransitionByState(self:*@This(), state:u32, transition:Pair(u8,u8), targetStates:[]const u32) !bool {
-        return try addRangeTransition(&self.transitions[state], transition, targetStates);
+    pub fn addRangeTransitionByState(self:*@This(), state:u32, transition:Pair(u8,u8), targetStates:[]const u32) !void {
+        // TODO maybe add a check if this is the simple case of 'insert a single char with a single target without overlap'
+        // then this could be the standard 'isnert anything' function that calls everything else
+
+        _ = try addRangeTransition(&self.transitions[state], transition, targetStates);
+    }
+
+    // splits the given transition map in preparation for the split range to gain new target states (if there is splitting to be done)
+    // if the split range is just a single char for instance (-> a split point), this will split any continuous range around the split point into three ranges, so that the upper and lower one can keep their target states, and the split point can have a target state added to it. Thus if the split range is larger, there can be arbitrarily many new ranges, some of which will have not existed before and the state to be added is their first target, others will simply have another target added.
+    // returns whether it changed anything
+    pub fn addRangeTransition(transitions:*EntireTransitionMapOfAState, splitRange:Pair(u8,u8), newTargetsSlice:anytype) !bool {
+        // TODO would giving a choice of allocator make sense here?
+        const newTargetStateSet = try UniqueStateSet.initElements(cAllocer, newTargetsSlice);
+        // will be cloned for the new ranges, thus we can deinit this later
+        defer newTargetStateSet.deinit();
+        // constructing this once and cloning is preferable, as this only requires newTargets to be sorted once
+
+        return addRangeTransitionFromStateSet(transitions, splitRange, newTargetStateSet);
     }
 
     pub fn addRangeTransitionFromStateSet(transitions:*EntireTransitionMapOfAState, splitRange:Pair(u8,u8), newTargetStateSet:UniqueStateSet) !bool {
@@ -1902,20 +2108,6 @@ const RegExNFA = struct {
 
     }
 
-
-    // splits the given transition map in preparation for the split range to gain new target states (if there is splitting to be done)
-    // if the split range is just a single char for instance (-> a split point), this will split any continuous range around the split point into three ranges, so that the upper and lower one can keep their target states, and the split point can have a target state added to it. Thus if the split range is larger, there can be arbitrarily many new ranges, some of which will have not existed before and the state to be added is their first target, others will simply have another target added.
-    // returns whether it changed anything
-    pub fn addRangeTransition(transitions:*EntireTransitionMapOfAState, splitRange:Pair(u8,u8), newTargetsSlice:anytype) !bool {
-        // TODO would giving a choice of allocator make sense here?
-        const newTargetStateSet = try UniqueStateSet.initElements(cAllocer, newTargetsSlice);
-        // will be cloned for the new ranges, thus we can deinit this later
-        defer newTargetStateSet.deinit();
-        // constructing this once and cloning is preferable, as this only requires newTargets to be sorted once
-
-        return addRangeTransitionFromStateSet(transitions, splitRange, newTargetStateSet);
-    }
-
     test "range NFA splitting no edge cases" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -1928,7 +2120,7 @@ const RegExNFA = struct {
         try nfa.addSingleTransition(0, 'b', 1);
         try nfa.addSingleTransition(0, 'd', 1);
 
-        _ = try nfa.addRangeTransitionByState(0, .{'a', 'e'}, &[_]u32{2});
+        try nfa.addRangeTransitionByState(0, .{'a', 'e'}, &[_]u32{2});
 
         // now 'a', 'c', 'e' should lead to 2, 'b', 'd' should lead to 1 and 2
         // and all should be single char ranges
@@ -1955,7 +2147,7 @@ const RegExNFA = struct {
         try nfa.addSingleTransition(0, 'b', 1);
         try nfa.addSingleTransition(0, 'c', 1);
 
-        _ = try nfa.addRangeTransitionByState(0, .{'a', 'e'}, &[_]u32{2});
+        try nfa.addRangeTransitionByState(0, .{'a', 'e'}, &[_]u32{2});
 
         try expect(nfa.transitions[0].map.items.len == 4);
 
@@ -1978,7 +2170,7 @@ const RegExNFA = struct {
 
         try nfa.addSingleTransition(0, 'b', 1);
 
-        _ = try nfa.addRangeTransitionByState(0, .{'a', 'e'}, &[_]u32{1});
+        try nfa.addRangeTransitionByState(0, .{'a', 'e'}, &[_]u32{1});
 
         try expect(nfa.transitions[0].map.items.len == 2);
 
@@ -2000,7 +2192,7 @@ const RegExNFA = struct {
 
         try nfa.addStates(5);
 
-        _ = try nfa.addRangeTransitionByState(0, .{'a', 'e'}, &[_]u32{1});
+        try nfa.addRangeTransitionByState(0, .{'a', 'e'}, &[_]u32{1});
 
         try expect(nfa.transitions[0].map.items.len == 1);
 
@@ -2010,15 +2202,15 @@ const RegExNFA = struct {
             try expectEqual(nfa.transitions[0].find(@intCast(c)).?.items.ptr, nfa.transitions[0].find('a').?.items.ptr);
         }
 
-        _ = try nfa.addRangeTransitionByState(0, .{'f', 'g'}, &[_]u32{2});
+        try nfa.addRangeTransitionByState(0, .{'f', 'g'}, &[_]u32{2});
 
         try expect(nfa.transitions[0].map.items.len == 2);
 
-        _ = try nfa.addRangeTransitionByState(0, .{'o', 'x'}, &[_]u32{4});
+        try nfa.addRangeTransitionByState(0, .{'o', 'x'}, &[_]u32{4});
 
         try expect(nfa.transitions[0].map.items.len == 3);
 
-        _ = try nfa.addRangeTransitionByState(0, .{'j', 'k'}, &[_]u32{3});
+        try nfa.addRangeTransitionByState(0, .{'j', 'k'}, &[_]u32{3});
 
         try expect(nfa.transitions[0].map.items.len == 4);
 
@@ -2051,10 +2243,10 @@ const RegExNFA = struct {
 
         try nfa.addStates(3);
 
-        _ = try nfa.addRangeTransitionByState(0, .{'a', 'e'}, &[_]u32{1});
+        try nfa.addRangeTransitionByState(0, .{'a', 'e'}, &[_]u32{1});
         try expectOrSkip(nfa.transitions[0].map.items.len == 1);
 
-        _ = try nfa.addRangeTransitionByState(0, .{'b', 'f'}, &[_]u32{2});
+        try nfa.addRangeTransitionByState(0, .{'b', 'f'}, &[_]u32{2});
 
         try expect(nfa.transitions[0].map.items.len == 3);
         try expect(std.mem.eql(u32, nfa.transitions[0].find('a').?.items, &[_]u32{1}));
@@ -2074,11 +2266,11 @@ const RegExNFA = struct {
 
         try nfa.addStates(3);
 
-        _ = try nfa.addRangeTransitionByState(0, .{'b', 'f'}, &[_]u32{2});
+        try nfa.addRangeTransitionByState(0, .{'b', 'f'}, &[_]u32{2});
 
         try expectOrSkip(nfa.transitions[0].map.items.len == 1);
 
-        _ = try nfa.addRangeTransitionByState(0, .{'a', 'e'}, &[_]u32{1});
+        try nfa.addRangeTransitionByState(0, .{'a', 'e'}, &[_]u32{1});
 
         try expect(nfa.transitions[0].map.items.len == 3);
         try expect(std.mem.eql(u32, nfa.transitions[0].find('a').?.items, &[_]u32{1}));
@@ -2098,11 +2290,11 @@ const RegExNFA = struct {
 
         try nfa.addStates(3);
 
-        _ = try nfa.addRangeTransitionByState(0, .{'b', 'f'}, &[_]u32{2});
+        try nfa.addRangeTransitionByState(0, .{'b', 'f'}, &[_]u32{2});
 
         try expectOrSkip(nfa.transitions[0].map.items.len == 1);
 
-        _ = try nfa.addRangeTransitionByState(0, .{'c', 'e'}, &[_]u32{1});
+        try nfa.addRangeTransitionByState(0, .{'c', 'e'}, &[_]u32{1});
 
         try expect(nfa.transitions[0].map.items.len == 3);
         try expect(std.mem.eql(u32, nfa.transitions[0].find('b').?.items, &[_]u32{2}));
@@ -2123,7 +2315,7 @@ const RegExNFA = struct {
 
         try nfa.addSingleTransition(0, RegExNFA.epsilon, 1);
 
-        _ = try nfa.addRangeTransitionByState(0, .{RegExNFA.epsilon, 'b'}, &[_]u32{2});
+        try nfa.addRangeTransitionByState(0, .{RegExNFA.epsilon, 'b'}, &[_]u32{2});
 
         try expect(nfa.transitions[0].map.items.len == 2);
 
@@ -2362,12 +2554,143 @@ const RegExNFA = struct {
     }
 };
 
+pub fn compileInputString(arena:*std.heap.ArenaAllocator, input: []const u8, comptime opts:struct{printErrors:bool = true}) !RegExDFA.CompiledRegExDFA {
+    _ = opts;
+
+    var tok = try Tokenizer.init(arena.allocator(), input);
+    defer tok.deinit();
+
+    const regex = RegEx.parseExpr(arena.allocator(), 0, &tok) catch |e| switch(e){
+        //SyntaxError.InvalidToken => {
+        //    if(opts.printErrors){
+        //        const writer = std.io.getStdErr().writer();
+        //
+        //        try writer.print(Termcolor.Error ++ "Error" ++ Termcolor.Reset ++ ": Invalid token in regex:\n", .{});
+        //        try writer.print("{}", .{input});
+        //        try writer.print(Termcolor.Caret ++ "~" ** (errorPosition.charStart) ++ "^" ** (errorPosition.charEnd - errorPosition.charStart) ++ "~" ** (input.len) ++ Termcolor.Reset ++ "\n", .{});
+        //        // TODO continue here
+        //    }
+        //},
+        
+        // for now, just re-throw the error, until we have proper parsing and error messages
+        else => return e
+    };
+
+    var dfa = try regex.toDFA(.{});
+
+    return dfa.compile(&arena, false, .{});
+}
+
 test "tokenizer" {
     const input = "xyz|w*(abc)*de*f";
     var tok = try Tokenizer.init(std.testing.allocator, input);
     defer tok.deinit();
     const buf = try tok.debugFmt();
     try expect(std.mem.eql(u8, buf.items, "x y z|w* (a b c)* d e* f"));
+}
+
+test "tokenizer char groups" {
+    const input = "[xyz]|[a-f]";
+    var tok = try Tokenizer.init(std.testing.allocator, input);
+    defer tok.deinit();
+    const buf = try tok.debugFmt();
+    try expect(std.mem.eql(u8, buf.items, "[xyz]|[a-f]"));
+}
+
+test "parsing edge cases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const input1 = "a|";
+    var tok1 = try Tokenizer.init(std.testing.allocator, input1);
+    defer tok1.deinit();
+    try expect(RegEx.parseExpr(arena.allocator(), 0, &tok1) == SyntaxError.PrematureEnd);
+
+    const input2 = "a|b|c";
+    var tok2 = try Tokenizer.init(std.testing.allocator, input2);
+    defer tok2.deinit();
+    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok2);
+
+    try expect(regex.kind == Token.Kind.Union);
+
+    const a:Pair(u8, u8) = .{'a', 'a'};
+    const b:Pair(u8, u8) = .{'b', 'b'};
+    const c:Pair(u8, u8) = .{'c', 'c'};
+
+    if(regex.left.?.kind == Token.Kind.Union){
+        try expect(regex.left.?.left.?.kind == Token.Kind.Char);
+        try expectEqualDeep(regex.left.?.left.?.chars, a);
+        try expect(regex.left.?.right.?.kind == Token.Kind.Char);
+        try expectEqualDeep(regex.left.?.right.?.chars, b);
+
+        try expect(regex.right.?.kind == Token.Kind.Char);
+        try expectEqualDeep(regex.right.?.chars, c);
+    }else{
+        try expect(regex.left.?.kind == Token.Kind.Char);
+        try expectEqualDeep(regex.left.?.chars, a);
+
+        try expect(regex.right.?.kind == Token.Kind.Union); 
+        try expect(regex.right.?.left.?.kind == Token.Kind.Char);
+        try expectEqualDeep(regex.right.?.left.?.chars, b);
+        try expect(regex.right.?.right.?.kind == Token.Kind.Char);
+        try expectEqualDeep(regex.right.?.right.?.chars, c);
+    }
+
+    // TODO fails
+    const input3 = "[b-";
+    var tok3 = try Tokenizer.init(std.testing.allocator, input3);
+    defer tok3.deinit();
+    try expect(RegEx.parseExpr(std.testing.allocator, 0, &tok3) == SyntaxError.PrematureEnd);
+
+    const input4 = "[b-]";
+    var tok4 = try Tokenizer.init(std.testing.allocator, input4);
+    defer tok4.deinit();
+    try expect(RegEx.parseExpr(std.testing.allocator, 0, &tok4) == SyntaxError.InvalidToken);
+
+    const input5 = "[b-a]";
+    var tok5 = try Tokenizer.init(std.testing.allocator, input5);
+    defer tok5.deinit();
+    try expect(RegEx.parseExpr(std.testing.allocator, 0, &tok5) == SyntaxError.InvalidRange);
+}
+
+test "parsing char groups" {
+    const input1 = "[abcd]";
+    var tok = try Tokenizer.init(std.testing.allocator, input1);
+    var regex = try RegEx.parseExpr(std.testing.allocator, 0, &tok);
+    defer regex.deinit();
+    tok.deinit();
+
+    try regex.traverse(struct{
+        fn f(r:*RegEx, isLeaf:bool, depth:usize) anyerror!void {
+            try expect(!isLeaf == r.isOperator());
+            if(isLeaf){
+                try expect(r.kind == Token.Kind.Char);
+                try expect(depth == 2);
+            }else{
+                try expect(r.kind == Token.Kind.Union);
+                _ = try expectNotNull(r.left);
+                _ = try expectNotNull(r.right);
+            }
+        }
+    }.f);
+
+    const input2 = "[a-d]";
+    tok = try Tokenizer.init(std.testing.allocator, input2);
+    const regex2 = try RegEx.parseExpr(std.testing.allocator, 0, &tok);
+    defer regex2.deinit();
+    tok.deinit();
+
+    try expect(regex2.kind == Token.Kind.Char);
+    try expect(regex2.chars[0] == 'a');
+    try expect(regex2.chars[1] == 'd');
+    try expect(regex2.left == null);
+    try expect(regex2.right == null);
+
+    //const input3 = "[a-d]|e|[b-falzxk]";
+    //tok = try Tokenizer.init(std.testing.allocator, input3);
+    //const regex3 = try RegEx.parseExpr(std.testing.allocator, 0, &tok);
+    //defer regex3.deinit(); // TODO fails for some reason
+    //tok.deinit();
 }
 
 test "ab* DFA" {
@@ -2575,7 +2898,7 @@ test "xyz|w*(abc)*de*f regex to dfa compiled" {
     defer tok.deinit();
     const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
     try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
-    assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
+    try expect(!tok.hasNext());
 
     var dfa = try regex.toDFA(.{});
     try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
@@ -2583,6 +2906,30 @@ test "xyz|w*(abc)*de*f regex to dfa compiled" {
     var compiledDFA = try dfa.compile(&arena, false, .{});
 
     try xyzTestCases(compiledDFA, RegExDFA.CompiledRegExDFA.isInLanguageCompiled);
+}
+
+test "x[yz]|[.]w*([a-c])*de*[f-i] regex to dfa compiled" {
+    const input = "x[yz]|[.]w*([a-c])*de*[f-i]";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var tok = try Tokenizer.init(arena.allocator(), input);
+    defer tok.deinit();
+    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
+    try expect(!tok.hasNext());
+
+    var dfa = try regex.toDFA(.{});
+    try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
+
+    var compiledDFA = try dfa.compile(&arena, false, .{});
+
+    try expect(compiledDFA.isInLanguageCompiled("xz"));
+    try expect(!compiledDFA.isInLanguageCompiled("xyz"));
+    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdg"));
+
+    // TODO more actual testing
 }
 
 test "single char regex to dfa" {
@@ -2761,11 +3108,12 @@ test "fadec basic functionality and abstractions" {
 }
 
 pub fn main() !void {
-    //const writer = std.io.getStdOut().writer();
-//
-    //var arena = std.heap.ArenaAllocator.init(cAllocer);
-    //defer arena.deinit();
-    //
+    const writer = std.io.getStdOut().writer();
+    _ = writer;
+
+    var arena = std.heap.ArenaAllocator.init(cAllocer);
+    defer arena.deinit();
+
     //const input = "xyz|w*(abc)*de*f";
     //
     //var tok = try Tokenizer.init(arena.allocator(), input);
@@ -2785,34 +3133,17 @@ pub fn main() !void {
     //
     //try fa.printDOT(writer);
 
-    var arena = std.heap.ArenaAllocator.init(cAllocer);
-    defer arena.deinit();
-
-    var nfa = try RegExNFA.init(arena.allocator());
-    try nfa.addStates(6);
-    _ =try nfa.addRangeTransitionByState(0, .{'a', 'z'}, &[_]u32{1});
-    _ =try nfa.addRangeTransitionByState(0, .{'A', 'Z'}, &[_]u32{1});
-    _ =try nfa.addRangeTransitionByState(0, .{'b', 'z'}, &[_]u32{2});
-    _ =try nfa.addRangeTransitionByState(0, .{'b', 'z'}, &[_]u32{2});
-
-    // these are transitions to useless trap states (4, 5), just to throw the thing off
-    _ =try nfa.addRangeTransitionByState(1, .{'0', '9'}, &[_]u32{4});
-    _ =try nfa.addRangeTransitionByState(2, .{'0', '9'}, &[_]u32{5});
-
-    _ =try nfa.addRangeTransitionByState(1, .{'5', '9'}, &[_]u32{3});
-    _ =try nfa.addRangeTransitionByState(2, .{'0', '4'}, &[_]u32{3});
-    _ =try nfa.designateStatesFinal(&[_]u32{3});
-
-    //const fa = FiniteAutomaton{.nfa = &nfa};
-    //try fa.printDOT(std.io.getStdOut().writer());
-
-    try nfa.backUpEpsTransitions(); // technically unnecessary, but just to test it
-    var dfa = try nfa.toPowersetConstructedDFA(.{});
-
-    var compiled = try dfa.compile(&arena, false, .{});
-    compiled.debugPrint();
-
 
     //const fa = FiniteAutomaton{.dfa = &dfa};
     //try fa.printDOT(std.io.getStdOut().writer());
+
+    //const input = "[xyz]|[a-f][0-9abc5-6]";
+    //var tok = try Tokenizer.init(cAllocer, input);
+    //defer tok.deinit();
+    //const buf = try tok.debugFmt();
+    //try expect(std.mem.eql(u8, buf.items, "[xyz]|[a-f] [0-9abc5-6]"));
+
+    const input1 = "[a-]";
+    compileInputString(&arena, input1, .{});
+
 }
