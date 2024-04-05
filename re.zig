@@ -2848,46 +2848,6 @@ test "complex eps-NFA powerset construction" {
     try expect(dfa.isInLanguageInterpreted("dbbbbbeceecebbbed"));
 }
 
-fn xyzTestCases(dfa:anytype, checkFn:anytype) !void {
-    try expect(checkFn(dfa, "xyz"));
-
-    try expect(!checkFn(dfa, "xz"));
-    try expect(!checkFn(dfa, "xy"));
-    try expect(!checkFn(dfa, "x"));
-    try expect(!checkFn(dfa, "y"));
-    try expect(!checkFn(dfa, "z"));
-
-    try expect(checkFn(dfa, "wwwwwwwwdf"));
-    try expect(checkFn(dfa, "df"));
-    try expect(checkFn(dfa, "deef"));
-    try expect(checkFn(dfa, "wabcabcdeeef"));
-    try expect(checkFn(dfa, "wwwwabcabcabcdeeef"));
-
-    try expect(!checkFn(dfa, "wwwwacabcabcdeeef"));
-    try expect(!checkFn(dfa, "xyz" ++ "wwwwwwwwdf"));
-    try expect(!checkFn(dfa, "xyz" ++ "df"));
-    try expect(!checkFn(dfa, "xyz" ++ "wabcabcdeeef"));
-    try expect(!checkFn(dfa, "xyz" ++ "wwwwabcabcabcdeeef"));
-}
-
-test "xyz|w*(abc)*de*f regex to dfa interpreted" {
-    const input = "xyz|w*(abc)*de*f";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var tok = try Tokenizer.init(arena.allocator(), input);
-    defer tok.deinit();
-    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
-    try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
-    assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
-
-    var dfa = try regex.toDFA(.{});
-    try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
-
-    try xyzTestCases(dfa, RegExDFA.isInLanguageInterpreted);
-}
-
 test "xyz|w*(abc)*de*f regex to dfa compiled" {
     const input = "xyz|w*(abc)*de*f";
 
@@ -2905,6 +2865,31 @@ test "xyz|w*(abc)*de*f regex to dfa compiled" {
 
     var compiledDFA = try dfa.compile(&arena, false, .{});
 
+    const xyzTestCases = struct{
+        fn xyzTestCases(ddfa:anytype, checkFn:anytype) !void {
+            try expect(checkFn(ddfa, "xyz"));
+
+            try expect(!checkFn(ddfa, "xz"));
+            try expect(!checkFn(ddfa, "xy"));
+            try expect(!checkFn(ddfa, "x"));
+            try expect(!checkFn(ddfa, "y"));
+            try expect(!checkFn(ddfa, "z"));
+
+            try expect(checkFn(ddfa, "wwwwwwwwdf"));
+            try expect(checkFn(ddfa, "df"));
+            try expect(checkFn(ddfa, "deef"));
+            try expect(checkFn(ddfa, "wabcabcdeeef"));
+            try expect(checkFn(ddfa, "wwwwabcabcabcdeeef"));
+
+            try expect(!checkFn(ddfa, "wwwwacabcabcdeeef"));
+            try expect(!checkFn(ddfa, "xyz" ++ "wwwwwwwwdf"));
+            try expect(!checkFn(ddfa, "xyz" ++ "df"));
+            try expect(!checkFn(ddfa, "xyz" ++ "wabcabcdeeef"));
+            try expect(!checkFn(ddfa, "xyz" ++ "wwwwabcabcabcdeeef"));
+        }
+    }.xyzTestCases;
+
+    try xyzTestCases(dfa, RegExDFA.isInLanguageInterpreted);
     try xyzTestCases(compiledDFA, RegExDFA.CompiledRegExDFA.isInLanguageCompiled);
 }
 
