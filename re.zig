@@ -1218,17 +1218,13 @@ const RegEx = struct {
         // 4. convert to dfa
 
         // edge case: no operators, just a single char
+        // we need to handle this separately, because the main tree traversal only traverses inner nodes (operators), and analyzes the children of those, so we would miss this singular leaf
         if(!self.isOperator()) {
-            assert(self.right == null, "regex has no left operand, but right operand is not null", .{});
-
             var dfa = try RegExDFA.init(self.internalAllocator);
             try dfa.addStates(2);
             dfa.startState = 0;
             try dfa.designateStatesFinal(&[1]u32{1});
             try dfa.transitions[dfa.startState].insert(self.chars[0], self.chars[1], 1, .{});
-
-            // TODO handle AnyChar here as soon as it's implemented
-            // TODO the best thing to do would probably to add some sort of relaxation on transitions, so that they can also be taken if the input char is in a certain range. This would allow groups like [0-9] to be handled somewhat efficiently, and AnyChar would just be the range 1-255
 
             return dfa;
         }
