@@ -192,6 +192,8 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             if(a.items.ptr == b.items.ptr){
                 assert(a.items.len == b.items.len, "addAll called on the same set with different lengths", .{});
                 return;
+            }else if(b.items.len == 0){
+                return;
             }
 
             var self = a;
@@ -798,7 +800,7 @@ const Token = struct {
 
     pub const Kind = enum {
         Char,
-        //AnyChar,
+        AnyChar,
         Concat,
         Union,
         Kleen,
@@ -812,7 +814,7 @@ const Token = struct {
         pub fn precedenceAndChar(self:@This()) struct{prec:u8, char:u8} {
             return switch(self){
                 Kind.Char         => .{.prec = 0, .char = 'x'},
-                //Kind.AnyChar      => .{.prec = 0, .char = '.'},
+                Kind.AnyChar      => .{.prec = 0, .char = '.'},
                 Kind.Union        => .{.prec = 1, .char = '|'},
                 Kind.Concat       => .{.prec = 2, .char = ' '},
                 Kind.Kleen        => .{.prec = 3, .char = '*'},
@@ -827,7 +829,7 @@ const Token = struct {
         pub fn fromChar(theChar:u8) @This() {
             // this seems to get compiled into smth proper
             return switch(theChar){
-                //Kind.AnyChar.precedenceAndChar().char      => Kind.AnyChar,
+                Kind.AnyChar.precedenceAndChar().char      => Kind.AnyChar,
                 Kind.Union.precedenceAndChar().char        => Kind.Union,
                 Kind.Kleen.precedenceAndChar().char        => Kind.Kleen,
                 Kind.RangeMinus.precedenceAndChar().char   => Kind.RangeMinus,
@@ -842,7 +844,7 @@ const Token = struct {
         pub fn canConcatToRight(self:@This()) bool {
             return switch(self){
                 Kind.Char         => true,
-                //Kind.AnyChar      => true,
+                Kind.AnyChar      => true,
                 Kind.Kleen        => true,
                 Kind.RParen       => true,
                 Kind.RSquareBrack => true,
@@ -852,7 +854,7 @@ const Token = struct {
         pub fn canConcatToLeft(self:@This()) bool {
             return switch(self){
                 Kind.Char         => true,
-                //Kind.AnyChar      => true,
+                Kind.AnyChar      => true,
                 Kind.LParen       => true,
                 Kind.LSquareBrack => true,
                 else              => false
@@ -1146,7 +1148,17 @@ const RegEx = struct {
             return SyntaxError.PrematureEnd;
         }else{
             primary = try allocer.create(RegEx);
-            primary.* = initLiteralChar(allocer, tok.nextAssume().char);
+
+            if(tok.matchNext(Token.Kind.AnyChar, true)) {
+                // anychar is just a range from 1 to 255 (0 is an invalid input char, and later represents an epsilon transition)
+                primary.* = initLiteralChars(allocer, .{1, 255});
+            }else{
+                if(tok.peekAssume().kind != Token.Kind.Char) {
+                    tok.setErrorPositionToCur();
+                    return SyntaxError.InvalidToken;
+                }
+                primary.* = initLiteralChar(allocer, tok.nextAssume().char);
+            }
         }
 
         if(tok.matchNext(Token.Kind.Kleen, true)) { // kleens prec is ignored because its the highest anyway
@@ -1697,6 +1709,7 @@ const RegExDFA = struct{
 
         var worklistI:usize = 0;
         while(worklistI < self.numStates) : (worklistI += 1) {
+            // TODO if there are any unreachable states, this will panic. unreachable states are impossible if generated from powerset construction, but still, this should be handled more gracefully
             const curState = worklist.items[worklistI];
             startOfState[curState] = @ptrCast(cur);
 
@@ -1729,10 +1742,52 @@ const RegExDFA = struct{
                 curTransitionsOrdered = self.transitions[curState];
             }
 
+            // normally:
+            // traverse all possible transitions and emit instructions that check for them, and jump to the respective target state
+            // if it's the end of the word, jump to the final state check function
+            // if it's not the end of the word and we haven't found a transition, jump to the trap state
+            // (this is done by the for loop below)
+            // but for anychar, this is easier:
+
+            // additional check for '.'/AnyChar, i.e. if the range is 1-255, just check that it's not 0, if it's not, jump to the target. If it is 0, skip the normal insertion of another cmp cl, 0, and do the JZ immediately
+            if(curTransitionsOrdered.map.items.len == 1){ 
+                const targetState = curTransitionsOrdered.map.items[0][1][1];
+                const startChar = curTransitionsOrdered.map.items[0][1][0];
+                const endChar = curTransitionsOrdered.map.items[0][0];
+
+                if(startChar == 1 and endChar == 255){
+                    // add to the worklist
+                    if(!scheduledForVisit[targetState]) {
+                        worklist.appendAssumeCapacity(targetState);
+                        scheduledForVisit[targetState] = true;
+                    }
+
+                    try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, 0});
+                    // if not zero: jump to target state 
+                    // je targetState
+                    if(startOfState[targetState]) |jeTarget| {
+                        // just encode, and let fadec pick the best encoding
+                        try encode(&cur, fadec.FE_JNZ, .{oldIntCast(@intFromPtr(jeTarget), fadec.FeOp)});
+                    }else{
+                        try jumpsToPatch.append(.{.instrToPatch = @ptrCast(cur), .opcode = fadec.FE_JNZ, .targetState = targetState});
+                        // use longest possible encoding to reserve space, patch it later
+                        try encode(&cur, fadec.FE_JNZ | fadec.FE_JMPL, .{oldIntCast(@intFromPtr(cur), fadec.FeOp)});
+                    }
+                    // otherwise it's zero, i.e. the end of the word (basically the same code as after the for loop, just without the trap state, and with an unconditional jump. Again @Zig, this is why you need local lambdas)
+                    // if we have, jump to the checkFinalStatePtr and move the current state into RSI
+                    // TODO instruction scheduling-wise: might make sense to put the mov at the start (for better out of order execution), although it would cost a bit of decoding performance even if its not executed, which is not the case here. Test this
+                    try encode(&cur, fadec.FE_MOV64ri, .{fadec.FE_SI, curState});
+                    try encode(&cur, fadec.FE_JMP, .{oldIntCast(@intFromPtr(checkFinalStatePtr), fadec.FeOp)});
+
+                    continue;
+                }
+            }
+
             for(curTransitionsOrdered.map.items) |transition| {
-                // add to the worklist
                 const range:Pair(u8,u8) = .{transition[1][0], transition[0]};
                 const targetState = transition[1][1];
+
+                // add to the worklist
                 if(!scheduledForVisit[targetState]) {
                     worklist.appendAssumeCapacity(targetState);
                     scheduledForVisit[targetState] = true;
@@ -1742,7 +1797,8 @@ const RegExDFA = struct{
 
                 // single char transition
                 if(range[0] == range[1]){
-                    const char = range[0];
+                    // because fadec expects signed operands (i64), we need to use signed chars as well, i.e. i8. If we don't, then zig will implicitly widen the u8 to an i64, meaning e.g. 255 would become 0x00...00ff, not 0xff...ff like we want it to, i.e. it wouldn't get sign-extended. We need the sign extension for stuff to still be encoded correctly. Arguably a minor fault in fadec's operand types
+                    const char:i8  = @bitCast(range[0]);
 
                     // cmp cl, transitionChar
                     try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, char});
@@ -1757,11 +1813,8 @@ const RegExDFA = struct{
                         try encode(&cur, fadec.FE_JZ | fadec.FE_JMPL, .{oldIntCast(@intFromPtr(cur), fadec.FeOp)});
                     }
                 }else{
-                    const startChar = range[0];
-                    const endChar = range[1];
-
-                    // TODO think about this range code again, and write tests for it
-                    // TODO include an additional check for '.'/AnyChar, i.e. if the range is 1-255, just check that its not 0, if its not, jump to the target. If it is, skip the normal insertion of another cmp cl, 0, and do the JZ immediately
+                    const startChar:i8 = @bitCast(range[0]);
+                    const endChar:i8  = @bitCast(range[1]);
 
                     // cmp cl, startChar
                     try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, startChar});
@@ -1794,7 +1847,7 @@ const RegExDFA = struct{
             // check if we have reached the end of the word
             try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, 0});
             // if we have, jump to the checkFinalStatePtr and move the current state into RSI
-            // TODO instruction scheduling-wise: shouldn't we move the code for moving into RSI earlier, so that there's more time for it to be executed out of order?
+            // TODO instruction scheduling-wise: might make sense to put the mov at the start (for better out of order execution), although it would cost a bit of decoding performance even if its not executed, which is not the case here. Test this
             try encode(&cur, fadec.FE_MOV64ri, .{fadec.FE_SI, curState});
             try encode(&cur, fadec.FE_JZ, .{oldIntCast(@intFromPtr(checkFinalStatePtr), fadec.FeOp)});
 
@@ -2021,6 +2074,9 @@ const RegExNFA = struct {
             else
                 std.math.maxInt(u32); // in this case, just skip the loop, because the current lower edge is higher than all existing ranges
 
+        // just used to make sure we don't try to add a range above 255 later
+        var handled255 = false;
+
         while(curIndex < transitions.map.items.len) : (curIndex+=1) { // not the only condition, we also break if we've found that the elements were looking at are too high
             var element = &transitions.map.items[curIndex];
             const range:Pair(u8, u8) = .{element[1][0], element[0]};
@@ -2076,6 +2132,9 @@ const RegExNFA = struct {
 
                 transitions.map.items[curIndex][1][0] = curLowerEdge;
             }else{
+                // if allNewTargetsPresent is false, then one of the insertions above did not find an existing element, so it inserted it, i.e. we changed something
+                changedSmth = true;
+
                 // if not all were present, they are now, as we've added them during the search
                 // TODO could try out not to add the targets while searching, but just make the new lower range, and `addAll` them, could be faster
 
@@ -2086,13 +2145,18 @@ const RegExNFA = struct {
                     try newRangesToInsertLater.map.insert(.{range[0] - 1, .{curLowerEdge, try newTargetStateSet.clone()}}, .{.DontSort = true});
             }
 
-            // now go on just above the range we handled now
+            // now go on just above the range we handled now, except if we're at the upper edge
+            if(range[1] == 255){
+                handled255 = true;
+                break;
+            }
+
             curLowerEdge = range[1] + 1;
         }
 
-        // TODO if we have iterated through everything, check whether the current lower edge is still below the split range's upper edge, and if so, add the last range
-        // TODO think about this again when we add the edge case
-        if(compare(curLowerEdge, splitRange[1]) != Order.gt)
+        // if we have iterated through everything, check whether the current lower edge is still below the split range's upper edge, and if so, add the last range
+        // but only do this if we're not ad the upper edge: in theory this check would also work for the upper edge, but because a u8 can't hold 256, this check would be wrong, so we handle 255 separately
+        if(!handled255 and compare(curLowerEdge, splitRange[1]) != Order.gt)
             try newRangesToInsertLater.map.insert(.{splitRange[1], .{curLowerEdge, try newTargetStateSet.clone()}}, .{.DontSort = true});
 
         changedSmth = changedSmth or newRangesToInsertLater.map.items.len > 0;
@@ -2921,6 +2985,96 @@ test "x[yz]|[.]w*([a-c])*de*[f-i] regex to dfa compiled" {
     try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdfig"));
 }
 
+test "simple anychar" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const input1 = ".";
+
+    var tok = try Tokenizer.init(arena.allocator(), input1);
+    defer tok.deinit();
+    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+
+    var dfa = try regex.toDFA(.{});
+
+    var compiledDFA = try dfa.compile(&arena, false, .{});
+
+    for(1..255) |c| {
+        const input:[:0]const u8 = &[1:0]u8{@intCast(c)};
+        try expect(compiledDFA.isInLanguageCompiled(input));
+        try expect(dfa.isInLanguageInterpreted(input));
+    }
+
+    const input2 = ".a|..";
+
+    var tok2 = try Tokenizer.init(arena.allocator(), input2);
+    defer tok2.deinit();
+    const regex2 = try RegEx.parseExpr(arena.allocator(), 0, &tok2);
+
+    var dfa2 = try regex2.toDFA(.{});
+
+    var compiledDFA2 = try dfa2.compile(&arena, false, .{});
+
+    for(1..255) |c1| {
+        for(1..255) |c2| {
+            const input:[:0]const u8 = &[2:0]u8{@intCast(c1), @intCast(c2)};
+            try expect(compiledDFA2.isInLanguageCompiled(input));
+            try expect(dfa2.isInLanguageInterpreted(input));
+        }
+    }
+
+    const input3 = "a|.|[b-f]";
+
+    var tok3 = try Tokenizer.init(arena.allocator(), input3);
+    defer tok3.deinit();
+    const regex3 = try RegEx.parseExpr(arena.allocator(), 0, &tok3);
+
+    var dfa3 = try regex3.toDFA(.{});
+
+    var compiledDFA3 = try dfa3.compile(&arena, false, .{});
+
+    for(1..255) |c| {
+        const input:[:0]const u8 = &[1:0]u8{@intCast(c)};
+        try expect(compiledDFA3.isInLanguageCompiled(input));
+        try expect(dfa3.isInLanguageInterpreted(input));
+    }
+}
+
+test "x[yz]|.w*([a-c])*.e*[f-i] regex to dfa compiled" {
+    const input = "x[yz]|.w*([a-c])*.e*[f-i]";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var tok = try Tokenizer.init(arena.allocator(), input);
+    defer tok.deinit();
+    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
+    try expect(!tok.hasNext());
+
+    var dfa = try regex.toDFA(.{});
+    try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
+
+    var compiledDFA = try dfa.compile(&arena, false, .{});
+
+
+    try expect(compiledDFA.isInLanguageCompiled("xz"));
+    try expect(compiledDFA.isInLanguageCompiled("xy"));
+    try expect(!compiledDFA.isInLanguageCompiled("xyz"));
+    try expect(!compiledDFA.isInLanguageCompiled("y"));
+    try expect(!compiledDFA.isInLanguageCompiled("z"));
+    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdg"));
+    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeeg"));
+    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeei"));
+    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeef"));
+    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabeeef"));
+    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabf"));
+    try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcafe"));
+    try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeefi"));
+    try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeefig"));
+    try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdfig"));
+}
+
 test "single char regex to dfa" {
     const input = "x";
 
@@ -3132,7 +3286,6 @@ pub fn main() !void {
     //const buf = try tok.debugFmt();
     //try expect(std.mem.eql(u8, buf.items, "[xyz]|[a-f] [0-9abc5-6]"));
 
-    const input1 = "[a-]";
-    compileInputString(&arena, input1, .{});
-
+    //const input1 = "[a-]";
+    //compileInputString(&arena, input1, .{});
 }

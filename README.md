@@ -1,7 +1,9 @@
 # zig-re
 RegEx in Zig.
 
-At the moment, parsing of basic RegEx's (literal characters, concatenation, `|`, and `*`) is implemented. Currently, the only implemented syntactic sugar feature is character ranges and groups: `[a-d]`, `[abcd]`, `[ab-d]`, `(a|b|c|d)` are all possible (and equivalent).
+At the moment, parsing of basic RegEx's (literal characters, concatenation, `|`, and `*`) is implemented. All other current features are merely syntactic sugar (as the previous features are enough to recognize any Type-3 language); here's a list of all the sweet stuff:
+- Character ranges and groups: `[a-d]`, `[abcd]`, `[ab-d]`, `(a|b|c|d)` are all supported (and equivalent).
+- Using `.` to mean "any character" is supported. To match a literal '.', use `[.]`.
 
 Translation of regular expressions to $\varepsilon$-NFA to NFA to DFA is implemented and seems to work in somewhat complex scenarios, but is not tested extensively yet. Canonicalization of the final DFA is not implemented yet, and $\varepsilon$-NFA to NFA conversion is not very efficient yet.
 
