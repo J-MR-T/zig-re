@@ -793,6 +793,40 @@ test "range map transitions" {
     }
 }
 
+pub fn formatTransitionChar(char:u8, writer: anytype) std.os.WriteError!void {
+    // handle some special chars
+    switch(char){
+        0    => _ = try writer.write("&epsilon;"),
+        ' '  => _ = try writer.write("\\s"),
+        '\n' => _ = try writer.write("\\n"),
+        '\t' => _ = try writer.write("\\t"),
+        '\r' => _ = try writer.write("\\r"),
+        else => {
+            if(char < 0x20 or char >= 0xff){
+                try writer.print("0x{x:0>2}", .{char});
+            }else{
+                try writer.writeByte(char);
+            }
+        }
+    }
+}
+
+pub fn formatTransitionChars(chars:Pair(u8, u8), writer: anytype) std.os.WriteError!void {
+    // TODO for correct DOT output, need to html string escape the chars at some point
+
+    // single char transition
+    if(chars[0] == chars[1]){
+        try formatTransitionChar(chars[0], writer);
+    } // anychar transition
+    else if(chars[0] == 1 and chars[1] == 255){
+        try writer.print("any", .{});
+    } // range transition
+    else{
+        try formatTransitionChar(chars[0], writer);
+        try writer.writeByte('-');
+        try formatTransitionChar(chars[1], writer);
+    }
+}
 
 const Token = struct {
     char:u8,
@@ -886,29 +920,47 @@ const Tokenizer = struct {
     internalAllocator:Allocator,
 
     // can be used without Tokenizer, but tokenizer is more convenient
-    fn tokenize(allocer:Allocator, input:[]const u8) error{OutOfMemory}![]Token {
+    fn tokenize(allocer:Allocator, input:[]const u8) error{OutOfMemory, PrematureEnd}![]Token {
         // we need to fill in concat tokens, as they are implicit in the input
         var tokens:[]Token = try allocer.alloc(Token, input.len << 1); // multiply by 2 to account for concat tokens
-        var i:u32 = 0;
+        errdefer allocer.free(tokens);
+        var tokenI:u32 = 0;
+        var inputI:u32 = 0;
         var isInCharGroupingSquareBrack = false;
-        for (input) |char| {
-            const curToken = Token.initChar(char);
-            // hope this gets unrolled
-            if(i > 0 and curToken.kind.canConcatToLeft() and tokens[i-1].kind.canConcatToRight() and !isInCharGroupingSquareBrack) {
-                tokens[i] = Token.initKind(Token.Kind.Concat);
-                i+=1;
-                tokens[i] = curToken;
+        while(inputI < input.len) : (inputI += 1) {
+            const char = input[inputI];
+
+            var curTokenInit:Token = undefined;
+            // escaping
+            if(char == '\\'){
+                inputI += 1;
+                if(inputI >= input.len)
+                    return SyntaxError.PrematureEnd;
+
+                curTokenInit = Token{.char = input[inputI], .kind = Token.Kind.Char};
             }else{
-                tokens[i] = curToken;
+                curTokenInit = Token.initChar(char);
+            }
+            
+            // to make clear that its const from now on
+            const curToken = curTokenInit;
+
+            // hope this gets unrolled
+            if(tokenI > 0 and curToken.kind.canConcatToLeft() and tokens[tokenI-1].kind.canConcatToRight() and !isInCharGroupingSquareBrack) {
+                tokens[tokenI] = Token.initKind(Token.Kind.Concat);
+                tokenI+=1;
+                tokens[tokenI] = curToken;
+            }else{
+                tokens[tokenI] = curToken;
             }
             // inside a char group, a period is a literal char
             if(isInCharGroupingSquareBrack and char == '.')
-                tokens[i].kind = Token.Kind.Char;
+                tokens[tokenI].kind = Token.Kind.Char;
 
             isInCharGroupingSquareBrack = (isInCharGroupingSquareBrack or (!isInCharGroupingSquareBrack and curToken.kind == Token.Kind.LSquareBrack)) and !(isInCharGroupingSquareBrack and curToken.kind == Token.Kind.RSquareBrack);
-            i+=1;
+            tokenI+=1;
         }
-        return try allocer.realloc(tokens, i);
+        return try allocer.realloc(tokens, tokenI);
     }
 
     pub fn init(allocer:Allocator, input:[]const u8) !@This() {
@@ -946,6 +998,13 @@ const Tokenizer = struct {
     pub fn next(self:*Tokenizer) SyntaxError!Token {
         if(!self.hasNext())
             return SyntaxError.PrematureEnd;
+
+        return self.nextAssume();
+    }
+
+    pub fn nextOrNull(self:*Tokenizer) ?Token {
+        if(!self.hasNext())
+            return null;
 
         return self.nextAssume();
     }
@@ -1373,11 +1432,7 @@ const RegEx = struct {
         if(self.isOperator()){
             try writer.print("{c}", .{self.kind.precedenceAndChar().char});
         }else{
-            if(self.chars[0] == self.chars[1]){
-                try writer.print("{c}", .{self.chars[0]});
-            }else{
-                try writer.print("[{c}-{c}]", .{self.chars[0], self.chars[1]});
-            }
+            try formatTransitionChars(self.chars, writer);
         }
     }
 
@@ -1878,7 +1933,7 @@ const FiniteAutomaton = union(enum){
             FiniteAutomaton.dfa => try writer.print("DFA", .{}),
             FiniteAutomaton.nfa => try writer.print("NFA", .{}),
         }
-        try writer.print("{{ node[shape=circle]; mode = \"hier\"; layout = \"neato\"; edge[len = 2.5,  weight = 2.5]; ", .{});
+        try writer.print("{{ node[shape=circle]; mode = \"hier\"; layout = \"neato\"; overlap=\"scale\"; sep=\"+40\"", .{});
 
         const startState = switch(self){
             inline else => |case| case.startState
@@ -1901,38 +1956,30 @@ const FiniteAutomaton = union(enum){
             }
             try writer.print("]; ", .{});
 
+            // TODO could also put the same transitions on the same edge, reduce clutter a bit
             switch(self){
                 FiniteAutomaton.dfa => |dfa| {
                     for(dfa.transitions[curState].map.items) |transition| {
-                        // single char transition
-                        if(transition[0] == transition[1][0]){
-                            try writer.print("n{} -> n{}[label=\"{c}\"]; ", .{curState, transition[1][1], transition[0]});
-                        }
-                        // range transition
-                        else{
-                            try writer.print("n{} -> n{}[label=\"{c}-{c}\"]; ", .{curState, transition[1][1], transition[1][0], transition[0]});
-                        }
+                        const range:Pair(u8,u8) = .{transition[1][0], transition[0]};
+                        const targetState = transition[1][1];
+
+                        try writer.print("n{} -> n{}[label=\"", .{curState, targetState});
+                        try formatTransitionChars(range, writer);
+                        try writer.print("\"]; ", .{});
                     }
                 },
                 FiniteAutomaton.nfa => |nfa| {
                     if(curState > nfa.transitions.len)
                         continue;
 
-                    // could also put the same transitions on the same edge, reduce clutter a bit, but this is only for debugging anyway
                     for(nfa.transitions[curState].map.items) |transitions| {
-                        for(transitions[1][1].items) |targetState| {
-                            // single char transition
-                            if(transitions[0] == transitions[1][0]){
-                                const c = transitions[0];
-                                if(transitions[0] == 0){
-                                    try writer.print("n{} -> n{}[label=\"&epsilon;\"]; ", .{curState, targetState});
-                                }else{
-                                    try writer.print("n{} -> n{}[label=\"{c}\"]; ", .{curState, targetState, c});
-                                }
-                            } // range transition 
-                            else{
-                                try writer.print("n{} -> n{}[label=\"{c}-{c}\"]; ", .{curState, targetState, transitions[1][0], transitions[0]});
-                            }
+                        const range:Pair(u8,u8) = .{transitions[1][0], transitions[0]};
+                        const targetStates = transitions[1][1];
+
+                        for(targetStates.items) |targetState| {
+                            try writer.print("n{} -> n{}[label=\"", .{curState, targetState});
+                            try formatTransitionChars(range, writer);
+                            try writer.print("\"]; ", .{});
                         }
                     }
                 },
@@ -2657,6 +2704,33 @@ test "tokenizer char groups" {
     try expect(std.mem.eql(u8, buf.items, "[xyz]|[a-f]"));
 }
 
+test "tokenizer escaping" {
+    // the spaces separate the special cases to be tested
+    const input1 = " \\| \\\\ \\[ \\] ";
+    var tok1 = try Tokenizer.init(std.testing.allocator, input1);
+    defer tok1.deinit();
+
+    while(tok1.nextOrNull()) |token| {
+        // because of the escaping, everything should be literal (concatenated together)
+        try expect(token.kind == Token.Kind.Char or token.kind == Token.Kind.Concat);
+    }
+
+    // now test it inside a char group
+    const input2 = "[a\\-z]";
+    var tok2 = try Tokenizer.init(std.testing.allocator, input2);
+    defer tok2.deinit();
+
+    try expect(tok2.nextAssume().kind == Token.Kind.LSquareBrack);
+    try expect(tok2.nextAssume().char == 'a');
+    try expect(tok2.nextAssume().char == '-');
+    try expect(tok2.nextAssume().char == 'z');
+    try expect(tok2.nextAssume().kind == Token.Kind.RSquareBrack);
+
+    // now test that wrong stuff gets detected
+    const input3 = "[a\\";
+    try expect(Tokenizer.init(std.testing.allocator, input3) == SyntaxError.PrematureEnd);
+}
+
 test "parsing edge cases" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2696,7 +2770,6 @@ test "parsing edge cases" {
         try expectEqualDeep(regex.right.?.right.?.chars, c);
     }
 
-    // TODO fails
     const input3 = "[b-";
     var tok3 = try Tokenizer.init(std.testing.allocator, input3);
     defer tok3.deinit();
@@ -3288,4 +3361,15 @@ pub fn main() !void {
 
     //const input1 = "[a-]";
     //compileInputString(&arena, input1, .{});
+
+    const input = "x[yz]|.w*[a-c]*[f-i]";
+
+    var tok = try Tokenizer.init(arena.allocator(), input);
+    defer tok.deinit();
+    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+
+    var dfa = try regex.toDFA(.{});
+
+    var compiledDFA = try dfa.compile(&arena, false, .{});
+    _ = compiledDFA;
 }
