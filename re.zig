@@ -2906,11 +2906,19 @@ test "x[yz]|[.]w*([a-c])*de*[f-i] regex to dfa compiled" {
 
     var compiledDFA = try dfa.compile(&arena, false, .{});
 
+    
     try expect(compiledDFA.isInLanguageCompiled("xz"));
+    try expect(compiledDFA.isInLanguageCompiled("xy"));
     try expect(!compiledDFA.isInLanguageCompiled("xyz"));
+    try expect(!compiledDFA.isInLanguageCompiled("y"));
+    try expect(!compiledDFA.isInLanguageCompiled("z"));
     try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdg"));
-
-    // TODO more actual testing
+    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeeg"));
+    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeei"));
+    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeef"));
+    try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeefi"));
+    try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeefig"));
+    try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdfig"));
 }
 
 test "single char regex to dfa" {
