@@ -1245,7 +1245,7 @@ const RegEx = struct {
 
 
             var rhs = try parseExpr(allocer, prec + 1, tok); // always + 1, because we only have left-associative operators, so we want to bind the same operator again in the next depth, not in the one above
-            var op = try cAllocer.create(RegEx);
+            var op = try allocer.create(RegEx);
             op.* = initOperator(allocer, operatorKind, lhs, rhs);
             lhs = op;
         }
@@ -2819,11 +2819,23 @@ test "parsing char groups" {
     try expect(regex2.left == null);
     try expect(regex2.right == null);
 
-    //const input3 = "[a-d]|e|[b-falzxk]";
-    //tok = try Tokenizer.init(std.testing.allocator, input3);
-    //const regex3 = try RegEx.parseExpr(std.testing.allocator, 0, &tok);
-    //defer regex3.deinit(); // TODO fails for some reason
-    //tok.deinit();
+    const input3 = "[a-d]|e|[b-falzxk]";
+    tok = try Tokenizer.init(std.testing.allocator, input3);
+    const regex3 = try RegEx.parseExpr(std.testing.allocator, 0, &tok);
+    defer regex3.deinit();
+    try regex3.traverse(struct{
+        fn f(r:*RegEx, isLeaf:bool, _:usize) anyerror!void {
+            try expect(!isLeaf == r.isOperator());
+            if(isLeaf){
+                try expect(r.kind == Token.Kind.Char);
+            }else{
+                try expect(r.kind == Token.Kind.Union);
+                _ = try expectNotNull(r.left);
+                _ = try expectNotNull(r.right);
+            }
+        }
+    }.f);
+    tok.deinit();
 }
 
 test "ab* DFA" {
