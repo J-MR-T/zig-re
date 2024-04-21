@@ -27,6 +27,15 @@ test "semantically analyze relevant types without explicit calls" {
 const expect          = std.testing.expect;
 const expectEqual     = std.testing.expectEqual;
 const expectEqualDeep = std.testing.expectEqualDeep;
+const expectError     = std.testing.expectError;
+
+fn expectAnyError(value:anytype) !void {
+    _ = value catch {
+        return;
+    };
+    try expect(false);
+}
+
 // unwraps the optional and std.testing.expect's that its not null (similar to just doing .?, but with an explicit expect)
 fn expectNotNull(value:anytype) !@typeInfo(@TypeOf(value)).Optional.child {
     try expect(value != null);
@@ -504,9 +513,7 @@ test "array set addAll" {
         try set1.addAll(set2);
 
         if(!std.mem.eql(u32, set1.items, correctSet.items)){
-            debugLog("added set (size: {}):", .{set1.items.len});
             set1.debugPrint();
-            debugLog("check set (size: {}):", .{correctSet.items.len});
             correctSet.debugPrint();
             try expect(false);
         }
@@ -755,11 +762,11 @@ test "range map"{
     for(0..11) |i| {
         const ii = oldIntCast(i, u32);
         try expect(rm.find(@intCast(ii)).? == 1);
-        try std.testing.expectError(error.OverlappingRanges, rm.insert(ii, ii, 1, .{}));
+        try expectError(error.OverlappingRanges, rm.insert(ii, ii, 1, .{}));
     }
 
-    try std.testing.expectError(error.OverlappingRanges, rm.insert(0, 10, 1, .{}));
-    try std.testing.expectError(error.OverlappingRanges, rm.insert(3, 6, 1, .{}));
+    try expectError(error.OverlappingRanges, rm.insert(0, 10, 1, .{}));
+    try expectError(error.OverlappingRanges, rm.insert(3, 6, 1, .{}));
 }
 
 test "range map transitions" {
@@ -838,9 +845,12 @@ const Token = struct {
         Concat,
         Union,
         Kleen,
-        RangeMinus,
         LParen,
         RParen,
+        // syntactic sugar
+        Plus,
+        Question,
+        RangeMinus,
         LSquareBrack,
         RSquareBrack,
 
@@ -852,9 +862,11 @@ const Token = struct {
                 Kind.Union        => .{.prec = 1, .char = '|'},
                 Kind.Concat       => .{.prec = 2, .char = ' '},
                 Kind.Kleen        => .{.prec = 3, .char = '*'},
-                Kind.RangeMinus   => .{.prec = 0, .char = '-'},
+                Kind.Plus         => .{.prec = 3, .char = '+'},
+                Kind.Question     => .{.prec = 3, .char = '?'},
                 Kind.LParen       => .{.prec = 0, .char = '('},
                 Kind.RParen       => .{.prec = 0, .char = ')'},
+                Kind.RangeMinus   => .{.prec = 0, .char = '-'},
                 Kind.LSquareBrack => .{.prec = 0, .char = '['},
                 Kind.RSquareBrack => .{.prec = 0, .char = ']'},
             };
@@ -866,6 +878,8 @@ const Token = struct {
                 Kind.AnyChar.precedenceAndChar().char      => Kind.AnyChar,
                 Kind.Union.precedenceAndChar().char        => Kind.Union,
                 Kind.Kleen.precedenceAndChar().char        => Kind.Kleen,
+                Kind.Plus.precedenceAndChar().char         => Kind.Plus,
+                Kind.Question.precedenceAndChar().char     => Kind.Question,
                 Kind.RangeMinus.precedenceAndChar().char   => Kind.RangeMinus,
                 Kind.LParen.precedenceAndChar().char       => Kind.LParen,
                 Kind.RParen.precedenceAndChar().char       => Kind.RParen,
@@ -880,6 +894,8 @@ const Token = struct {
                 Kind.Char         => true,
                 Kind.AnyChar      => true,
                 Kind.Kleen        => true,
+                Kind.Plus         => true,
+                Kind.Question     => true,
                 Kind.RParen       => true,
                 Kind.RSquareBrack => true,
                 else              => false
@@ -1099,6 +1115,32 @@ const RegEx = struct {
         };
     }
 
+    // uses the internal allocator to perform a deep clone
+    pub fn deepClone(self:*@This()) !*@This() {
+        var clone = try self.internalAllocator.create(RegEx);
+        clone.kind = self.kind;
+        clone.chars = self.chars;
+
+        clone.left = 
+            if(self.left) |left|
+                try left.*.deepClone()
+            else
+                null;
+
+        clone.right = 
+            if(self.right) |right|
+                try right.*.deepClone()
+            else
+                null;
+
+        clone.internalAllocator = self.internalAllocator;
+
+        clone.nfaStartState = self.nfaStartState;
+        clone.nfaEndState = self.nfaEndState;
+
+        return clone;
+    }
+
     pub fn deinit(self:*@This()) void {
         if(self.left) |left| {
             left.deinit();
@@ -1209,7 +1251,7 @@ const RegEx = struct {
             primary = try allocer.create(RegEx);
 
             if(tok.matchNext(Token.Kind.AnyChar, true)) {
-                // anychar is just a range from 1 to 255 (0 is an invalid input char, and later represents an epsilon transition)
+                // anychar is just a range from 1 to 255 (0 is an invalid char in the final string (as it denotes the end of the string), later we use it to represent an epsilon transition)
                 primary.* = initLiteralChars(allocer, .{1, 255});
             }else{
                 if(tok.peekAssume().kind != Token.Kind.Char) {
@@ -1220,12 +1262,32 @@ const RegEx = struct {
             }
         }
 
-        if(tok.matchNext(Token.Kind.Kleen, true)) { // kleens prec is ignored because its the highest anyway
+        // unary operators
+        // precedence is ignored because its the highest anyway
+        if(tok.matchNext(Token.Kind.Kleen, true)) {
             var kleen = try allocer.create(RegEx);
             kleen.* = initOperator(allocer, Token.Kind.Kleen, primary, null);
             return kleen;
+        }else if(tok.matchNext(Token.Kind.Plus, true)) {
+            var kleen = try allocer.create(RegEx);
+            kleen.* = initOperator(allocer, Token.Kind.Kleen, primary, null);
+
+            var first = try primary.deepClone();
+            
+            var concat = try allocer.create(RegEx);
+            concat.* = initOperator(allocer, Token.Kind.Concat, first, kleen);
+            return concat;
+        }else if(tok.matchNext(Token.Kind.Question, true)) {
+            var eps = try allocer.create(RegEx);
+            eps.* = initLiteralChar(allocer, RegExNFA.epsilon);
+
+            var yunyin = try allocer.create(RegEx);
+            yunyin.* = initOperator(allocer, Token.Kind.Union, primary, eps);
+
+            return yunyin;
+        }else{
+            return primary;
         }
-        return primary;
     }
 
     pub fn parseExpr(allocer:Allocator, minPrec:u32, tok:*Tokenizer) ParseError!*@This() {
@@ -2696,6 +2758,14 @@ test "tokenizer" {
     try expect(std.mem.eql(u8, buf.items, "x y z|w* (a b c)* d e* f"));
 }
 
+test "tokenizer syntactic sugar" {
+    const input = "xyz|w+(abc)?de*f";
+    var tok = try Tokenizer.init(std.testing.allocator, input);
+    defer tok.deinit();
+    const buf = try tok.debugFmt();
+    try expect(std.mem.eql(u8, buf.items, "x y z|w+ (a b c)? d e* f"));
+}
+
 test "tokenizer char groups" {
     const input = "[xyz]|[a-f]";
     var tok = try Tokenizer.init(std.testing.allocator, input);
@@ -2773,17 +2843,22 @@ test "parsing edge cases" {
     const input3 = "[b-";
     var tok3 = try Tokenizer.init(std.testing.allocator, input3);
     defer tok3.deinit();
-    try expect(RegEx.parseExpr(std.testing.allocator, 0, &tok3) == SyntaxError.PrematureEnd);
+    try expectError(SyntaxError.PrematureEnd, RegEx.parseExpr(std.testing.allocator, 0, &tok3));
 
     const input4 = "[b-]";
     var tok4 = try Tokenizer.init(std.testing.allocator, input4);
     defer tok4.deinit();
-    try expect(RegEx.parseExpr(std.testing.allocator, 0, &tok4) == SyntaxError.InvalidToken);
+    try expectError(SyntaxError.InvalidToken, RegEx.parseExpr(std.testing.allocator, 0, &tok4));
 
     const input5 = "[b-a]";
     var tok5 = try Tokenizer.init(std.testing.allocator, input5);
     defer tok5.deinit();
-    try expect(RegEx.parseExpr(std.testing.allocator, 0, &tok5) == SyntaxError.InvalidRange);
+    try expectError(SyntaxError.InvalidRange,   RegEx.parseExpr(std.testing.allocator, 0, &tok5));
+
+    const input6 = "[]";
+    var tok6 = try Tokenizer.init(std.testing.allocator, input6);
+    defer tok6.deinit();
+    try expectAnyError(RegEx.parseExpr(std.testing.allocator, 0, &tok6));
 }
 
 test "parsing char groups" {
@@ -2837,6 +2912,22 @@ test "parsing char groups" {
     }.f);
     tok.deinit();
 }
+
+test "parsing sugar: +" {
+    const input1 = "a+";
+    var tok = try Tokenizer.init(std.testing.allocator, input1);
+    var regex = try RegEx.parseExpr(std.testing.allocator, 0, &tok);
+    defer regex.deinit();
+    tok.deinit();
+
+    try expect(regex.kind == Token.Kind.Concat);
+    try expect(regex.left.?.kind == Token.Kind.Char);
+    try expectEqualDeep(regex.left.?.chars, .{'a', 'a'});
+    try expect(regex.right.?.kind == Token.Kind.Kleen);
+    try expect(regex.right.?.left.?.kind == Token.Kind.Char);
+    try expectEqualDeep(regex.right.?.left.?.chars, .{'a', 'a'});
+}
+
 
 test "ab* DFA" {
     var dfa = try RegExDFA.init(std.testing.allocator);
@@ -3000,7 +3091,6 @@ test "xyz|w*(abc)*de*f regex to dfa compiled" {
     defer arena.deinit();
 
     var tok = try Tokenizer.init(arena.allocator(), input);
-    defer tok.deinit();
     const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
     try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
     try expect(!tok.hasNext());
@@ -3158,6 +3248,38 @@ test "x[yz]|.w*([a-c])*.e*[f-i] regex to dfa compiled" {
     try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeefi"));
     try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeefig"));
     try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdfig"));
+}
+
+test "x?[yz]+|.?w+ regex to dfa compiled" {
+    const input = "x?[yz]+|.?w+";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var tok = try Tokenizer.init(arena.allocator(), input);
+    defer tok.deinit();
+    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
+    try expect(!tok.hasNext());
+
+    var dfa = try regex.toDFA(.{});
+    try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
+
+    var compiledDFA = try dfa.compile(&arena, false, .{});
+
+
+    try expect(compiledDFA.isInLanguageCompiled("xz"));
+    try expect(compiledDFA.isInLanguageCompiled("xy"));
+    try expect(compiledDFA.isInLanguageCompiled("y"));
+    try expect(compiledDFA.isInLanguageCompiled("z"));
+    try expect(compiledDFA.isInLanguageCompiled("xyz"));
+    try expect(!compiledDFA.isInLanguageCompiled("x"));
+
+    try expect(!compiledDFA.isInLanguageCompiled(""));
+
+    try expect(compiledDFA.isInLanguageCompiled("\x02wwww"));
+    try expect(compiledDFA.isInLanguageCompiled("aw"));
+    try expect(compiledDFA.isInLanguageCompiled("w"));
 }
 
 test "single char regex to dfa" {
@@ -3374,14 +3496,20 @@ pub fn main() !void {
     //const input1 = "[a-]";
     //compileInputString(&arena, input1, .{});
 
-    const input = "x[yz]|.w*[a-c]*[f-i]";
+    const input = "x?[yz]+|.?w+";
 
     var tok = try Tokenizer.init(arena.allocator(), input);
     defer tok.deinit();
     const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    defer regex.deinit();
+
+    try regex.printDOTRoot(std.io.getStdOut().writer());
 
     var dfa = try regex.toDFA(.{});
 
     var compiledDFA = try dfa.compile(&arena, false, .{});
     _ = compiledDFA;
+
+    //var fa = FiniteAutomaton{.dfa = &dfa};
+    //try fa.printDOT(std.io.getStdOut().writer());
 }
