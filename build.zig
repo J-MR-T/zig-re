@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(exe);
 
-    const run_fresh_step = std.build.RunStep.create(b, "run fresh");
+    const run_fresh_step = std.Build.RunStep.create(b, "run fresh");
     run_fresh_step.addArtifactArg(exe);
 
     b.step("run", "runs zig-re's main (currently just for testing purposes)").dependOn(&run_fresh_step.step);
