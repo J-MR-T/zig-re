@@ -186,7 +186,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
                 return .{.item_ptr = &self.items[self.items.len-1], .found_existing = false};
             }
 
-            var findResults = try self.findOrMakeSpot(itemToInsert, .{.AssumeCapacity = opts.AssumeCapacity, .LinearInsertionSearch = opts.LinearInsertionSearch});
+            const findResults = try self.findOrMakeSpot(itemToInsert, .{.AssumeCapacity = opts.AssumeCapacity, .LinearInsertionSearch = opts.LinearInsertionSearch});
             // if we didnt find it, or we should replace it, write to it
             if(!findResults.found_existing or opts.ReplaceExisting)
                 findResults.item_ptr.* = itemToInsert;
@@ -501,8 +501,8 @@ test "array set addAll" {
 
     var rnd = std.rand.DefaultPrng.init(0);
     for(0..numStuffToInsert) |_| {
-        var rand1 = rnd.random().intRangeLessThan(u32, 0, 1000);
-        var rand2 = rnd.random().intRangeLessThan(u32, 0, 1000);
+        const rand1 = rnd.random().intRangeLessThan(u32, 0, 1000);
+        const rand2 = rnd.random().intRangeLessThan(u32, 0, 1000);
 
         try set1.insert(rand1, insertionOpts);
         try set2.insert(rand2, insertionOpts);
@@ -594,7 +594,7 @@ pub fn UnionFind(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type 
         // representative of a is now the representative of all of a \cup b
         pub fn yunyin(self:*@This(), a:T, b:T) !void {
             const aParent = try self.find(a);
-            var bParent = try self.find(b);
+            const bParent = try self.find(b);
 
             if(comparatorFn(aParent.*, bParent.*) == Order.eq)
                 return;
@@ -800,7 +800,7 @@ test "range map transitions" {
     }
 }
 
-pub fn formatTransitionChar(char:u8, writer: anytype) std.os.WriteError!void {
+pub fn formatTransitionChar(char:u8, writer: anytype) !void {
     // handle some special chars
     switch(char){
         0    => _ = try writer.write("&epsilon;"),
@@ -818,7 +818,7 @@ pub fn formatTransitionChar(char:u8, writer: anytype) std.os.WriteError!void {
     }
 }
 
-pub fn formatTransitionChars(chars:Pair(u8, u8), writer: anytype) std.os.WriteError!void {
+pub fn formatTransitionChars(chars:Pair(u8, u8), writer: anytype) !void {
     // TODO for correct DOT output, need to html string escape the chars at some point
 
     // single char transition
@@ -1235,7 +1235,7 @@ const RegEx = struct {
                 // -> we've constructed a full subtree
                 // if there are more ranges left, we need to union the current subtree with the next one
                 if(options.items.len > 0){
-                    var newRoot = try allocer.create(RegEx);
+                    const newRoot = try allocer.create(RegEx);
                     currentSubtree = try allocer.create(RegEx);
                     newRoot.* = initOperator(allocer, Token.Kind.Union, currentRoot, currentSubtree);
                     currentRoot = newRoot;
@@ -1265,23 +1265,23 @@ const RegEx = struct {
         // unary operators
         // precedence is ignored because its the highest anyway
         if(tok.matchNext(Token.Kind.Kleen, true)) {
-            var kleen = try allocer.create(RegEx);
+            const kleen = try allocer.create(RegEx);
             kleen.* = initOperator(allocer, Token.Kind.Kleen, primary, null);
             return kleen;
         }else if(tok.matchNext(Token.Kind.Plus, true)) {
-            var kleen = try allocer.create(RegEx);
+            const kleen = try allocer.create(RegEx);
             kleen.* = initOperator(allocer, Token.Kind.Kleen, primary, null);
 
-            var first = try primary.deepClone();
+            const first = try primary.deepClone();
             
-            var concat = try allocer.create(RegEx);
+            const concat = try allocer.create(RegEx);
             concat.* = initOperator(allocer, Token.Kind.Concat, first, kleen);
             return concat;
         }else if(tok.matchNext(Token.Kind.Question, true)) {
-            var eps = try allocer.create(RegEx);
+            const eps = try allocer.create(RegEx);
             eps.* = initLiteralChar(allocer, RegExNFA.epsilon);
 
-            var yunyin = try allocer.create(RegEx);
+            const yunyin = try allocer.create(RegEx);
             yunyin.* = initOperator(allocer, Token.Kind.Union, primary, eps);
 
             return yunyin;
@@ -1294,11 +1294,11 @@ const RegEx = struct {
         var lhs = try parsePrimaryExpr(allocer, tok);
         while (tok.hasNext()) {
             // let the upper level parse 'unknown operators' (in this case anything but the binary operators)
-            var operatorKind = tok.peekAssume().kind; // we peek, because if we return inside the loop, the upper level needs to consume that token
+            const operatorKind = tok.peekAssume().kind; // we peek, because if we return inside the loop, the upper level needs to consume that token
             if(operatorKind != Token.Kind.Union and operatorKind != Token.Kind.Concat)
                 return lhs;
 
-            var prec = operatorKind.precedenceAndChar().prec;
+            const prec = operatorKind.precedenceAndChar().prec;
             if (prec < minPrec)
                 return lhs;
 
@@ -1306,8 +1306,8 @@ const RegEx = struct {
 
 
 
-            var rhs = try parseExpr(allocer, prec + 1, tok); // always + 1, because we only have left-associative operators, so we want to bind the same operator again in the next depth, not in the one above
-            var op = try allocer.create(RegEx);
+            const rhs = try parseExpr(allocer, prec + 1, tok); // always + 1, because we only have left-associative operators, so we want to bind the same operator again in the next depth, not in the one above
+            const op = try allocer.create(RegEx);
             op.* = initOperator(allocer, operatorKind, lhs, rhs);
             lhs = op;
         }
@@ -1490,7 +1490,7 @@ const RegEx = struct {
         return try nfa.toPowersetConstructedDFA(.{.overrideAllocator = opts.overrideAllocator orelse self.internalAllocator});
     }
 
-    pub fn format(self: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) std.os.WriteError!void {
+    pub fn format(self: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
         if(self.isOperator()){
             try writer.print("{c}", .{self.kind.precedenceAndChar().char});
         }else{
@@ -1593,7 +1593,7 @@ const RegExDFA = struct{
         internalAllocator:Allocator,
 
         pub fn init(allocer:Allocator, numStates:u32) !@This() {
-            var info = ProfilingInformation{
+            const info = ProfilingInformation{
                 .transitionFequencyPerState = try allocer.alloc(EntireTransitionMapOfAState, numStates),
                 .visitsPerState = try allocer.alloc(u32, numStates),
                 .internalAllocator = allocer,
@@ -1636,7 +1636,7 @@ const RegExDFA = struct{
         }
     }
 
-    const CompilationError = error{DFATooLargeError, NotYetImplemented} || FeError || std.os.MMapError;
+    const CompilationError = error{DFATooLargeError, NotYetImplemented} || FeError || std.posix.MMapError;
 
     const CompiledRegExDFA = struct{
         jitBuf:[]u8,
@@ -1648,14 +1648,14 @@ const RegExDFA = struct{
         }
 
         // finalStates obviously needs to have a lifetime that is at least as long as the compiled DFA
-        pub fn init(finalStates:*const UniqueStateSet) std.os.MMapError!@This() {
+        pub fn init(finalStates:*const UniqueStateSet) std.posix.MMapError!@This() {
             // we just map 2 GiB by default, and mremap it later to the actual size
             return CompiledRegExDFA{
-                .jitBuf = try std.os.mmap(
+                .jitBuf = try std.posix.mmap(
                     null,
                     1 << 31,
-                    std.os.PROT.READ | std.os.PROT.WRITE | std.os.PROT.EXEC,
-                    std.os.MAP.PRIVATE | std.os.MAP.ANONYMOUS,
+                    std.posix.PROT.READ | std.posix.PROT.WRITE | std.posix.PROT.EXEC,
+                    .{.TYPE = .PRIVATE, .ANONYMOUS = true},
                     -1,
                     0,
                 ),
@@ -2076,7 +2076,7 @@ const RegExNFA = struct {
     internalAllocator:Allocator,
 
     pub fn init(allocer:Allocator) !@This() {
-        var nfa                = RegExNFA{
+        const nfa                = RegExNFA{
             .startState        = 0,
             .numStates         = 0,
             .transitions       = try allocer.alloc(EntireTransitionMapOfAState, 0),
@@ -2210,7 +2210,7 @@ const RegExNFA = struct {
 
 
                 // insert new middle range (range[0], splitRange[1]), clone target states from the existing range, then add the new targets
-                var middle = try newRangesToInsertLater.map.insertAndGet(.{splitRange[1], .{range[0], try targetStates.clone()}}, .{.DontSort = true});
+                const middle = try newRangesToInsertLater.map.insertAndGet(.{splitRange[1], .{range[0], try targetStates.clone()}}, .{.DontSort = true});
                 try middle.item_ptr.*[1][1].addAll(newTargetStateSet);
 
                 // edit the existing range to be the upper one, but don't change the target states
@@ -2669,7 +2669,7 @@ const RegExNFA = struct {
 
         // add start state to new DFA
         dfa.startState = try dfa.addState();
-        var startStateSet = try UniqueStateSet.initElements(dfa.internalAllocator, &[1]u32{self.startState});
+        const startStateSet = try UniqueStateSet.initElements(dfa.internalAllocator, &[1]u32{self.startState});
         try nfaToDfaStates.putNoClobber(startStateSet.items, dfa.startState);
 
         // used like a stack
@@ -2705,7 +2705,7 @@ const RegExNFA = struct {
                 const targetStates = transition[1][1];
 
                 // create or get state
-                var targetStateEntry = try nfaToDfaStates.getOrPut(targetStates.items);
+                const targetStateEntry = try nfaToDfaStates.getOrPut(targetStates.items);
                 if(!targetStateEntry.found_existing){
                     targetStateEntry.value_ptr.* = try dfa.addState();
 
@@ -3049,8 +3049,8 @@ test "NFA simple powerset construction" {
 
     var rnd = std.rand.DefaultPrng.init(0);
     for(0..10000) |_| {
-        var length = rnd.random().int(u8);
-        var buf = try std.testing.allocator.allocSentinel(u8, length, 0);
+        const length = rnd.random().int(u8);
+        const buf = try std.testing.allocator.allocSentinel(u8, length, 0);
         defer std.testing.allocator.free(buf);
         for(buf) |*c| {
             c.* = rnd.random().int(u8);
@@ -3098,7 +3098,7 @@ test "xyz|w*(abc)*de*f regex to dfa compiled" {
     var dfa = try regex.toDFA(.{});
     try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
 
-    var compiledDFA = try dfa.compile(&arena, false, .{});
+    const compiledDFA = try dfa.compile(&arena, false, .{});
 
     const xyzTestCases = struct{
         fn xyzTestCases(ddfa:anytype, checkFn:anytype) !void {
@@ -3437,8 +3437,15 @@ const fadec = @cImport({
 const FeMnem = u64;
 const FeError = error{EncodeError};
 
-fn encode(bufPtr:*[*]u8, mnem:FeMnem, args:struct{@"0":fadec.FeOp = 0, @"1":fadec.FeOp = 0, @"2":fadec.FeOp = 0, @"3":fadec.FeOp = 0, }) FeError!void {
-    const ret = fadec.fe_enc64_impl(@ptrCast(bufPtr), mnem, args.@"0", args.@"1", args.@"2", args.@"3");
+fn encode(bufPtr:*[*]u8, mnem:FeMnem, varArgs:anytype) FeError!void {
+    // somehow they broke the nice struct initialization in zig 0.12...
+    var args:Tuple(&[_]type{fadec.FeOp}**4) = undefined;
+
+    inline for(varArgs, 0..) |arg,i| {
+        args[i] = arg;
+    }
+
+    const ret = fadec.fe_enc64_impl(@ptrCast(bufPtr), mnem, args[0], args[1], args[2], args[3]);
     if(ret != 0)
         return FeError.EncodeError;
 }
@@ -3446,7 +3453,7 @@ fn encode(bufPtr:*[*]u8, mnem:FeMnem, args:struct{@"0":fadec.FeOp = 0, @"1":fade
 test "fadec basic functionality and abstractions" {
     const buf:[]u8 = try cAllocer.alloc(u8, 256);
     var cur:[*]u8 = buf.ptr;
-    var curPtr:[*c][*c]u8 = @ptrCast(&cur); // in zig-style this is not right, but the c translation of fadec expects this type, instead of the more sensible *[*]u8
+    const curPtr:[*c][*c]u8 = @ptrCast(&cur); // in zig-style this is not right, but the c translation of fadec expects this type, instead of the more sensible *[*]u8
 
     _ = fadec.fe_enc64_impl(curPtr, fadec.FE_ADD8rr, fadec.FE_AX, fadec.FE_AX, 0, 0);
     const length = @intFromPtr(cur) - @intFromPtr(buf.ptr);
@@ -3507,7 +3514,7 @@ pub fn main() !void {
 
     var dfa = try regex.toDFA(.{});
 
-    var compiledDFA = try dfa.compile(&arena, false, .{});
+    const compiledDFA = try dfa.compile(&arena, false, .{});
     _ = compiledDFA;
 
     //var fa = FiniteAutomaton{.dfa = &dfa};

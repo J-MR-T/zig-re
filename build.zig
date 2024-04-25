@@ -33,9 +33,9 @@ pub fn build(b: *std.Build) !void {
 
 
 
-    const fadecRoot = std.Build.LazyPath.relative("thirdparty/fadec");
-    const fadecBuild = std.Build.LazyPath.relative("thirdparty/fadec/build");
-    const fadecBuildLibarchive = std.Build.LazyPath.relative("thirdparty/fadec/build/libfadec.a");
+    const fadecRoot = b.path("thirdparty/fadec");
+    const fadecBuild = b.path("thirdparty/fadec/build");
+    const fadecBuildLibarchive = b.path("thirdparty/fadec/build/libfadec.a");
 
     const fadecBuildStep = try buildFadec(b, "thirdparty/fadec");
 
