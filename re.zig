@@ -1162,7 +1162,7 @@ const RegEx = struct {
             var options = std.ArrayList(Pair(u8, u8)).init(allocer);
             defer options.deinit();
 
-            while(tok.hasNext()) {
+            while(!tok.matchNext(Token.Kind.RSquareBrack, true)) {
                 // get current range
                 const start = tok.nextAssume();
                 if(start.kind != Token.Kind.Char) { //can't be anychar inside char group
@@ -1186,14 +1186,7 @@ const RegEx = struct {
                 }
 
                 try options.append(range);
-
-                // check if group ends here
-                if(tok.matchNext(Token.Kind.RSquareBrack, false)) {
-                    break;
-                }
             }
-
-            try tok.assertNext(Token.Kind.RSquareBrack);
 
             // TODO could also sort the options here and try to unify the ranges
 
@@ -1202,6 +1195,7 @@ const RegEx = struct {
             // we create these by descending size
 
             var currentRoot = try allocer.create(RegEx);
+            currentRoot.* = RegEx.initLiteralChar(allocer, RegExNFA.epsilon); // if the options are empty, we need an empty char, if not, this will get overwritten
             var currentSubtree = currentRoot;
             while(options.items.len>0){
                 const subtreeHeight = std.math.log2_int(usize, options.items.len) + 1; // the log is basically the depth, but we want a height, so we add 1
@@ -2858,7 +2852,13 @@ test "parsing edge cases" {
     const input6 = "[]";
     var tok6 = try Tokenizer.init(std.testing.allocator, input6);
     defer tok6.deinit();
-    try expectAnyError(RegEx.parseExpr(std.testing.allocator, 0, &tok6));
+    const regex6 = try RegEx.parseExpr(std.testing.allocator, 0, &tok6);
+    defer regex6.deinit();
+    try expect(regex6.kind == Token.Kind.Char);
+    try expect(regex6.chars[0] == RegExNFA.epsilon);
+    try expect(regex6.chars[1] == RegExNFA.epsilon);
+    try expect(regex6.left == null);
+    try expect(regex6.right == null);
 }
 
 test "parsing char groups" {
@@ -3282,6 +3282,30 @@ test "x?[yz]+|.?w+ regex to dfa compiled" {
     try expect(compiledDFA.isInLanguageCompiled("w"));
 }
 
+test "eps-only/empty string regex" {
+    const input = "[]";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var tok = try Tokenizer.init(arena.allocator(), input);
+    defer tok.deinit();
+    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
+    assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
+
+    var dfa = try regex.toDFA(.{});
+    try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
+
+    var compiledDFA = try dfa.compile(&arena, false, .{});
+
+    try expect(compiledDFA.isInLanguageCompiled(""));
+    for(1..255) |c| {
+        const str:[:0]const u8 = &[_:0]u8{@intCast(c)};
+        try expect(!compiledDFA.isInLanguageCompiled(str));
+    }
+}
+
 test "single char regex to dfa" {
     const input = "x";
 
@@ -3309,6 +3333,7 @@ test "single char regex to dfa" {
     try expect(!compiledDFA.isInLanguageCompiled("w"));
     try expect(!dfa.isInLanguageInterpreted("w"));
 }
+
 
 test "nfas with ranges compiled" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3503,19 +3528,6 @@ pub fn main() !void {
     //const input1 = "[a-]";
     //compileInputString(&arena, input1, .{});
 
-    const input = "x?[yz]+|.?w+";
-
-    var tok = try Tokenizer.init(arena.allocator(), input);
-    defer tok.deinit();
-    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
-    defer regex.deinit();
-
-    try regex.printDOTRoot(std.io.getStdOut().writer());
-
-    var dfa = try regex.toDFA(.{});
-
-    const compiledDFA = try dfa.compile(&arena, false, .{});
-    _ = compiledDFA;
 
     //var fa = FiniteAutomaton{.dfa = &dfa};
     //try fa.printDOT(std.io.getStdOut().writer());
