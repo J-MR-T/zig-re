@@ -1,14 +1,32 @@
 const std = @import("std");
 
-pub fn buildFadec(b: *std.Build, comptime path:[]const u8) !*std.Build.Step {
-    const step = b.step("build fadec", "");
+const fadecRootS = "thirdparty/fadec";
+const fadecBuildS = fadecRootS ++ "/build";
 
-    try step.evalChildProcess(&[_][]const u8{"meson", "setup", path ++ "/build", path});
-    try step.evalChildProcess(&[_][]const u8{"meson", "compile", "-C", path ++ "/build"});
-    return step;
+pub fn buildFadec(step: *std.Build.Step, _:*std.Progress.Node) anyerror!void {
+    try step.evalChildProcess(&[_][]const u8{"meson", "setup", fadecBuildS, fadecRootS});
+    try step.evalChildProcess(&[_][]const u8{"meson", "compile", "-C", fadecBuildS});
+}
+
+pub fn clean(clean_step: *std.Build.Step, _:*std.Progress.Node) anyerror!void {
+    const b = clean_step.owner;
+    // run meson clean in fadec root
+    try clean_step.evalChildProcess(&[_][]const u8{"meson", "compile", "-C", fadecBuildS,  "--clean"});
+    // remove zig-out
+    clean_step.dependOn(&b.addRemoveDirTree(b.install_path).step);
+    // remove zig-cache
+    if(b.cache_root.path) |cache_path|
+        clean_step.dependOn(&b.addRemoveDirTree(cache_path).step);
 }
 
 pub fn build(b: *std.Build) !void {
+    const clean_step = b.step("clean", "Remove build artifacts");
+    clean_step.makeFn = clean;
+
+    if(b.args) |args| 
+        if(std.mem.eql(u8, args[1], "clean"))
+            return;
+
     const exe = b.addExecutable(.{
         .name = "re",
         .root_source_file = .{ .path = "re.zig" },
@@ -31,13 +49,12 @@ pub fn build(b: *std.Build) !void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     test_step.dependOn(&run_unit_tests.step);
 
+    const fadecRoot = b.path(fadecRootS);
+    const fadecBuild = b.path(fadecBuildS);
+    const fadecBuildLibarchive = b.path(fadecBuildS ++ "/libfadec.a");
 
-
-    const fadecRoot = b.path("thirdparty/fadec");
-    const fadecBuild = b.path("thirdparty/fadec/build");
-    const fadecBuildLibarchive = b.path("thirdparty/fadec/build/libfadec.a");
-
-    const fadecBuildStep = try buildFadec(b, "thirdparty/fadec");
+    const fadecBuildStep = b.step("build fadec", "");
+    fadecBuildStep.makeFn = buildFadec;
 
     for([_]*std.Build.Step.Compile{exe, unit_tests}) |compileStep| {
         compileStep.addIncludePath(fadecRoot);
