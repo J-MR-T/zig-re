@@ -2766,6 +2766,20 @@ test "tokenizer char groups" {
     defer tok.deinit();
     const buf = try tok.debugFmt();
     try expect(std.mem.eql(u8, buf.items, "[xyz]|[a-f]"));
+
+    const input2 = "a-^b";
+    var tok2 = try Tokenizer.init(std.testing.allocator, input2);
+    defer tok2.deinit();
+
+    var i:u32 = 0;
+    while(tok2.nextOrNull()) |token| {
+        try expect(token.kind == Token.Kind.Char or token.kind == Token.Kind.Concat);
+
+        if(token.kind == Token.Kind.Char){
+            try expect(token.char == input2[i]);
+            i += 1;
+        }
+    }
 }
 
 test "tokenizer escaping" {
