@@ -3476,14 +3476,21 @@ const fadec = @cImport({
 const FeMnem = u64;
 const FeError = error{EncodeError};
 
-fn encode(bufPtr:*[*]u8, mnem:FeMnem, varArgs:anytype) FeError!void {
-    // somehow they broke the nice struct initialization in zig 0.12...
-    var args:Tuple(&[_]type{fadec.FeOp}**4) = undefined;
 
-    inline for(varArgs, 0..) |arg,i| {
-        args[i] = arg;
-    }
+// somehow they broke the nice struct initialization in zig 0.12..., need to manually force it to be a tuple type
+fn ForceTuple(almostTupleType:type) type {
+    const typeInfo = @typeInfo(almostTupleType);
+    return @Type(.{
+        .Struct = .{
+            .is_tuple = true,
+            .layout = .auto,
+            .decls = &.{},
+            .fields = typeInfo.Struct.fields,
+        }
+    });
+}
 
+fn encode(bufPtr:*[*]u8, mnem:FeMnem, args:ForceTuple(struct{@"0":fadec.FeOp = 0, @"1":fadec.FeOp = 0, @"2":fadec.FeOp = 0, @"3":fadec.FeOp = 0,})) FeError!void {
     const ret = fadec.fe_enc64_impl(@ptrCast(bufPtr), mnem, args[0], args[1], args[2], args[3]);
     if(ret != 0)
         return FeError.EncodeError;
