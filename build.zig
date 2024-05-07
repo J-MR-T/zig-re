@@ -23,10 +23,6 @@ pub fn build(b: *std.Build) !void {
     const clean_step = b.step("clean", "Remove build artifacts");
     clean_step.makeFn = clean;
 
-    if(b.args) |args| 
-        if(std.mem.eql(u8, args[1], "clean"))
-            return;
-
     const exe = b.addExecutable(.{
         .name = "re",
         .root_source_file = .{ .path = "re.zig" },
@@ -44,6 +40,9 @@ pub fn build(b: *std.Build) !void {
 
     const unit_tests = b.addTest(.{
         .root_source_file = .{ .path = "re.zig" },
+        .filters = if(b.args) |args| 
+            args
+        else &[_][]const u8{},
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
