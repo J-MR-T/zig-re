@@ -91,6 +91,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             ReplaceExisting:bool       = false, // important for example if this is a key/value map and comparator fn only compares the key
             AssumeCapacity:bool        = false,
             LinearInsertionSearch:bool = false,
+            // TODO should maybe be 'JustAppendDontSort'
             DontSort:bool              = false,
         };
 
@@ -195,6 +196,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             return findResults;
         }
 
+        // TODO would be great if this supported merging at some point, could parameterize it with 'shouldMerge' and 'merge' functions passed to this one
         // invalidates pointers and capacity guarantees in all cases (!)
         // this could also be done sort of in-place with sufficient guarantees, but that is unnecessarily complex for now
         pub fn addAll(a:*@This(), b:@This()) Allocator.Error!void {
@@ -1284,6 +1286,8 @@ const RegEx = struct {
         }
     }
 
+    // TODO currently, a parsing error results in memory not being freed. In the main use case, this uses an arena anyway, so it shouldn't be a big problem, but it's still not nice
+
     pub fn parseExpr(allocer:Allocator, minPrec:u32, tok:*Tokenizer) ParseError!*@This() {
         var lhs = try parsePrimaryExpr(allocer, tok);
         while (tok.hasNext()) {
@@ -1308,6 +1312,12 @@ const RegEx = struct {
         return lhs;
     }
 
+    pub fn isOperator(self:RegEx) bool {
+        // if left is null (i.e. this is a leaf), right must be null too
+        assert(self.left != null or self.right == null, "regex has no left operand, but right operand is not null", .{});
+        return self.left != null;
+    }
+
     fn printDOTInternal(self:RegEx, writer:anytype, num:u128) !void {
         // depth above 127 is undefined for now
         try writer.print("n{}[label=\"{}\"];", .{num, self});
@@ -1320,12 +1330,6 @@ const RegEx = struct {
             try writer.print("n{} -> n{};",    .{num, (num << 1) + 1});
             try right.printDOTInternal(writer, (num << 1) + 1);
         }
-    }
-
-    pub fn isOperator(self:RegEx) bool {
-        // if left is null (i.e. this is a leaf), right must be null too
-        assert(self.left != null or self.right == null, "regex has no left operand, but right operand is not null", .{});
-        return self.left != null;
     }
 
     pub fn printDOTRoot(self:RegEx, writer:anytype) !void {
@@ -2113,7 +2117,7 @@ const RegExNFA = struct {
 
     pub fn addRangeTransitionByState(self:*@This(), state:u32, transition:Pair(u8,u8), targetStates:[]const u32) !void {
         // TODO maybe add a check if this is the simple case of 'insert a single char with a single target without overlap'
-        // then this could be the standard 'isnert anything' function that calls everything else
+        // then this could be the standard 'insert anything' function that calls everything else
 
         _ = try addRangeTransition(&self.transitions[state], transition, targetStates);
     }
@@ -2731,7 +2735,7 @@ pub fn compileInputString(arena:*std.heap.ArenaAllocator, input: []const u8, com
         //        try writer.print(Termcolor.Error ++ "Error" ++ Termcolor.Reset ++ ": Invalid token in regex:\n", .{});
         //        try writer.print("{}", .{input});
         //        try writer.print(Termcolor.Caret ++ "~" ** (errorPosition.charStart) ++ "^" ** (errorPosition.charEnd - errorPosition.charStart) ++ "~" ** (input.len) ++ Termcolor.Reset ++ "\n", .{});
-        //        // TODO continue here
+        //        // TODO continue here with proper error messages
         //    }
         //},
         
@@ -2816,6 +2820,7 @@ test "parsing edge cases" {
     const input1 = "a|";
     var tok1 = try Tokenizer.init(std.testing.allocator, input1);
     defer tok1.deinit();
+    // use arena to prevent leak
     try expect(RegEx.parseExpr(arena.allocator(), 0, &tok1) == SyntaxError.PrematureEnd);
 
     const input2 = "a|b|c";
