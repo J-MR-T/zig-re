@@ -853,13 +853,13 @@ const Token = struct {
         Plus,
         Question,
         RangeMinus,
+        RangeInvert,
         LSquareBrack,
         RSquareBrack,
 
         // hope that the compiler knows that this is often used at comptime
         pub fn precedenceAndChar(self:@This()) struct{prec:u8, char:u8} {
             return switch(self){
-                Kind.Char         => .{.prec = 0, .char = 'x'},
                 Kind.AnyChar      => .{.prec = 0, .char = '.'},
                 Kind.Union        => .{.prec = 1, .char = '|'},
                 Kind.Concat       => .{.prec = 2, .char = ' '},
@@ -868,9 +868,9 @@ const Token = struct {
                 Kind.Question     => .{.prec = 3, .char = '?'},
                 Kind.LParen       => .{.prec = 0, .char = '('},
                 Kind.RParen       => .{.prec = 0, .char = ')'},
-                Kind.RangeMinus   => .{.prec = 0, .char = '-'},
                 Kind.LSquareBrack => .{.prec = 0, .char = '['},
-                Kind.RSquareBrack => .{.prec = 0, .char = ']'},
+                // e.g. char, RangeInvert, RangeMinus
+                else => .{.prec = 0, .char = 'x'},
             };
         }
 
@@ -882,12 +882,23 @@ const Token = struct {
                 Kind.Kleen.precedenceAndChar().char        => Kind.Kleen,
                 Kind.Plus.precedenceAndChar().char         => Kind.Plus,
                 Kind.Question.precedenceAndChar().char     => Kind.Question,
-                Kind.RangeMinus.precedenceAndChar().char   => Kind.RangeMinus,
                 Kind.LParen.precedenceAndChar().char       => Kind.LParen,
                 Kind.RParen.precedenceAndChar().char       => Kind.RParen,
                 Kind.LSquareBrack.precedenceAndChar().char => Kind.LSquareBrack,
-                Kind.RSquareBrack.precedenceAndChar().char => Kind.RSquareBrack,
                 else                                       => Kind.Char
+            };
+        }
+
+        pub fn fromCharInsideCharRangeGroup(theChar:u8) @This() {
+            // this seems to get compiled into smth proper
+            return switch(theChar){
+                '^' => Kind.RangeInvert,
+                '-' => Kind.RangeMinus,
+                // rsquarebrack is only a special char inside a char range group
+                ']' => Kind.RSquareBrack,
+                // inside a char range group, a period is a literal char
+                '.' => Kind.Char,
+                else => fromChar(theChar)
             };
         }
 
@@ -917,6 +928,13 @@ const Token = struct {
     pub fn initChar(char:u8) @This() {
         return Token{
             .kind = Token.Kind.fromChar(char),
+            .char = char
+        };
+    }
+
+    pub fn initCharInsideCharRangeGroup(char:u8) @This() {
+        return Token{
+            .kind = Token.Kind.fromCharInsideCharRangeGroup(char),
             .char = char
         };
     }
@@ -956,6 +974,8 @@ const Tokenizer = struct {
                     return SyntaxError.PrematureEnd;
 
                 curTokenInit = Token{.char = input[inputI], .kind = Token.Kind.Char};
+            }else if(isInCharGroupingSquareBrack){
+                curTokenInit = Token.initCharInsideCharRangeGroup(char);
             }else{
                 curTokenInit = Token.initChar(char);
             }
@@ -971,9 +991,6 @@ const Tokenizer = struct {
             }else{
                 tokens[tokenI] = curToken;
             }
-            // inside a char group, a period is a literal char
-            if(isInCharGroupingSquareBrack and char == '.')
-                tokens[tokenI].kind = Token.Kind.Char;
 
             isInCharGroupingSquareBrack = (isInCharGroupingSquareBrack or (!isInCharGroupingSquareBrack and curToken.kind == Token.Kind.LSquareBrack)) and !(isInCharGroupingSquareBrack and curToken.kind == Token.Kind.RSquareBrack);
             tokenI+=1;
@@ -1164,6 +1181,8 @@ const RegEx = struct {
             var options = std.ArrayList(Pair(u8, u8)).init(allocer);
             defer options.deinit();
 
+            const invert = tok.matchNext(Token.Kind.RangeInvert, true);
+
             while(!tok.matchNext(Token.Kind.RSquareBrack, true)) {
                 // get current range
                 const start = tok.nextAssume();
@@ -1190,7 +1209,51 @@ const RegEx = struct {
                 try options.append(range);
             }
 
-            // TODO could also sort the options here and try to unify the ranges
+            if(options.items.len > 1) {
+                // sort the range options and try to unify the ranges (also eliminates duplicates)
+                // TODO this could be done more efficiently using a custom sort that merges during the sorting, but this is fine for now, as we have such low n usually anyway
+
+                // insertion sort because of low n
+                std.sort.insertion(Pair(u8, u8), options.items, .{}, struct {fn f(_:@TypeOf(.{}), a:Pair(u8, u8), b:Pair(u8, u8)) bool { return a[0] < b[0]; }}.f);
+
+                // merge (also inefficient rn)
+                var i:i32 = 0;
+                while(i < options.items.len - 1) : (i+=1) {
+                    assert(i >= 0, "i should never be negative at the start of the loop (was: {})", .{i});
+                    const uI:usize = @intCast(i);
+                    if(options.items[uI][1] +| 1 >= options.items[uI+1][0]){
+                        options.items[uI][1] = @max(options.items[uI][1], options.items[uI+1][1]);
+                        // overall quadratic again, oof
+                        _ = options.orderedRemove(uI+1);
+                        // stay at the same index
+                        i -= 1;
+                    }
+                }
+            }
+
+
+            if(invert){
+                // edge case: in the very unlikely case (from a user perspective) that the first range starts at 1, we need to simply remove it. This is O(n), but so unlikely (and n usually so small), that it shouldn't matter much
+
+                var lastRangeEnd:u8 = 0;
+
+                if(options.items.len > 0 and options.items[0][0] == 1){
+                    lastRangeEnd = options.orderedRemove(0)[1];
+                }
+
+                for(options.items) |*range| {
+                    assert(range[0] != 0, "invalid range start", .{});
+                    const oldRange = range.*;
+                    range[0] = lastRangeEnd + 1;
+                    range[1] = oldRange[0] - 1;
+                    lastRangeEnd = oldRange[1];
+                }
+                // append last range (edge case: except when the last range ends at 255, then the range to append would be empty, so omit it)
+                if(lastRangeEnd < 255){
+                    try options.append(.{lastRangeEnd + 1, 255});
+                }
+            }
+            
 
             // now we have all ranges, we need to convert them to a regex
             // we do this by successively creating full subtrees (every inner node is a union), and then union-ing them together again, basically bottom-up
@@ -2721,6 +2784,13 @@ const RegExNFA = struct {
     }
 };
 
+pub fn parseRegex(allocer: Allocator, input: []const u8) !*RegEx {
+    var tok = try Tokenizer.init(allocer, input);
+    defer tok.deinit();
+
+    return RegEx.parseExpr(allocer, 0, &tok);
+}
+
 pub fn compileInputString(arena:*std.heap.ArenaAllocator, input: []const u8, comptime opts:struct{printErrors:bool = true}) !RegExDFA.CompiledRegExDFA {
     _ = opts;
 
@@ -2748,6 +2818,10 @@ pub fn compileInputString(arena:*std.heap.ArenaAllocator, input: []const u8, com
     return dfa.compile(&arena, false, .{});
 }
 
+fn eqlPairU8(a: Pair(u8,u8), b: Pair(u8,u8)) bool {
+    return a[0] == b[0] and a[1] == b[1];
+}
+
 test "tokenizer" {
     const input = "xyz|w*(abc)*de*f";
     var tok = try Tokenizer.init(std.testing.allocator, input);
@@ -2755,6 +2829,12 @@ test "tokenizer" {
     const buf = try tok.debugFmt();
     try expect(std.mem.eql(u8, buf.items, "x y z|w* (a b c)* d e* f"));
 }
+
+fn expectLiteralChar(token:Token, expected:u8) anyerror!void {
+    try expectEqual(.Char, token.kind);
+    try expectEqual(expected, token.char);
+}
+
 
 test "tokenizer syntactic sugar" {
     const input = "xyz|w+(abc)?de*f";
@@ -2780,7 +2860,30 @@ test "tokenizer char groups" {
         try expect(token.kind == Token.Kind.Char or token.kind == Token.Kind.Concat);
 
         if(token.kind == Token.Kind.Char){
-            try expect(token.char == input2[i]);
+            try expectEqual(input2[i], token.char);
+            i += 1;
+        }
+    }
+
+    // shouldn't need to escape additional ] outside of a char group
+    const input3 = "a]";
+    var tok3 = try Tokenizer.init(std.testing.allocator, input3);
+    defer tok3.deinit();
+    try expectLiteralChar(tok3.nextAssume(), 'a');
+    try expectEqual(.Concat, tok3.nextAssume().kind);
+    try expectLiteralChar(tok3.nextAssume(), ']');
+    try expectEqual(null,tok3.nextOrNull());
+
+    // outside of a char group, - and ^ should be literal
+    const input4 = "^a-bc";
+    var tok4 = try Tokenizer.init(std.testing.allocator, input4);
+    defer tok4.deinit();
+    i = 0;
+    while(tok4.nextOrNull()) |token| {
+        try expect(token.kind == Token.Kind.Char or token.kind == Token.Kind.Concat);
+
+        if(token.kind == Token.Kind.Char){
+            try expectEqual(input4[i],token.char);
             i += 1;
         }
     }
@@ -2803,12 +2906,13 @@ test "tokenizer escaping" {
     defer tok2.deinit();
 
     try expect(tok2.nextAssume().kind == Token.Kind.LSquareBrack);
-    try expect(tok2.nextAssume().char == 'a');
-    try expect(tok2.nextAssume().char == '-');
-    try expect(tok2.nextAssume().char == 'z');
+    try expectLiteralChar(tok2.nextAssume(), 'a');
+    try expectLiteralChar(tok2.nextAssume(), '-');
+    try expectLiteralChar(tok2.nextAssume(), 'z');
     try expect(tok2.nextAssume().kind == Token.Kind.RSquareBrack);
+    try expectEqual(null, tok2.nextOrNull());
 
-    // now test that wrong stuff gets detected
+    // wrong escape
     const input3 = "[a\\";
     try expect(Tokenizer.init(std.testing.allocator, input3) == SyntaxError.PrematureEnd);
 }
@@ -2817,6 +2921,7 @@ test "parsing edge cases" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
+    // test the manual way of tokenizing+parsing
     const input1 = "a|";
     var tok1 = try Tokenizer.init(std.testing.allocator, input1);
     defer tok1.deinit();
@@ -2824,11 +2929,10 @@ test "parsing edge cases" {
     try expect(RegEx.parseExpr(arena.allocator(), 0, &tok1) == SyntaxError.PrematureEnd);
 
     const input2 = "a|b|c";
-    var tok2 = try Tokenizer.init(std.testing.allocator, input2);
-    defer tok2.deinit();
-    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok2);
+    const regex = try parseRegex(std.testing.allocator, input2);
+    defer regex.deinit();
 
-    try expect(regex.kind == Token.Kind.Union);
+    try expectEqual(.Union, regex.kind);
 
     const a:Pair(u8, u8) = .{'a', 'a'};
     const b:Pair(u8, u8) = .{'b', 'b'};
@@ -2854,70 +2958,39 @@ test "parsing edge cases" {
     }
 
     const input3 = "[b-";
-    var tok3 = try Tokenizer.init(std.testing.allocator, input3);
-    defer tok3.deinit();
-    try expectError(SyntaxError.PrematureEnd, RegEx.parseExpr(std.testing.allocator, 0, &tok3));
+    try expectError(SyntaxError.PrematureEnd, parseRegex(std.testing.allocator, input3));
 
     const input4 = "[b-]";
-    var tok4 = try Tokenizer.init(std.testing.allocator, input4);
-    defer tok4.deinit();
-    try expectError(SyntaxError.InvalidToken, RegEx.parseExpr(std.testing.allocator, 0, &tok4));
+    try expectError(SyntaxError.InvalidToken, parseRegex(std.testing.allocator, input4));
 
     const input5 = "[b-a]";
-    var tok5 = try Tokenizer.init(std.testing.allocator, input5);
-    defer tok5.deinit();
-    try expectError(SyntaxError.InvalidRange,   RegEx.parseExpr(std.testing.allocator, 0, &tok5));
+    try expectError(SyntaxError.InvalidRange, parseRegex(std.testing.allocator, input5));
 
     const input6 = "[]";
-    var tok6 = try Tokenizer.init(std.testing.allocator, input6);
-    defer tok6.deinit();
-    const regex6 = try RegEx.parseExpr(std.testing.allocator, 0, &tok6);
+    const regex6 = try parseRegex(std.testing.allocator, input6);
     defer regex6.deinit();
     try expect(regex6.kind == Token.Kind.Char);
     try expect(regex6.chars[0] == RegExNFA.epsilon);
     try expect(regex6.chars[1] == RegExNFA.epsilon);
     try expect(regex6.left == null);
     try expect(regex6.right == null);
+
+    // invert edge cases
+    const input7 = "[^\x01-\xff]";
+    const regex7 = try parseRegex(std.testing.allocator, input7);
+    defer regex7.deinit();
+
+    try expect(regex7.kind == Token.Kind.Char);
+    try expect(regex7.chars[0] == RegExNFA.epsilon);
+    try expect(regex7.chars[1] == RegExNFA.epsilon);
 }
 
 test "parsing char groups" {
-    const input1 = "[abcd]";
-    var tok = try Tokenizer.init(std.testing.allocator, input1);
-    var regex = try RegEx.parseExpr(std.testing.allocator, 0, &tok);
+    const input1 = "[aceg]";
+    const regex = try parseRegex(std.testing.allocator, input1);
     defer regex.deinit();
-    tok.deinit();
 
-    try regex.traverse(struct{
-        fn f(r:*RegEx, isLeaf:bool, depth:usize) anyerror!void {
-            try expect(!isLeaf == r.isOperator());
-            if(isLeaf){
-                try expect(r.kind == Token.Kind.Char);
-                try expect(depth == 2);
-            }else{
-                try expect(r.kind == Token.Kind.Union);
-                _ = try expectNotNull(r.left);
-                _ = try expectNotNull(r.right);
-            }
-        }
-    }.f);
-
-    const input2 = "[a-d]";
-    tok = try Tokenizer.init(std.testing.allocator, input2);
-    const regex2 = try RegEx.parseExpr(std.testing.allocator, 0, &tok);
-    defer regex2.deinit();
-    tok.deinit();
-
-    try expect(regex2.kind == Token.Kind.Char);
-    try expect(regex2.chars[0] == 'a');
-    try expect(regex2.chars[1] == 'd');
-    try expect(regex2.left == null);
-    try expect(regex2.right == null);
-
-    const input3 = "[a-d]|e|[b-falzxk]";
-    tok = try Tokenizer.init(std.testing.allocator, input3);
-    const regex3 = try RegEx.parseExpr(std.testing.allocator, 0, &tok);
-    defer regex3.deinit();
-    try regex3.traverse(struct{
+    const isOnlyCharGroup = struct{
         fn f(r:*RegEx, isLeaf:bool, _:usize) anyerror!void {
             try expect(!isLeaf == r.isOperator());
             if(isLeaf){
@@ -2928,16 +3001,90 @@ test "parsing char groups" {
                 _ = try expectNotNull(r.right);
             }
         }
+    }.f;
+
+    try regex.traverse(struct{
+        fn f(r:*RegEx, isLeaf:bool, depth:usize) anyerror!void {
+            try isOnlyCharGroup(r, isLeaf, depth);
+            if(isLeaf)
+                try expect(depth == 2);
+        }
     }.f);
-    tok.deinit();
+
+    const input2 = "[a-d]";
+    const regex2 = try parseRegex(std.testing.allocator, input2);
+    defer regex2.deinit();
+
+    try expect(regex2.kind == Token.Kind.Char);
+    try expect(regex2.chars[0] == 'a');
+    try expect(regex2.chars[1] == 'd');
+    try expect(regex2.left == null);
+    try expect(regex2.right == null);
+
+
+    const complicatedRangeInput = "jjhejdjcjbjgjf-gje-gj";
+    const input3 = "[" ++ complicatedRangeInput ++ "]";
+    const regex3 = try parseRegex(std.testing.allocator, input3);
+    defer regex3.deinit();
+
+    // should just be one union between b-h and j
+    try expect(regex3.kind == .Union);
+    try expect(regex3.left.?.kind == .Char);
+    try expect(regex3.right.?.kind == .Char);
+
+    const options3 = &[_]Pair(u8,u8){
+        .{'b', 'h'},
+        .{'j', 'j'},
+    };
+
+    inline for(options3) |option| {
+        try expect(
+            eqlPairU8(regex3.left.?.chars, option)
+            or
+            eqlPairU8(regex3.right.?.chars, option)
+        );
+    }
+
+    // now the same thing, but inverted
+    const input4 = "[^" ++ complicatedRangeInput ++ "]";
+    const regex4 = try parseRegex(std.testing.allocator, input4);
+    defer regex4.deinit();
+    
+    const options4 = &[_]Pair(u8,u8){
+        .{1, 'a'},
+        .{'i', 'i'},
+        .{'k', 255},
+    };
+
+    inline for(options4) |option| {
+        if(regex4.left.?.kind == .Char){
+            try expect(
+                eqlPairU8(regex4.left.?.chars, option)
+                or
+                eqlPairU8(regex4.right.?.left.?.chars, option)
+                or
+                eqlPairU8(regex4.right.?.right.?.chars, option)
+            );
+        }else{
+            try expect(
+                eqlPairU8(regex4.right.?.chars, option)
+                or
+                eqlPairU8(regex4.left.?.left.?.chars, option)
+                or
+                eqlPairU8(regex4.left.?.right.?.chars, option)
+            );
+        }
+    }
+
+    const input5 = "[a-d]|e|[b-falzxk]";
+    const regex5 = try parseRegex(std.testing.allocator, input5);
+    defer regex5.deinit();
+    try regex5.traverse(isOnlyCharGroup);
 }
 
 test "parsing sugar: +" {
-    const input1 = "a+";
-    var tok = try Tokenizer.init(std.testing.allocator, input1);
-    var regex = try RegEx.parseExpr(std.testing.allocator, 0, &tok);
+    var regex = try parseRegex(std.testing.allocator, "a+");
     defer regex.deinit();
-    tok.deinit();
 
     try expect(regex.kind == Token.Kind.Concat);
     try expect(regex.left.?.kind == Token.Kind.Char);
@@ -2947,6 +3094,14 @@ test "parsing sugar: +" {
     try expectEqualDeep(regex.right.?.left.?.chars, .{'a', 'a'});
 }
 
+test "parsing sugar: ?" {
+    const regex = try parseRegex(std.testing.allocator, "a?");
+    defer regex.deinit();
+
+    const comparison = try parseRegex(std.testing.allocator, "a|[]");
+    defer comparison.deinit();
+    try expectEqualDeep(regex, comparison);
+}
 
 test "ab* DFA" {
     var dfa = try RegExDFA.init(std.testing.allocator);
@@ -3270,7 +3425,7 @@ test "x[yz]|.w*([a-c])*.e*[f-i] regex to dfa compiled" {
 }
 
 test "x?[yz]+|.?w+ regex to dfa compiled" {
-    const input = "x?[yz]+|.?w+";
+    const input = "x?[yzyz]+|.?w+"; // duplicates on purpose
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3312,6 +3467,10 @@ test "eps-only/empty string regex" {
     const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
     try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
     assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
+
+    try expect(regex.kind == Token.Kind.Char);
+    try expect(regex.chars[0] == RegExNFA.epsilon);
+    try expect(regex.chars[1] == RegExNFA.epsilon);
 
     var dfa = try regex.toDFA(.{});
     try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
@@ -3517,7 +3676,7 @@ test "fadec basic functionality and abstractions" {
 
 pub fn main() !void {
     const writer = std.io.getStdOut().writer();
-    _ = writer;
+    //_ = writer;
 
     var arena = std.heap.ArenaAllocator.init(cAllocer);
     defer arena.deinit();
@@ -3545,11 +3704,13 @@ pub fn main() !void {
     //const fa = FiniteAutomaton{.dfa = &dfa};
     //try fa.printDOT(std.io.getStdOut().writer());
 
-    //const input = "[xyz]|[a-f][0-9abc5-6]";
-    //var tok = try Tokenizer.init(cAllocer, input);
-    //defer tok.deinit();
-    //const buf = try tok.debugFmt();
-    //try expect(std.mem.eql(u8, buf.items, "[xyz]|[a-f] [0-9abc5-6]"));
+
+    const input = "[^\x01-\xff]";
+    var tok = try Tokenizer.init(cAllocer, input);
+    defer tok.deinit();
+    const regex = try RegEx.parseExpr(cAllocer, 0, &tok);
+    try regex.printDOTRoot(writer);
+
 
     //const input1 = "[a-]";
     //compileInputString(&arena, input1, .{});
