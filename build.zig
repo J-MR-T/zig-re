@@ -3,6 +3,8 @@ const std = @import("std");
 const fadecRootS = "thirdparty/fadec";
 const fadecBuildS = fadecRootS ++ "/build";
 
+const rootSourceFile = "re.zig";
+
 pub fn buildFadec(step: *std.Build.Step, _:*std.Progress.Node) anyerror!void {
     try step.evalChildProcess(&[_][]const u8{"meson", "setup", fadecBuildS, fadecRootS});
     try step.evalChildProcess(&[_][]const u8{"meson", "compile", "-C", fadecBuildS});
@@ -25,7 +27,7 @@ pub fn build(b: *std.Build) !void {
 
     const exe = b.addExecutable(.{
         .name = "re",
-        .root_source_file = .{ .path = "re.zig" },
+        .root_source_file = .{ .path = rootSourceFile},
         .target = b.standardTargetOptions(.{}),
         .optimize = b.standardOptimizeOption(.{}),
     });
@@ -39,7 +41,7 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run unit tests");
 
     const unit_tests = b.addTest(.{
-        .root_source_file = .{ .path = "re.zig" },
+        .root_source_file = .{ .path = rootSourceFile},
         .filters = if(b.args) |args| 
             args
         else &[_][]const u8{},
