@@ -24,6 +24,15 @@ test "semantically analyze relevant types without explicit calls" {
     std.testing.refAllDeclsRecursive(RangeMap(u32, makeOrder(u32), u32));
 }
 
+fn isOk(errUnionType: anytype) bool {
+    _ = errUnionType catch return false;
+    return true;
+}
+
+fn isErr(errUnionType: anytype) bool {
+    return !isOk(errUnionType);
+}
+
 const expect          = std.testing.expect;
 const expectEqual     = std.testing.expectEqual;
 const expectEqualDeep = std.testing.expectEqualDeep;
@@ -34,6 +43,17 @@ fn expectAnyError(value:anytype) !void {
         return;
     };
     try expect(false);
+}
+
+// unwraps the parser result, and checks that the diag contains the expected error
+fn expectParserError(expectedError: anyerror, parserResult: anytype) !void {
+    const diag:Diag = parserResult[1];
+    defer diag.deinit();
+    for(diag.msgs.items) |msg| {
+        if(msg.kind.Error == expectedError)
+            return;
+    }
+    try expectAnyError(parserResult[0]);
 }
 
 // unwraps the optional and std.testing.expect's that its not null (similar to just doing .?, but with an explicit expect)
@@ -74,7 +94,7 @@ const Termcolor = struct{
     const Reset = "\x1b[0m";
     // use the defaults from GCC
     const Error = "\x1b[01;31m";
-    const Caret = "\x1b[01;33m";
+    const Warning = "\x1b[01;35m";
 };
 
 // sorted array set. Should not be used if removal is important, try to treat it as an insert-only set
@@ -947,13 +967,80 @@ const Token = struct {
     }
 };
 
-const SyntaxError = error{InvalidToken, PrematureEnd, InvalidRange};
-const ParseError = error{OutOfMemory} || SyntaxError;
+const SyntaxError = error{InvalidToken, PrematureEnd};
+const ParseError = error{OutOfMemory, RootExpressionInvalid, SemanticallyInvalidRange} || SyntaxError;
+const CompileError = ParseError;
+
+const Diag =  struct{
+    msgs:std.ArrayList(Msg),
+
+    const Msg = struct{
+        const Kind = union(enum) {
+            Error:CompileError,
+            Warning:void,
+        };
+        kind:Kind,
+        // inclusive start exclusive end, index into source
+        location:Pair(u32, u32),
+        str:[]const u8,
+    };
+
+    pub fn init(allocator:Allocator) @This() {
+        return @This(){
+            .msgs = std.ArrayList(Msg).init(allocator),
+        };
+    }
+
+    pub fn deinit(self:@This()) void {
+        self.msgs.deinit();
+    }
+
+    pub fn registerError(self:*@This(), errorKind:CompileError, location:Pair(u32, u32), str:[]const u8) error{OutOfMemory}!void {
+        try self.msgs.append(.{.kind = Msg.Kind{.Error = errorKind}, .location = location, .str = str});
+    }
+
+    pub fn throw(self:*@This(), errorKind:CompileError, location:Pair(u32, u32), str:[]const u8) CompileError!void {
+        try self.register(errorKind, location, str);
+        return errorKind;
+    }
+
+    pub fn warn(self:*@This(), location:Pair(u32, u32), str:[]const u8) error{OutOfMemory}!void {
+        try self.msgs.append(.{.kind = Msg.Kind{.Warning = {}}, .location = location, .str = str});
+    }
+
+    pub fn printAll(self:*const @This(), writer:anytype, source:[]const u8) !void {
+        for (self.msgs.items) |msg| {
+            // all messages print the message, the whole source string, and then highlight the location
+            const start = msg.location[0];
+            const startInside = @min(start, source.len -| 1);
+            const end = msg.location[1];
+            const endInside = @min(end, source.len -| 1);
+
+            
+            const errorColor, const errorName = switch(msg.kind){
+                Msg.Kind.Error => .{Termcolor.Error, "Error"},
+                Msg.Kind.Warning => .{Termcolor.Warning, "Warning"},
+            };
+
+            // these could all be one statement, but this is more readable
+
+            try writer.print("{s}{s}: " ++ Termcolor.Reset ++ "{s}\n", .{errorColor, errorName, msg.str});
+
+            try writer.print("{s}{s}{s}{s}{s}\n", .{source[0..startInside], errorColor, source[startInside..endInside], Termcolor.Reset, source[endInside..source.len]});
+            
+            try writer.writeByteNTimes(' ', start);
+            try writer.print("{s}^", .{errorColor});
+            try writer.writeByteNTimes('~', end-start-|1);
+            try writer.print(Termcolor.Reset ++ "\n", .{} );
+        }
+    }
+};
 
 const Tokenizer = struct {
     tokens:[]Token,
     cur:u32,
     internalAllocator:Allocator,
+    diag:*Diag,
 
     // can be used without Tokenizer, but tokenizer is more convenient
     fn tokenize(allocer:Allocator, input:[]const u8) error{OutOfMemory, PrematureEnd}![]Token {
@@ -998,16 +1085,16 @@ const Tokenizer = struct {
         return try allocer.realloc(tokens, tokenI);
     }
 
-    pub fn init(allocer:Allocator, input:[]const u8) !@This() {
+    pub fn init(allocer:Allocator, input:[]const u8, diag:*Diag) !@This(){
         const tokens = try tokenize(allocer, input);
         return Tokenizer{
             .tokens = tokens,
             .cur = 0,
             .internalAllocator = allocer,
+            .diag = diag,
         };
     }
 
-    // TODO think about these 5 things again 
     pub fn hasNext(self:*const Tokenizer) bool {
         return self.cur < self.tokens.len;
     }
@@ -1058,7 +1145,6 @@ const Tokenizer = struct {
             if(!self.hasNext()){
                 return SyntaxError.PrematureEnd;
             }else{
-                self.setErrorPositionToCur();
                 return SyntaxError.InvalidToken;
             }
         }
@@ -1066,11 +1152,6 @@ const Tokenizer = struct {
 
     pub fn deinit(self:@This()) void {
         self.internalAllocator.free(self.tokens);
-    }
-
-    pub fn setErrorPositionToCur(self:*const Tokenizer) void {
-        errorPosition.charStart = self.cur;
-        errorPosition.charEnd = self.cur;
     }
 
     fn debugFmt(self:@This()) !std.ArrayList(u8) {
@@ -1083,8 +1164,285 @@ const Tokenizer = struct {
     }
 };
 
-// zig doesn't have error payloads, so just use a global, to indicate where a possible error in the input is located (if the error is not a PrematureEnd error)
-var errorPosition:struct{charStart:u32, charEnd:u32} = .{.charStart = 0, .charEnd = 0};
+
+const Parser = struct{
+    allocer:Allocator,
+    tok:*Tokenizer,
+    diag:*Diag,
+
+    pub fn init(allocer:Allocator, tok:*Tokenizer) @This() {
+        return @This(){
+            .allocer = allocer,
+            .tok = tok,
+            .diag = tok.diag,
+        };
+    }
+
+    pub fn logError(self:*@This(), errorKind:ParseError) void {
+        const msgStr:[:0]const u8 = switch(errorKind){
+            error.OutOfMemory => "out of memory",
+            error.RootExpressionInvalid => "root expression invalid, could not continue parsing",
+            error.InvalidToken => "invalid token",
+            error.PrematureEnd => "input ended prematurely",
+            error.SemanticallyInvalidRange => "semantically invalid range in char group",
+        };
+        var location:Pair(u32, u32) = .{self.tok.cur, self.tok.cur+1};
+        // try to get a better location depending on the error
+        if(errorKind == error.SemanticallyInvalidRange){
+            // can find the exact range to highlight: from the token before the last RangeMinus to the one after
+            var rangeMinusIndex:u32 = self.tok.cur - 1;
+            while(rangeMinusIndex > 0 and self.tok.tokens[rangeMinusIndex].kind != Token.Kind.RangeMinus){
+                rangeMinusIndex -= 1;
+            }
+            location = .{rangeMinusIndex-|1, rangeMinusIndex+2};
+        }
+        self.diag.registerError(errorKind,  location, msgStr) 
+            // if this is an error (has to be out of memory) we try to say 'help, something's going very wrong, we can't even register errors anymore'
+            catch {
+                std.io.getStdErr().writer().print("ran out of memory registering error: {} ({s})\n", .{errorKind, "a"}) catch {};
+            };
+    }
+
+    pub fn parse(allocator:Allocator, regex:[]const u8) Tuple(&[_]type{ParseError!*RegEx, Diag}) {
+        var diag = Diag.init(allocator);
+        var tok = Tokenizer.init(allocator, regex, &diag) catch |err|{
+            return .{err, diag};
+        };
+        var parser = Parser.init(allocator, &tok);
+        defer tok.deinit();
+        const res = parser.parseExpr(0);
+        assert(isErr(res) or !tok.hasNext(), "tokenizer should be empty after successful parsing", .{});
+        return .{res, diag};
+    }
+
+    pub fn parseNoDiagnostic(allocator:Allocator, regex:[]const u8) ParseError!*RegEx {
+        const res, const diag =  Parser.parse(allocator, regex);
+        diag.deinit();
+        return res;
+    }
+
+    pub fn parsePrimaryExpr(self:*@This()) ParseError!*RegEx {
+        const tok = self.tok;
+        var primary:*RegEx = undefined;
+        if(tok.matchNext(Token.Kind.LParen, true)) {
+            primary = try self.parseExpr(0);
+            try tok.assertNext(Token.Kind.RParen);
+        }else if(tok.matchNext(Token.Kind.LSquareBrack, true)) {
+            // char groups implemented as loop, that basically does [a-xyz] -> a-x|y|z
+            // first of all: find all ranges
+            var options = std.ArrayList(Pair(u8, u8)).init(self.allocer);
+            defer options.deinit();
+
+            const rangeStartIndex = tok.cur;
+
+            const invert = tok.matchNext(Token.Kind.RangeInvert, true);
+
+            while(!tok.matchNext(Token.Kind.RSquareBrack, true)) {
+                // get current range
+                const start = tok.nextAssume();
+                if(start.kind != Token.Kind.Char) { //can't be anychar inside char group
+                    return SyntaxError.InvalidToken;
+                }
+
+                var range:Pair(u8, u8) = .{start.char, start.char};
+
+                if(tok.matchNext(Token.Kind.RangeMinus, true)){
+                    const end = try tok.next();
+                    if(end.kind != Token.Kind.Char) { //can't be anychar inside char group
+                        return SyntaxError.InvalidToken;
+                    }else if(end.char < range[0]) {
+                        return ParseError.SemanticallyInvalidRange;
+                    }
+
+                    range[1] = end.char;
+                }
+
+                try options.append(range);
+            }
+
+            const rangeEndIndex = tok.cur;
+
+            if(options.items.len > 1) {
+                // sort the range options and try to unify the ranges (also eliminates duplicates)
+                // TODO this could be done more efficiently using a custom sort that merges during the sorting, but this is fine for now, as we have such low n usually anyway
+
+                // insertion sort because of low n
+                std.sort.insertion(Pair(u8, u8), options.items, .{}, struct {fn f(_:@TypeOf(.{}), a:Pair(u8, u8), b:Pair(u8, u8)) bool { return a[0] < b[0]; }}.f);
+
+                // merge (also inefficient rn)
+                var i:i32 = 0;
+                while(i < options.items.len - 1) : (i+=1) {
+                    assert(i >= 0, "i should never be negative at the start of the loop (was: {})", .{i});
+                    const uI:usize = @intCast(i);
+                    if(options.items[uI][1] +| 1 >= options.items[uI+1][0]){
+                        options.items[uI][1] = @max(options.items[uI][1], options.items[uI+1][1]);
+                        // overall quadratic again, oof
+                        _ = options.orderedRemove(uI+1);
+                        // stay at the same index
+                        i -= 1;
+
+                        try self.diag.warn(.{rangeStartIndex, rangeEndIndex}, "overlapping or adjacent ranges in char group (merged automatically)");
+                    }
+                }
+            }
+
+
+            if(invert){
+                // edge case: in the very unlikely case (from a user perspective) that the first range starts at 1, we need to simply remove it. This is O(n), but so unlikely (and n usually so small), that it shouldn't matter much
+
+                var lastRangeEnd:u8 = 0;
+
+                if(options.items.len > 0 and options.items[0][0] == 1){
+                    lastRangeEnd = options.orderedRemove(0)[1];
+                }
+
+                for(options.items) |*range| {
+                    assert(range[0] != 0, "invalid range start", .{});
+                    const oldRange = range.*;
+                    range[0] = lastRangeEnd + 1;
+                    range[1] = oldRange[0] - 1;
+                    lastRangeEnd = oldRange[1];
+                }
+                // append last range (edge case: except when the last range ends at 255, then the range to append would be empty, so omit it)
+                if(lastRangeEnd < 255){
+                    try options.append(.{lastRangeEnd + 1, 255});
+                }
+            }
+            
+
+            // now we have all ranges, we need to convert them to a regex
+            // we do this by successively creating full subtrees (every inner node is a union), and then union-ing them together again, basically bottom-up
+            // we create these by descending size
+
+            var currentRoot = try self.allocer.create(RegEx);
+            currentRoot.* = RegEx.initLiteralChar(self.allocer, RegExNFA.epsilon); // if the options are empty, we need an empty char, if not, this will get overwritten
+            var currentSubtree = currentRoot;
+            while(options.items.len>0){
+                const subtreeHeight = std.math.log2_int(usize, options.items.len) + 1; // the log is basically the depth, but we want a height, so we add 1
+                if(subtreeHeight > 32) 
+                    return error.OutOfMemory;
+
+                const numInnerNodes = (oldIntCast(1, usize) << (subtreeHeight - 1)) - 1;
+                const numTotalNodes = (oldIntCast(1, usize) << subtreeHeight) - 1;
+                var worklist = try std.ArrayList(*RegEx).initCapacity(self.allocer, numTotalNodes);
+                defer worklist.deinit();
+                worklist.appendAssumeCapacity(currentSubtree);
+                var handled:usize = 0;
+                // this loop initializes the inner nodes
+                while(handled < numInnerNodes) : (handled+=1) {
+                    const left = try self.allocer.create(RegEx);
+                    const right = try self.allocer.create(RegEx);
+
+                    worklist.items[handled].* = RegEx.initOperator(self.allocer, Token.Kind.Union, left, right);
+
+                    worklist.appendAssumeCapacity(left);
+                    worklist.appendAssumeCapacity(right);
+                }
+
+                // we've handled all inner nodes, everything that's remaining are the leaves
+                for(worklist.items[handled..]) |leaf| {
+                    // don't need to check whether there are options left, the construction of the subtree guarantees that there are
+                    // TODO could not do pop and keep track of an index ourselves (then the order would also not be reversed), but this is fine, and a bit more readable
+                    leaf.* = RegEx.initLiteralChars(self.allocer, options.pop());
+                }
+
+                // -> we've constructed a full subtree
+                // if there are more ranges left, we need to union the current subtree with the next one
+                if(options.items.len > 0){
+                    const newRoot = try self.allocer.create(RegEx);
+                    currentSubtree = try self.allocer.create(RegEx);
+                    newRoot.* = RegEx.initOperator(self.allocer, Token.Kind.Union, currentRoot, currentSubtree);
+                    currentRoot = newRoot;
+
+                    // -> the next iteration will fill the newRoots right subtree as the currentSubtree
+                }
+            }
+
+            primary = currentRoot;
+        }else if(!tok.hasNext()) {
+            return SyntaxError.PrematureEnd;
+        }else{
+            primary = try self.allocer.create(RegEx);
+            errdefer self.allocer.destroy(primary);
+
+            if(tok.matchNext(Token.Kind.AnyChar, true)) {
+                // anychar is just a range from 1 to 255 (0 is an invalid char in the final string (as it denotes the end of the string), later we use it to represent an epsilon transition)
+                primary.* = RegEx.initLiteralChars(self.allocer, .{1, 255});
+            }else{
+                if(tok.peekAssume().kind != Token.Kind.Char) {
+                    return SyntaxError.InvalidToken;
+                }
+                primary.* = RegEx.initLiteralChar(self.allocer, tok.nextAssume().char);
+            }
+        }
+
+        // unary operators
+        // precedence is ignored because its the highest anyway
+        if(tok.matchNext(Token.Kind.Kleen, true)) {
+            const kleen = try self.allocer.create(RegEx);
+            kleen.* = RegEx.initOperator(self.allocer, Token.Kind.Kleen, primary, null);
+            return kleen;
+        }else if(tok.matchNext(Token.Kind.Plus, true)) {
+            const kleen = try self.allocer.create(RegEx);
+            kleen.* = RegEx.initOperator(self.allocer, Token.Kind.Kleen, primary, null);
+
+            const first = try primary.deepClone();
+            
+            const concat = try self.allocer.create(RegEx);
+            concat.* = RegEx.initOperator(self.allocer, Token.Kind.Concat, first, kleen);
+            return concat;
+        }else if(tok.matchNext(Token.Kind.Question, true)) {
+            const eps = try self.allocer.create(RegEx);
+            eps.* = RegEx.initLiteralChar(self.allocer, RegExNFA.epsilon);
+
+            const yunyin = try self.allocer.create(RegEx);
+            yunyin.* = RegEx.initOperator(self.allocer, Token.Kind.Union, primary, eps);
+
+            return yunyin;
+        }else{
+            return primary;
+        }
+    }
+
+    // TODO currently, a parsing error results in memory not being freed. In the main use case, this uses an arena anyway, so it shouldn't be a big problem, but it's still not nice
+
+    // TODO think about what error to return in case there are multipl errors, and how to best recover from an error to continue parsing at a higher level in the tree
+    pub fn parseExpr(self:*@This(), minPrec:u32) ParseError!*RegEx {
+        const tok = self.tok;
+
+        var lhs:?*RegEx = self.parsePrimaryExpr() catch |err| lhs: {
+            self.logError(err);
+            break :lhs null;
+        };
+        // TODO test this - this should always only deinit everything once, but I'm also not sure what happens if lhs gets overridden in the loop - does errdefer capture it? etc.
+        errdefer if (lhs) |lhs0| lhs0.deinit();
+        while (tok.hasNext()) {
+            // let the upper level parse 'unknown operators' (in this case anything but the binary operators)
+            const operatorKind = tok.peekAssume().kind; // we peek, because if we return inside the loop, the upper level needs to consume that token
+            if(operatorKind != Token.Kind.Union and operatorKind != Token.Kind.Concat)
+                return lhs orelse ParseError.RootExpressionInvalid;
+
+            const prec = operatorKind.precedenceAndChar().prec;
+            if (prec < minPrec)
+                return lhs orelse ParseError.RootExpressionInvalid;
+
+            _ = tok.nextAssume(); // consume operator
+
+
+            // new precedence always + 1, because we only have left-associative operators, so we want to bind the same operator again in the next depth, not in the one above
+            const rhs = try self.parseExpr(prec + 1);
+            const op = self.allocer.create(RegEx) catch {
+                self.logError(error.OutOfMemory);
+                lhs.?.deinit();
+                rhs.deinit();
+                return error.OutOfMemory;
+            };
+            op.* = RegEx.initOperator(self.allocer, operatorKind, lhs, rhs);
+            lhs = op;
+        }
+        return lhs orelse ParseError.RootExpressionInvalid;
+    }
+};
 
 const RegEx = struct {
     kind:Token.Kind,
@@ -1122,7 +1480,7 @@ const RegEx = struct {
         };
     }
 
-    pub fn initOperator(allocer:Allocator, kind:Token.Kind, left:*RegEx, right:?*RegEx) @This() {
+    pub fn initOperator(allocer:Allocator, kind:Token.Kind, left:?*RegEx, right:?*RegEx) @This() {
         return RegEx{
             .left = left,
             .right = right,
@@ -1170,210 +1528,6 @@ const RegEx = struct {
         self.internalAllocator.destroy(self);
     }
 
-    pub fn parsePrimaryExpr(allocer:Allocator, tok:*Tokenizer) ParseError!*@This() {
-        var primary:*RegEx = undefined;
-        if(tok.matchNext(Token.Kind.LParen, true)) {
-            primary = try parseExpr(allocer, 0, tok);
-            try tok.assertNext(Token.Kind.RParen);
-        }else if(tok.matchNext(Token.Kind.LSquareBrack, true)) {
-            // char groups implemented as loop, that basically does [a-xyz] -> a-x|y|z
-            // first of all: find all ranges
-            var options = std.ArrayList(Pair(u8, u8)).init(allocer);
-            defer options.deinit();
-
-            const invert = tok.matchNext(Token.Kind.RangeInvert, true);
-
-            while(!tok.matchNext(Token.Kind.RSquareBrack, true)) {
-                // get current range
-                const start = tok.nextAssume();
-                if(start.kind != Token.Kind.Char) { //can't be anychar inside char group
-                    tok.setErrorPositionToCur();
-                    return SyntaxError.InvalidToken;
-                }
-
-                var range:Pair(u8, u8) = .{start.char, start.char};
-
-                if(tok.matchNext(Token.Kind.RangeMinus, true)){
-                    const end = try tok.next();
-                    if(end.kind != Token.Kind.Char) { //can't be anychar inside char group
-                        tok.setErrorPositionToCur();
-                        return SyntaxError.InvalidToken;
-                    }else if(end.char < range[0]) {
-                        tok.setErrorPositionToCur();
-                        return SyntaxError.InvalidRange;
-                    }
-
-                    range[1] = end.char;
-                }
-
-                try options.append(range);
-            }
-
-            if(options.items.len > 1) {
-                // sort the range options and try to unify the ranges (also eliminates duplicates)
-                // TODO this could be done more efficiently using a custom sort that merges during the sorting, but this is fine for now, as we have such low n usually anyway
-
-                // insertion sort because of low n
-                std.sort.insertion(Pair(u8, u8), options.items, .{}, struct {fn f(_:@TypeOf(.{}), a:Pair(u8, u8), b:Pair(u8, u8)) bool { return a[0] < b[0]; }}.f);
-
-                // merge (also inefficient rn)
-                var i:i32 = 0;
-                while(i < options.items.len - 1) : (i+=1) {
-                    assert(i >= 0, "i should never be negative at the start of the loop (was: {})", .{i});
-                    const uI:usize = @intCast(i);
-                    if(options.items[uI][1] +| 1 >= options.items[uI+1][0]){
-                        options.items[uI][1] = @max(options.items[uI][1], options.items[uI+1][1]);
-                        // overall quadratic again, oof
-                        _ = options.orderedRemove(uI+1);
-                        // stay at the same index
-                        i -= 1;
-                    }
-                }
-            }
-
-
-            if(invert){
-                // edge case: in the very unlikely case (from a user perspective) that the first range starts at 1, we need to simply remove it. This is O(n), but so unlikely (and n usually so small), that it shouldn't matter much
-
-                var lastRangeEnd:u8 = 0;
-
-                if(options.items.len > 0 and options.items[0][0] == 1){
-                    lastRangeEnd = options.orderedRemove(0)[1];
-                }
-
-                for(options.items) |*range| {
-                    assert(range[0] != 0, "invalid range start", .{});
-                    const oldRange = range.*;
-                    range[0] = lastRangeEnd + 1;
-                    range[1] = oldRange[0] - 1;
-                    lastRangeEnd = oldRange[1];
-                }
-                // append last range (edge case: except when the last range ends at 255, then the range to append would be empty, so omit it)
-                if(lastRangeEnd < 255){
-                    try options.append(.{lastRangeEnd + 1, 255});
-                }
-            }
-            
-
-            // now we have all ranges, we need to convert them to a regex
-            // we do this by successively creating full subtrees (every inner node is a union), and then union-ing them together again, basically bottom-up
-            // we create these by descending size
-
-            var currentRoot = try allocer.create(RegEx);
-            currentRoot.* = RegEx.initLiteralChar(allocer, RegExNFA.epsilon); // if the options are empty, we need an empty char, if not, this will get overwritten
-            var currentSubtree = currentRoot;
-            while(options.items.len>0){
-                const subtreeHeight = std.math.log2_int(usize, options.items.len) + 1; // the log is basically the depth, but we want a height, so we add 1
-                if(subtreeHeight > 32) 
-                    return error.OutOfMemory;
-
-                const numInnerNodes = (oldIntCast(1, usize) << (subtreeHeight - 1)) - 1;
-                const numTotalNodes = (oldIntCast(1, usize) << subtreeHeight) - 1;
-                var worklist = try std.ArrayList(*RegEx).initCapacity(allocer, numTotalNodes);
-                defer worklist.deinit();
-                worklist.appendAssumeCapacity(currentSubtree);
-                var handled:usize = 0;
-                // this loop initializes the inner nodes
-                while(handled < numInnerNodes) : (handled+=1) {
-                    const left = try allocer.create(RegEx);
-                    const right = try allocer.create(RegEx);
-
-                    worklist.items[handled].* = initOperator(allocer, Token.Kind.Union, left, right);
-
-                    worklist.appendAssumeCapacity(left);
-                    worklist.appendAssumeCapacity(right);
-                }
-
-                // we've handled all inner nodes, everything that's remaining are the leaves
-                for(worklist.items[handled..]) |leaf| {
-                    // don't need to check whether there are options left, the construction of the subtree guarantees that there are
-                    // TODO could not do pop and keep track of an index ourselves (then the order would also not be reversed), but this is fine, and a bit more readable
-                    leaf.* = initLiteralChars(allocer, options.pop());
-                }
-
-                // -> we've constructed a full subtree
-                // if there are more ranges left, we need to union the current subtree with the next one
-                if(options.items.len > 0){
-                    const newRoot = try allocer.create(RegEx);
-                    currentSubtree = try allocer.create(RegEx);
-                    newRoot.* = initOperator(allocer, Token.Kind.Union, currentRoot, currentSubtree);
-                    currentRoot = newRoot;
-
-                    // -> the next iteration will fill the newRoots right subtree as the currentSubtree
-                }
-            }
-
-            primary = currentRoot;
-        }else if(!tok.hasNext()) {
-            return SyntaxError.PrematureEnd;
-        }else{
-            primary = try allocer.create(RegEx);
-
-            if(tok.matchNext(Token.Kind.AnyChar, true)) {
-                // anychar is just a range from 1 to 255 (0 is an invalid char in the final string (as it denotes the end of the string), later we use it to represent an epsilon transition)
-                primary.* = initLiteralChars(allocer, .{1, 255});
-            }else{
-                if(tok.peekAssume().kind != Token.Kind.Char) {
-                    tok.setErrorPositionToCur();
-                    return SyntaxError.InvalidToken;
-                }
-                primary.* = initLiteralChar(allocer, tok.nextAssume().char);
-            }
-        }
-
-        // unary operators
-        // precedence is ignored because its the highest anyway
-        if(tok.matchNext(Token.Kind.Kleen, true)) {
-            const kleen = try allocer.create(RegEx);
-            kleen.* = initOperator(allocer, Token.Kind.Kleen, primary, null);
-            return kleen;
-        }else if(tok.matchNext(Token.Kind.Plus, true)) {
-            const kleen = try allocer.create(RegEx);
-            kleen.* = initOperator(allocer, Token.Kind.Kleen, primary, null);
-
-            const first = try primary.deepClone();
-            
-            const concat = try allocer.create(RegEx);
-            concat.* = initOperator(allocer, Token.Kind.Concat, first, kleen);
-            return concat;
-        }else if(tok.matchNext(Token.Kind.Question, true)) {
-            const eps = try allocer.create(RegEx);
-            eps.* = initLiteralChar(allocer, RegExNFA.epsilon);
-
-            const yunyin = try allocer.create(RegEx);
-            yunyin.* = initOperator(allocer, Token.Kind.Union, primary, eps);
-
-            return yunyin;
-        }else{
-            return primary;
-        }
-    }
-
-    // TODO currently, a parsing error results in memory not being freed. In the main use case, this uses an arena anyway, so it shouldn't be a big problem, but it's still not nice
-
-    pub fn parseExpr(allocer:Allocator, minPrec:u32, tok:*Tokenizer) ParseError!*@This() {
-        var lhs = try parsePrimaryExpr(allocer, tok);
-        while (tok.hasNext()) {
-            // let the upper level parse 'unknown operators' (in this case anything but the binary operators)
-            const operatorKind = tok.peekAssume().kind; // we peek, because if we return inside the loop, the upper level needs to consume that token
-            if(operatorKind != Token.Kind.Union and operatorKind != Token.Kind.Concat)
-                return lhs;
-
-            const prec = operatorKind.precedenceAndChar().prec;
-            if (prec < minPrec)
-                return lhs;
-
-            _ = tok.nextAssume(); // consume operator
-
-
-
-            const rhs = try parseExpr(allocer, prec + 1, tok); // always + 1, because we only have left-associative operators, so we want to bind the same operator again in the next depth, not in the one above
-            const op = try allocer.create(RegEx);
-            op.* = initOperator(allocer, operatorKind, lhs, rhs);
-            lhs = op;
-        }
-        return lhs;
-    }
 
     pub fn isOperator(self:RegEx) bool {
         // if left is null (i.e. this is a leaf), right must be null too
@@ -1649,6 +1803,7 @@ const RegExDFA = struct{
     const ProfilingInformation = struct{
         transitionFequencyPerState:[]EntireTransitionMapOfAState, // instead of mapping to a state, we map to a frequency (also a u32)
         // only counts if we left the state again (so that all transition frequencies add up to the number of visits)
+        // TODO this is not used yet, but might of course be useful at some point
         visitsPerState:[]u32,
 
         internalAllocator:Allocator,
@@ -1678,7 +1833,7 @@ const RegExDFA = struct{
         }
     };
 
-    pub fn profileOneRun(self:@This(), word:[]const u8, profile:*ProfilingInformation) !void {
+    pub fn staticallyProfileOneRun(self:@This(), word:[]const u8, profile:*ProfilingInformation) !void {
         var curState:u32 = self.startState;
         for(word) |c| {
             // possibly return first so that the visit count only counts if we left the state again
@@ -1773,7 +1928,7 @@ const RegExDFA = struct{
     // for now, requires that the self-DFA has been allocated with an arena (and this arena has been passed), to be able to ensure the total code size will be < 2 GiB
     // for now, requires the original DFA to be live for the lifetime of the compiled DFA, because it needs to be able to access the final states
     // TODO there has to be a better way to do this comptime bool thing. A nullable profile info wouldn't generate a different function per bool value, i.e. cost runtime performance (I think)
-    pub fn compile(self:@This(), arena:*std.heap.ArenaAllocator, comptime hasProfileInfo:bool, opts:struct{profileInfo:ProfilingInformation = undefined}) CompilationError!CompiledRegExDFA{
+    pub fn compile(self:@This(), arena:*std.heap.ArenaAllocator, comptime hasProfileInfo:bool, opts:struct{profileInfo:ProfilingInformation = undefined, comptime stopOnFinalState:bool = true}) CompilationError!CompiledRegExDFA{
         // there are different options for implementing the jumps to the next state, equivalent to the approaches for lowering switch statements:
         // let's try a linear if-else chain first (could later order this by estimated frequency of each transition, by profiling this on the interpreted version). Should be fastest for a low number of transitions per state 
         // - binary search based switching might be fastest, if the number of transitions per state is medium to high
@@ -1901,6 +2056,7 @@ const RegExDFA = struct{
             var curTransitionsOrdered:EntireTransitionMapOfAState = undefined;
             defer if(hasProfileInfo) curTransitionsOrdered.deinit();
 
+            // if there is any - use the profiling info to sort the transitions
             if(hasProfileInfo) {
                 // TODO this functionality is probably quite slow overall in terms of compile-time, because of the cloning, sorting, etc.
                 curTransitionsOrdered = try self.transitions[curState].clone();
@@ -1919,6 +2075,22 @@ const RegExDFA = struct{
                 // copy shouldnt be a problem, is only copying fat pointers, right?
                 curTransitionsOrdered = self.transitions[curState];
             }
+
+            // I hate that zig has no proper way to do this...
+            // literally makes the language unusable for me
+            // and no, the userspace solutions are not sufficiently easy
+            const encodeMinimizedJump = struct{
+                fn f(curPtr:*[*]u8, jumpsToPatch0:anytype, startOfState0:anytype, targetState:u32, jmpKind:FeMnem) !void{
+                    if(startOfState0[targetState]) |jeTarget| {
+                        // just encode, and let fadec pick the best encoding
+                        try encode(curPtr, jmpKind, .{oldIntCast(@intFromPtr(jeTarget), fadec.FeOp)});
+                    }else{
+                        try jumpsToPatch0.*.append(.{.instrToPatch = @ptrCast(curPtr.*), .opcode = jmpKind, .targetState = targetState});
+                        // use longest possible encoding to reserve space, patch it later
+                        try encode(curPtr, jmpKind | fadec.FE_JMPL, .{oldIntCast(@intFromPtr(curPtr.*), fadec.FeOp)});
+                    }
+                }
+            }.f;
 
             // normally:
             // traverse all possible transitions and emit instructions that check for them, and jump to the respective target state
@@ -1943,14 +2115,7 @@ const RegExDFA = struct{
                     try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, 0});
                     // if not zero: jump to target state 
                     // je targetState
-                    if(startOfState[targetState]) |jeTarget| {
-                        // just encode, and let fadec pick the best encoding
-                        try encode(&cur, fadec.FE_JNZ, .{oldIntCast(@intFromPtr(jeTarget), fadec.FeOp)});
-                    }else{
-                        try jumpsToPatch.append(.{.instrToPatch = @ptrCast(cur), .opcode = fadec.FE_JNZ, .targetState = targetState});
-                        // use longest possible encoding to reserve space, patch it later
-                        try encode(&cur, fadec.FE_JNZ | fadec.FE_JMPL, .{oldIntCast(@intFromPtr(cur), fadec.FeOp)});
-                    }
+                    try encodeMinimizedJump(&cur, &jumpsToPatch, startOfState, targetState, fadec.FE_JNZ);
                     // otherwise it's zero, i.e. the end of the word (basically the same code as after the for loop, just without the trap state, and with an unconditional jump. Again @Zig, this is why you need local lambdas)
                     // if we have, jump to the checkFinalStatePtr and move the current state into RSI
                     // TODO instruction scheduling-wise: might make sense to put the mov at the start (for better out of order execution), although it would cost a bit of decoding performance even if its not executed, which is not the case here. Test this
@@ -1982,14 +2147,7 @@ const RegExDFA = struct{
                     try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, char});
 
                     // je targetState
-                    if(startOfState[targetState]) |jeTarget| {
-                        // just encode, and let fadec pick the best encoding
-                        try encode(&cur, fadec.FE_JZ, .{oldIntCast(@intFromPtr(jeTarget), fadec.FeOp)});
-                    }else{
-                        try jumpsToPatch.append(.{.instrToPatch = @ptrCast(cur), .opcode = fadec.FE_JZ, .targetState = targetState});
-                        // use longest possible encoding to reserve space, patch it later
-                        try encode(&cur, fadec.FE_JZ | fadec.FE_JMPL, .{oldIntCast(@intFromPtr(cur), fadec.FeOp)});
-                    }
+                    try encodeMinimizedJump(&cur, &jumpsToPatch, startOfState, targetState, fadec.FE_JZ);
                 }else{
                     const startChar:i8 = @bitCast(range[0]);
                     const endChar:i8  = @bitCast(range[1]);
@@ -2001,20 +2159,13 @@ const RegExDFA = struct{
                     // don't need to use FE_JMPL, because we know the target is <128 away
                     const FE_JB = fadec.FE_JC; // jump below == jump carry
                     var toPatch = cur;
-                    try encode(&cur, FE_JB, .{oldIntCast(@intFromPtr(cur), fadec.FeOp)}); // TODO could also hard code this instead of patching it, if we always use a long jump for the JBE later
+                    try encode(&cur, FE_JB, .{oldIntCast(@intFromPtr(cur), fadec.FeOp)}); // TODO could also hard code this instead of patching it, if we always use a long jump for the JBE later, performance test whether that's worth it
 
                     // cmp cl, endChar
                     try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, endChar});
 
                     // if cl <= endChar, jump to target like above
-                    if(startOfState[targetState]) |jeTarget| {
-                        // just encode, and let fadec pick the best encoding
-                        try encode(&cur, fadec.FE_JBE , .{oldIntCast(@intFromPtr(jeTarget), fadec.FeOp)});
-                    }else{
-                        try jumpsToPatch.append(.{.instrToPatch = @ptrCast(cur), .opcode = fadec.FE_JBE, .targetState = targetState});
-                        // use longest possible encoding to reserve space, patch it later
-                        try encode(&cur, fadec.FE_JBE | fadec.FE_JMPL, .{oldIntCast(@intFromPtr(cur), fadec.FeOp)});
-                    }
+                    try encodeMinimizedJump(&cur, &jumpsToPatch, startOfState, targetState, fadec.FE_JBE);
 
                     // patch jump from before to jump to here
                     const nextTransitionPatchTarget = cur;
@@ -2784,47 +2935,45 @@ const RegExNFA = struct {
     }
 };
 
-pub fn parseRegex(allocer: Allocator, input: []const u8) !*RegEx {
-    var tok = try Tokenizer.init(allocer, input);
+pub fn compileInputStringAnyWriter(arena:*std.heap.ArenaAllocator, input: []const u8, writer:anytype) !RegExDFA.CompiledRegExDFA {
+    // TODO resource management of the diag doesn't work properly
+    var diag = Diag.init(arena.allocator());
+    defer diag.deinit();
+
+    var tok = try Tokenizer.init(arena.allocator(), input, &diag);
     defer tok.deinit();
 
-    return RegEx.parseExpr(allocer, 0, &tok);
-}
+    var parser = Parser.init(arena.allocator(), &tok);
 
-pub fn compileInputString(arena:*std.heap.ArenaAllocator, input: []const u8, comptime opts:struct{printErrors:bool = true}) !RegExDFA.CompiledRegExDFA {
-    _ = opts;
+    const regex = parser.parseExpr(0) catch |e| {
+        // rethrow out of memory
+        if(e == error.OutOfMemory){
+            return error.OutOfMemory;
+        }
 
-    var tok = try Tokenizer.init(arena.allocator(), input);
-    defer tok.deinit();
-
-    const regex = RegEx.parseExpr(arena.allocator(), 0, &tok) catch |e| switch(e){
-        //SyntaxError.InvalidToken => {
-        //    if(opts.printErrors){
-        //        const writer = std.io.getStdErr().writer();
-        //
-        //        try writer.print(Termcolor.Error ++ "Error" ++ Termcolor.Reset ++ ": Invalid token in regex:\n", .{});
-        //        try writer.print("{}", .{input});
-        //        try writer.print(Termcolor.Caret ++ "~" ** (errorPosition.charStart) ++ "^" ** (errorPosition.charEnd - errorPosition.charStart) ++ "~" ** (input.len) ++ Termcolor.Reset ++ "\n", .{});
-        //        // TODO continue here with proper error messages
-        //    }
-        //},
-        
-        // for now, just re-throw the error, until we have proper parsing and error messages
-        else => return e
+        try diag.printAll(writer, input);
+        return e;
     };
 
     var dfa = try regex.toDFA(.{});
 
-    return dfa.compile(&arena, false, .{});
+    return dfa.compile(arena, false, .{});
+}
+
+pub fn compileInputString(arena:*std.heap.ArenaAllocator, input: []const u8, comptime comptime_opts:struct{printErrors:bool = true}) !RegExDFA.CompiledRegExDFA {
+    return compileInputStringAnyWriter(arena, input, if(comptime_opts.printErrors) std.io.getStdErr().writer() else std.io.null_writer());
 }
 
 fn eqlPairU8(a: Pair(u8,u8), b: Pair(u8,u8)) bool {
     return a[0] == b[0] and a[1] == b[1];
 }
 
+var emptyTestingDiag = Diag.init(std.heap.c_allocator);
+const emptyTestingDiagPtr = &emptyTestingDiag;
+
 test "tokenizer" {
     const input = "xyz|w*(abc)*de*f";
-    var tok = try Tokenizer.init(std.testing.allocator, input);
+    var tok = try Tokenizer.init(std.testing.allocator, input, emptyTestingDiagPtr);
     defer tok.deinit();
     const buf = try tok.debugFmt();
     try expect(std.mem.eql(u8, buf.items, "x y z|w* (a b c)* d e* f"));
@@ -2838,7 +2987,7 @@ fn expectLiteralChar(token:Token, expected:u8) anyerror!void {
 
 test "tokenizer syntactic sugar" {
     const input = "xyz|w+(abc)?de*f";
-    var tok = try Tokenizer.init(std.testing.allocator, input);
+    var tok = try Tokenizer.init(std.testing.allocator, input, emptyTestingDiagPtr);
     defer tok.deinit();
     const buf = try tok.debugFmt();
     try expect(std.mem.eql(u8, buf.items, "x y z|w+ (a b c)? d e* f"));
@@ -2846,13 +2995,13 @@ test "tokenizer syntactic sugar" {
 
 test "tokenizer char groups" {
     const input = "[xyz]|[a-f]";
-    var tok = try Tokenizer.init(std.testing.allocator, input);
+    var tok = try Tokenizer.init(std.testing.allocator, input, emptyTestingDiagPtr);
     defer tok.deinit();
     const buf = try tok.debugFmt();
     try expect(std.mem.eql(u8, buf.items, "[xyz]|[a-f]"));
 
     const input2 = "a-^b";
-    var tok2 = try Tokenizer.init(std.testing.allocator, input2);
+    var tok2 = try Tokenizer.init(std.testing.allocator, input2, emptyTestingDiagPtr);
     defer tok2.deinit();
 
     var i:u32 = 0;
@@ -2867,7 +3016,7 @@ test "tokenizer char groups" {
 
     // shouldn't need to escape additional ] outside of a char group
     const input3 = "a]";
-    var tok3 = try Tokenizer.init(std.testing.allocator, input3);
+    var tok3 = try Tokenizer.init(std.testing.allocator, input3, emptyTestingDiagPtr);
     defer tok3.deinit();
     try expectLiteralChar(tok3.nextAssume(), 'a');
     try expectEqual(.Concat, tok3.nextAssume().kind);
@@ -2876,7 +3025,7 @@ test "tokenizer char groups" {
 
     // outside of a char group, - and ^ should be literal
     const input4 = "^a-bc";
-    var tok4 = try Tokenizer.init(std.testing.allocator, input4);
+    var tok4 = try Tokenizer.init(std.testing.allocator, input4, emptyTestingDiagPtr);
     defer tok4.deinit();
     i = 0;
     while(tok4.nextOrNull()) |token| {
@@ -2892,7 +3041,7 @@ test "tokenizer char groups" {
 test "tokenizer escaping" {
     // the spaces separate the special cases to be tested
     const input1 = " \\| \\\\ \\[ \\] ";
-    var tok1 = try Tokenizer.init(std.testing.allocator, input1);
+    var tok1 = try Tokenizer.init(std.testing.allocator, input1, emptyTestingDiagPtr);
     defer tok1.deinit();
 
     while(tok1.nextOrNull()) |token| {
@@ -2902,7 +3051,7 @@ test "tokenizer escaping" {
 
     // now test it inside a char group
     const input2 = "[a\\-z]";
-    var tok2 = try Tokenizer.init(std.testing.allocator, input2);
+    var tok2 = try Tokenizer.init(std.testing.allocator, input2, emptyTestingDiagPtr);
     defer tok2.deinit();
 
     try expect(tok2.nextAssume().kind == Token.Kind.LSquareBrack);
@@ -2914,7 +3063,7 @@ test "tokenizer escaping" {
 
     // wrong escape
     const input3 = "[a\\";
-    try expect(Tokenizer.init(std.testing.allocator, input3) == SyntaxError.PrematureEnd);
+    try expect(Tokenizer.init(std.testing.allocator, input3, emptyTestingDiagPtr) == SyntaxError.PrematureEnd);
 }
 
 test "parsing edge cases" {
@@ -2923,13 +3072,15 @@ test "parsing edge cases" {
 
     // test the manual way of tokenizing+parsing
     const input1 = "a|";
-    var tok1 = try Tokenizer.init(std.testing.allocator, input1);
+    var diag = Diag.init(arena.allocator());
+    var tok1 = try Tokenizer.init(std.testing.allocator, input1, &diag);
     defer tok1.deinit();
     // use arena to prevent leak
-    try expect(RegEx.parseExpr(arena.allocator(), 0, &tok1) == SyntaxError.PrematureEnd);
+    var parser = Parser.init(arena.allocator(), &tok1);
+    try expectAnyError(parser.parseExpr(0));
 
     const input2 = "a|b|c";
-    const regex = try parseRegex(std.testing.allocator, input2);
+    const regex = try Parser.parseNoDiagnostic(std.testing.allocator, input2);
     defer regex.deinit();
 
     try expectEqual(.Union, regex.kind);
@@ -2958,16 +3109,16 @@ test "parsing edge cases" {
     }
 
     const input3 = "[b-";
-    try expectError(SyntaxError.PrematureEnd, parseRegex(std.testing.allocator, input3));
+    try expectParserError(SyntaxError.PrematureEnd, Parser.parse(std.testing.allocator, input3));
 
     const input4 = "[b-]";
-    try expectError(SyntaxError.InvalidToken, parseRegex(std.testing.allocator, input4));
+    try expectParserError(SyntaxError.InvalidToken, Parser.parse(std.testing.allocator, input4));
 
     const input5 = "[b-a]";
-    try expectError(SyntaxError.InvalidRange, parseRegex(std.testing.allocator, input5));
+    try expectParserError(ParseError.SemanticallyInvalidRange, Parser.parse(std.testing.allocator, input5));
 
     const input6 = "[]";
-    const regex6 = try parseRegex(std.testing.allocator, input6);
+    const regex6 = try Parser.parseNoDiagnostic(std.testing.allocator, input6);
     defer regex6.deinit();
     try expect(regex6.kind == Token.Kind.Char);
     try expect(regex6.chars[0] == RegExNFA.epsilon);
@@ -2977,7 +3128,7 @@ test "parsing edge cases" {
 
     // invert edge cases
     const input7 = "[^\x01-\xff]";
-    const regex7 = try parseRegex(std.testing.allocator, input7);
+    const regex7 = try Parser.parseNoDiagnostic(std.testing.allocator, input7);
     defer regex7.deinit();
 
     try expect(regex7.kind == Token.Kind.Char);
@@ -2985,9 +3136,59 @@ test "parsing edge cases" {
     try expect(regex7.chars[1] == RegExNFA.epsilon);
 }
 
+test "parsing error messages" {
+  var list = std.ArrayList(u8).init(std.testing.allocator);
+  defer list.deinit();
+  var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+  defer arena.deinit();
+
+  const expectErrorCaretPosition = struct {
+    fn f(l: anytype, comptime position:comptime_int, comptime length:comptime_int) !void {
+      try expect(std.mem.containsAtLeast(u8, l.items, 1, "\n" ++ " " ** position));
+      try expect(std.mem.count(u8, l.items, "\n" ++ " " ** (position + 1)) == 0);
+      try expect(std.mem.containsAtLeast(u8, l.items, 1, "^" ++ "~" ** (length-1)));
+    }
+  }.f;
+
+  const input1 = "a|||";
+  try expectAnyError(compileInputStringAnyWriter(&arena, input1, list.writer()));
+
+  // assert that the error message contains the correct message and indentation/position
+  try expect(std.mem.containsAtLeast(u8, list.items, 1, "invalid token"));
+  try expectErrorCaretPosition(list, 2, 1);
+
+  list.clearRetainingCapacity();
+
+  const input2 = "a|";
+  try expectAnyError(compileInputStringAnyWriter(&arena, input2, list.writer()));
+
+  try expect(std.mem.containsAtLeast(u8, list.items, 1, "premature"));
+  try expectErrorCaretPosition(list, 2, 1);
+
+  const input3 = "a|b|";
+  try expectAnyError(compileInputStringAnyWriter(&arena, input3, list.writer()));
+
+  try expect(std.mem.containsAtLeast(u8, list.items, 1, "premature"));
+  try expectErrorCaretPosition(list, 4, 1);
+
+  list.clearRetainingCapacity();
+  const input4 = "[z-y]"; // missing closing bracket
+  try expectAnyError(compileInputStringAnyWriter(&arena, input4, list.writer()));
+
+  try expect(std.mem.containsAtLeast(u8, list.items, 1, "semantically invalid range"));
+  try expectErrorCaretPosition(list, 1, 3);
+
+  list.clearRetainingCapacity();
+  const input5 = ""; // empty input
+  try expectAnyError(compileInputStringAnyWriter(&arena, input5, list.writer()));
+
+  try expect(std.mem.containsAtLeast(u8, list.items, 1, "premature"));
+}
+
+
 test "parsing char groups" {
     const input1 = "[aceg]";
-    const regex = try parseRegex(std.testing.allocator, input1);
+    const regex = try Parser.parseNoDiagnostic(std.testing.allocator, input1);
     defer regex.deinit();
 
     const isOnlyCharGroup = struct{
@@ -3012,7 +3213,7 @@ test "parsing char groups" {
     }.f);
 
     const input2 = "[a-d]";
-    const regex2 = try parseRegex(std.testing.allocator, input2);
+    const regex2 = try Parser.parseNoDiagnostic(std.testing.allocator, input2);
     defer regex2.deinit();
 
     try expect(regex2.kind == Token.Kind.Char);
@@ -3024,7 +3225,7 @@ test "parsing char groups" {
 
     const complicatedRangeInput = "jjhejdjcjbjgjf-gje-gj";
     const input3 = "[" ++ complicatedRangeInput ++ "]";
-    const regex3 = try parseRegex(std.testing.allocator, input3);
+    const regex3 = try Parser.parseNoDiagnostic(std.testing.allocator, input3);
     defer regex3.deinit();
 
     // should just be one union between b-h and j
@@ -3047,7 +3248,7 @@ test "parsing char groups" {
 
     // now the same thing, but inverted
     const input4 = "[^" ++ complicatedRangeInput ++ "]";
-    const regex4 = try parseRegex(std.testing.allocator, input4);
+    const regex4 = try Parser.parseNoDiagnostic(std.testing.allocator, input4);
     defer regex4.deinit();
     
     const options4 = &[_]Pair(u8,u8){
@@ -3077,13 +3278,13 @@ test "parsing char groups" {
     }
 
     const input5 = "[a-d]|e|[b-falzxk]";
-    const regex5 = try parseRegex(std.testing.allocator, input5);
+    const regex5 = try Parser.parseNoDiagnostic(std.testing.allocator, input5);
     defer regex5.deinit();
     try regex5.traverse(isOnlyCharGroup);
 }
 
 test "parsing sugar: +" {
-    var regex = try parseRegex(std.testing.allocator, "a+");
+    var regex = try Parser.parseNoDiagnostic(std.testing.allocator, "a+");
     defer regex.deinit();
 
     try expect(regex.kind == Token.Kind.Concat);
@@ -3095,10 +3296,10 @@ test "parsing sugar: +" {
 }
 
 test "parsing sugar: ?" {
-    const regex = try parseRegex(std.testing.allocator, "a?");
+    const regex = try Parser.parseNoDiagnostic(std.testing.allocator, "a?");
     defer regex.deinit();
 
-    const comparison = try parseRegex(std.testing.allocator, "a|[]");
+    const comparison = try Parser.parseNoDiagnostic(std.testing.allocator, "a|[]");
     defer comparison.deinit();
     try expectEqualDeep(regex, comparison);
 }
@@ -3264,10 +3465,8 @@ test "xyz|w*(abc)*de*f regex to dfa compiled" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var tok = try Tokenizer.init(arena.allocator(), input);
-    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    const regex = try Parser.parseNoDiagnostic(arena.allocator(), input);
     try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
-    try expect(!tok.hasNext());
 
     var dfa = try regex.toDFA(.{});
     try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
@@ -3308,11 +3507,8 @@ test "x[yz]|[.]w*([a-c])*de*[f-i] regex to dfa compiled" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var tok = try Tokenizer.init(arena.allocator(), input);
-    defer tok.deinit();
-    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    const regex = try Parser.parseNoDiagnostic(arena.allocator(), input);
     try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
-    try expect(!tok.hasNext());
 
     var dfa = try regex.toDFA(.{});
     try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
@@ -3340,9 +3536,7 @@ test "simple anychar" {
 
     const input1 = ".";
 
-    var tok = try Tokenizer.init(arena.allocator(), input1);
-    defer tok.deinit();
-    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    const regex = try Parser.parseNoDiagnostic(arena.allocator(), input1);
 
     var dfa = try regex.toDFA(.{});
 
@@ -3356,9 +3550,7 @@ test "simple anychar" {
 
     const input2 = ".a|..";
 
-    var tok2 = try Tokenizer.init(arena.allocator(), input2);
-    defer tok2.deinit();
-    const regex2 = try RegEx.parseExpr(arena.allocator(), 0, &tok2);
+    const regex2 = try Parser.parseNoDiagnostic(arena.allocator(), input2);
 
     var dfa2 = try regex2.toDFA(.{});
 
@@ -3374,9 +3566,7 @@ test "simple anychar" {
 
     const input3 = "a|.|[b-f]";
 
-    var tok3 = try Tokenizer.init(arena.allocator(), input3);
-    defer tok3.deinit();
-    const regex3 = try RegEx.parseExpr(arena.allocator(), 0, &tok3);
+    const regex3 = try Parser.parseNoDiagnostic(arena.allocator(), input3);
 
     var dfa3 = try regex3.toDFA(.{});
 
@@ -3395,11 +3585,8 @@ test "x[yz]|.w*([a-c])*.e*[f-i] regex to dfa compiled" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var tok = try Tokenizer.init(arena.allocator(), input);
-    defer tok.deinit();
-    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    const regex = try Parser.parseNoDiagnostic(arena.allocator(), input);
     try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
-    try expect(!tok.hasNext());
 
     var dfa = try regex.toDFA(.{});
     try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
@@ -3430,11 +3617,8 @@ test "x?[yz]+|.?w+ regex to dfa compiled" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var tok = try Tokenizer.init(arena.allocator(), input);
-    defer tok.deinit();
-    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    const regex = try Parser.parseNoDiagnostic(arena.allocator(), input);
     try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
-    try expect(!tok.hasNext());
 
     var dfa = try regex.toDFA(.{});
     try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
@@ -3462,11 +3646,8 @@ test "eps-only/empty string regex" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var tok = try Tokenizer.init(arena.allocator(), input);
-    defer tok.deinit();
-    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    const regex = try Parser.parseNoDiagnostic(arena.allocator(), input);
     try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
-    assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
 
     try expect(regex.kind == Token.Kind.Char);
     try expect(regex.chars[0] == RegExNFA.epsilon);
@@ -3490,11 +3671,8 @@ test "single char regex to dfa" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var tok = try Tokenizer.init(arena.allocator(), input);
-    defer tok.deinit();
-    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    const regex = try Parser.parseNoDiagnostic(arena.allocator(), input);
     try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
-    assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
 
     var dfa = try regex.toDFA(.{});
     try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
@@ -3587,19 +3765,62 @@ test "regex dfa profiling" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var tok = try Tokenizer.init(arena.allocator(), input);
-    defer tok.deinit();
-    const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    const regex = try Parser.parseNoDiagnostic(arena.allocator(), input);
 
     var dfa = try regex.toDFA(.{});
 
     var profileInfo = try RegExDFA.ProfilingInformation.init(std.testing.allocator, dfa.numStates);
     defer profileInfo.deinit();
 
-    for(0..3) |i| {
-        const runNumber = i+1;
+    for(1..4) |runNumber| {
+        try dfa.staticallyProfileOneRun("xyz", &profileInfo);
+        try expect(runNumber == profileInfo.transitionFequencyPerState[dfa.startState].find('x').?);
+        const stateOne = dfa.transitions[dfa.startState].find('x').?;
+        try expect(runNumber == profileInfo.transitionFequencyPerState[stateOne].find('y').?);
+        const stateTwo = dfa.transitions[stateOne].find('y').?;
+        try expect(runNumber == profileInfo.transitionFequencyPerState[stateTwo].find('z').?);
 
-        try dfa.profileOneRun("xyz", &profileInfo);
+        try expect(runNumber == profileInfo.visitsPerState[dfa.startState]);
+        try expect(runNumber == profileInfo.visitsPerState[stateOne]);
+        try expect(runNumber == profileInfo.visitsPerState[stateTwo]);
+        // don't increment the final state, as that is not left
+        try expect(0 == profileInfo.visitsPerState[dfa.transitions[stateTwo].find('z').?]);
+
+        // these should be the only entries -> check that all are runNumber
+        for(profileInfo.transitionFequencyPerState) |transitions| {
+            for(transitions.map.items) |transition| {
+                try expect(transition[1][1] == runNumber);
+            }
+        }
+    }
+
+    const compiled = try dfa.compile(&arena, true, .{.profileInfo = profileInfo});
+    const startOfRecognize:[*]u8 = @ptrCast(compiled.recognize);
+    // if the profiling has worked right, the first comparison should be comparing to x, i.e. the start of the recognize function should be:
+    // sub rsp, 0x8
+    // mov rax, rsi
+    // mov cl, byte ptr [rax]
+    // add rax, 0x1
+    // cmp cl, 0x78; this compares to 'x'
+    // -> check this
+    try expect(std.mem.eql(u8, startOfRecognize[0..16], "\x48\x83\xEC\x08\x48\x89\xF0\x8A\x08\x48\x83\xC0\x01\x80\xF9\x78"));
+}
+
+test "regex range dfa profiling" {
+    const input = "[a-x][by]z|w*(abc)*de*f";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const regex = try Parser.parseNoDiagnostic(arena.allocator(), input);
+
+    var dfa = try regex.toDFA(.{});
+
+    var profileInfo = try RegExDFA.ProfilingInformation.init(std.testing.allocator, dfa.numStates);
+    defer profileInfo.deinit();
+
+    for(1..4) |runNumber| {
+        try dfa.staticallyProfileOneRun("xyz", &profileInfo);
         try expect(runNumber == profileInfo.transitionFequencyPerState[dfa.startState].find('x').?);
         const stateOne = dfa.transitions[dfa.startState].find('x').?;
         try expect(runNumber == profileInfo.transitionFequencyPerState[stateOne].find('y').?);
@@ -3675,7 +3896,7 @@ test "fadec basic functionality and abstractions" {
 }
 
 pub fn main() !void {
-    const writer = std.io.getStdOut().writer();
+    //const writer = std.io.getStdOut().writer();
     //_ = writer;
 
     var arena = std.heap.ArenaAllocator.init(cAllocer);
@@ -3685,7 +3906,7 @@ pub fn main() !void {
     //
     //var tok = try Tokenizer.init(arena.allocator(), input);
     //defer tok.deinit();
-    //const regex = try RegEx.parseExpr(arena.allocator(), 0, &tok);
+    //const regex = try Parser.init(arena.allocator(), &tok);
     //assert(!tok.hasNext(), "expected EOF, but there were tokens left", .{});
     //
     //var dfa = try regex.toDFA(.{});
@@ -3705,15 +3926,14 @@ pub fn main() !void {
     //try fa.printDOT(std.io.getStdOut().writer());
 
 
-    const input = "[^\x01-\xff]";
-    var tok = try Tokenizer.init(cAllocer, input);
-    defer tok.deinit();
-    const regex = try RegEx.parseExpr(cAllocer, 0, &tok);
-    try regex.printDOTRoot(writer);
+    const input = "[z-a]";
+    //var tok = try Tokenizer.init(cAllocer, input);
+    //defer tok.deinit();
+    //const regex = try Parser.init(cAllocer, &tok);
+    //try regex.printDOTRoot(writer);
 
 
-    //const input1 = "[a-]";
-    //compileInputString(&arena, input1, .{});
+    _ = compileInputString(&arena, input, .{}) catch {};
 
 
     //var fa = FiniteAutomaton{.dfa = &dfa};
