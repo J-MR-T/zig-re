@@ -1565,14 +1565,30 @@ const RegEx = struct {
         // 3. back up eps transitions
         // 4. convert to dfa
 
-        // edge case: no operators, just a single char
+        // edge case: no operators, i.e. just a single char (could also be epsilon)
         // we need to handle this separately, because the main tree traversal only traverses inner nodes (operators), and analyzes the children of those, so we would miss this singular leaf
         if(!self.isOperator()) {
             var dfa = try RegExDFA.init(self.internalAllocator);
-            try dfa.addStates(2);
-            dfa.startState = 0;
-            try dfa.designateStatesFinal(&[1]u32{1});
-            try dfa.transitions[dfa.startState].insert(self.chars[0], self.chars[1], 1, .{});
+            dfa.startState = 
+                try dfa.addState();
+
+            if(self.chars[0] == RegExNFA.epsilon) {
+                // if the transition includes an epsilon, we need to add 0 as a final state, and ...
+                try dfa.designateStatesFinal(&[1]u32{0});
+                // if the transition is not empty, we need to add a state, and a transition from 0 to 1
+                if(self.chars[1] != RegExNFA.epsilon){
+                    try dfa.addStates(1);
+                    try dfa.designateStatesFinal(&[1]u32{1});
+                    // the transition starts from the char after epsilon
+                    try dfa.transitions[dfa.startState].insert(RegExNFA.epsilon + 1, self.chars[1], 1, .{});
+                } // otherwise, we just have the dfa that only accepts the empty string
+            } else {
+                try dfa.addStates(1);
+                // if there's no epsilon, just build a simple (0) -[chars]-> ((1)) dfa, i.e. with 1 as a final state
+                try dfa.designateStatesFinal(&[1]u32{1});
+                try dfa.transitions[dfa.startState].insert(self.chars[0], self.chars[1], 1, .{});
+            }
+
 
             return dfa;
         }
@@ -3658,20 +3674,22 @@ test "eps-only/empty string regex" {
 
     var compiledDFA = try dfa.compile(&arena, false, .{});
 
+    try expect(dfa.isInLanguageInterpreted(""));
     try expect(compiledDFA.isInLanguageCompiled(""));
     for(1..255) |c| {
         const str:[:0]const u8 = &[_:0]u8{@intCast(c)};
+        try expect(!dfa.isInLanguageInterpreted(str));
         try expect(!compiledDFA.isInLanguageCompiled(str));
     }
 }
 
 test "single char regex to dfa" {
-    const input = "x";
+    const input1 = "x";
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const regex = try Parser.parseNoDiagnostic(arena.allocator(), input);
+    const regex = try Parser.parseNoDiagnostic(arena.allocator(), input1);
     try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
 
     var dfa = try regex.toDFA(.{});
@@ -3688,6 +3706,40 @@ test "single char regex to dfa" {
     try expect(!dfa.isInLanguageInterpreted("y"));
     try expect(!compiledDFA.isInLanguageCompiled("w"));
     try expect(!dfa.isInLanguageInterpreted("w"));
+
+    // now with ranges
+    const input2 = "[b-f]";
+    compiledDFA = try compileInputString(&arena, input2, .{});
+
+    try expect(!compiledDFA.isInLanguageCompiled("a"));
+    try expect(compiledDFA.isInLanguageCompiled("b"));
+    try expect(compiledDFA.isInLanguageCompiled("c"));
+    try expect(compiledDFA.isInLanguageCompiled("d"));
+    try expect(compiledDFA.isInLanguageCompiled("e"));
+    try expect(compiledDFA.isInLanguageCompiled("f"));
+    try expect(!compiledDFA.isInLanguageCompiled("g"));
+
+    // now with ranges that include eps
+    const input3 = "[\x00-x]";
+    dfa = try (try Parser.parseNoDiagnostic(arena.allocator(), input3)).toDFA(.{});
+
+    // compile anew
+    compiledDFA = try dfa.compile(&arena, false, .{});
+    try expect(compiledDFA.isInLanguageCompiled(""));
+    for(1..'x') |c| {
+        const str:[:0]const u8 = &[_:0]u8{@intCast(c)};
+        try expect(compiledDFA.isInLanguageCompiled(str));
+    }
+    for('y'..255) |c| {
+        const str:[:0]const u8 = &[_:0]u8{@intCast(c)};
+        try expect(!compiledDFA.isInLanguageCompiled(str));
+    }
+    for(1..255) |c1| {
+        for(1..255) |c2| {
+            const str:[:0]const u8 = &[_:0]u8{@intCast(c1), @intCast(c2)};
+            try expect(!compiledDFA.isInLanguageCompiled(str));
+        }
+    }
 }
 
 
