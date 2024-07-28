@@ -1,6 +1,7 @@
 re*
 ^re.zig
 zig-*
+.zig-cache
 
 test.svg
 Session.vim
