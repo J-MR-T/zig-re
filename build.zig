@@ -5,18 +5,19 @@ const fadecBuildS = fadecRootS ++ "/build";
 
 const rootSourceFile = "re.zig";
 
-pub fn buildFadec(step: *std.Build.Step, _:*std.Progress.Node) anyerror!void {
+pub fn buildFadec(step: *std.Build.Step, _:std.Progress.Node) anyerror!void {
     try step.evalChildProcess(&[_][]const u8{"meson", "setup", fadecBuildS, fadecRootS});
     try step.evalChildProcess(&[_][]const u8{"meson", "compile", "-C", fadecBuildS});
 }
 
-pub fn clean(clean_step: *std.Build.Step, _:*std.Progress.Node) anyerror!void {
+pub fn clean(clean_step: *std.Build.Step, _:std.Progress.Node) anyerror!void {
     const b = clean_step.owner;
     // run meson clean in fadec root
     try clean_step.evalChildProcess(&[_][]const u8{"meson", "compile", "-C", fadecBuildS,  "--clean"});
     // remove zig-out
     clean_step.dependOn(&b.addRemoveDirTree(b.install_path).step);
-    // remove zig-cache
+    // remove .zig-cache
+    // TODO doesn't work anymore with 0.13
     if(b.cache_root.path) |cache_path|
         clean_step.dependOn(&b.addRemoveDirTree(cache_path).step);
 }
@@ -27,7 +28,7 @@ pub fn build(b: *std.Build) !void {
 
     const exe = b.addExecutable(.{
         .name = "re",
-        .root_source_file = .{ .path = rootSourceFile},
+        .root_source_file = b.path(rootSourceFile),
         .target = b.standardTargetOptions(.{}),
         .optimize = b.standardOptimizeOption(.{}),
     });
@@ -41,7 +42,7 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run unit tests");
 
     const unit_tests = b.addTest(.{
-        .root_source_file = .{ .path = rootSourceFile},
+        .root_source_file = b.path(rootSourceFile),
         .filters = if(b.args) |args| 
             args
         else &[_][]const u8{},
