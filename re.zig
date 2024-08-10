@@ -216,7 +216,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             return findResults;
         }
 
-        // TODO would be great if this supported merging at some point, could parameterize it with 'shouldMerge' and 'merge' functions passed to this one
+        // TODO would be great if this supported merging the individual elements of the two at some point, could parameterize it with 'shouldMerge' and 'merge' functions passed to this one
         // invalidates pointers and capacity guarantees in all cases (!)
         // this could also be done sort of in-place with sufficient guarantees, but that is unnecessarily complex for now
         pub fn addAll(a:*@This(), b:@This()) Allocator.Error!void {
@@ -312,7 +312,8 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             return false;
         }
 
-        // returns whether the set contains the item finds the item using binary search
+        /// DO NOT CHANGE THIS FUNCTION'S SIGNATURE WITHOUT CONSIDERING THE CODE GENERATION
+        /// returns whether the set contains the item finds the item using binary search
         pub fn contains(self:*const @This(), itemToFind:T) bool {
             const spot = self.findSpot(itemToFind, .{.LinearInsertionSearch = false}) orelse return false;
             return spot.found_existing;
@@ -347,7 +348,7 @@ pub fn ArraySet(comptime T:type, comptime comparatorFn:(fn (T, T) Order)) type {
             return (try self.findSpotInternal(itemToCompareAgainst, .{.MakeSpaceForNewIfNotFound = true, .AssumeCapacity = opts.AssumeCapacity, .LinearInsertionSearch = opts.LinearInsertionSearch})) orelse unreachable; // cannot be null, because we make space if it doesnt exist
         }
 
-        // only use this if you know what you're doing, try to use `contains`, the other `find...` function or `insert` if possible
+        // only use this if you know what you're doing, try to use `contains`, the other `find...` functions or `insert` if possible
         // finds the first item that is greater than or equal to the item to find and returns a pointer to it or the place it should be inserted if it does not exist, as well as whether or not it exists
         // if opts.MakeSpaceForNewIfNotFound is set, the array will be expanded and the returned pointer will point to the new item (undefined) item.
         // if opts.MakeSpaceForNewIfNotFound is not set and .found_existing is false, the returned pointer is null, if the array contains no element greater than the passed element, and valid if there is such an element.
@@ -916,9 +917,8 @@ const Token = struct {
                 '-' => Kind.RangeMinus,
                 // rsquarebrack is only a special char inside a char range group
                 ']' => Kind.RSquareBrack,
-                // inside a char range group, a period is a literal char
-                '.' => Kind.Char,
-                else => fromChar(theChar)
+                // inside a char range group, a period and all other special chars are just normal chars
+                else => Kind.Char,
             };
         }
 
@@ -967,7 +967,7 @@ const Token = struct {
     }
 };
 
-const SyntaxError = error{InvalidToken, PrematureEnd};
+const SyntaxError = error{InvalidToken, PrematureEnd, UnmatchedCharGroupBracket};
 const ParseError = error{OutOfMemory, RootExpressionInvalid, SemanticallyInvalidRange} || SyntaxError;
 const CompileError = ParseError;
 
@@ -980,7 +980,7 @@ const Diag =  struct{
             Warning:void,
         };
         kind:Kind,
-        // inclusive start exclusive end, index into source
+        // inclusive-start exclusive-end index into token array, not source string (!)
         location:Pair(u32, u32),
         str:[]const u8,
     };
@@ -999,6 +999,46 @@ const Diag =  struct{
         try self.msgs.append(.{.kind = Msg.Kind{.Error = errorKind}, .location = location, .str = str});
     }
 
+    pub fn registerErrorInferred(self:*@This(), errorKind:ParseError, tokCur:u32, tokens:[]Token) void {
+        const msgStr:[:0]const u8 = switch(errorKind){
+            error.OutOfMemory => "out of memory",
+            error.RootExpressionInvalid => "root expression invalid, could not continue parsing",
+            error.InvalidToken => "invalid token",
+            error.PrematureEnd => "input ended prematurely",
+            error.SemanticallyInvalidRange => "semantically invalid range in char group",
+            error.UnmatchedCharGroupBracket => "unmatched char group left square bracket",
+        };
+        // TODO this is completely wrong, because token indices aren't equal to sourec indices ofc. Pass a source string and index instead, and save source location in tokens
+        var location:Pair(u32, u32) = .{tokCur, tokCur+1};
+        // try to get a better location depending on the error
+        if(errorKind == error.SemanticallyInvalidRange){
+            // can find the exact range to highlight: from the token before the last RangeMinus to the one after
+            var rangeMinusIndex:u32 = tokCur - 1;
+            while(rangeMinusIndex > 0 and tokens[rangeMinusIndex].kind != Token.Kind.RangeMinus){
+                rangeMinusIndex -= 1;
+            }
+            location = .{rangeMinusIndex-|1, rangeMinusIndex+2};
+        }else if(errorKind == error.UnmatchedCharGroupBracket){
+            // find the exact unmatched bracket by going backwards
+            // because square brackets can't really be nested (any inner square brackets are just normal chars), and a closing bracket outside a char group is just a normal char, it has to be the last opening bracket
+
+            var index:u32 = tokCur;
+            while(index > 0 and tokens[index].kind != Token.Kind.LSquareBrack)
+                index -= 1;
+            assert(tokens[index].kind == Token.Kind.LSquareBrack, "this error should only be thrown if there is an unmatched bracket", .{});
+
+            location = .{index, tokCur+1};
+        }else if(errorKind == error.PrematureEnd){
+            // just set it to one after the last token
+            location = .{@intCast(tokens.len), @intCast(tokens.len+1)};
+        }
+        self.registerError(errorKind,  location, msgStr) 
+            // if this is an error (has to be out of memory) we try to say 'help, something's going very wrong, we can't even register errors anymore'
+            catch {
+                std.io.getStdErr().writer().print("ran out of memory registering error: {} ({s})\n", .{errorKind, "a"}) catch {};
+            };
+    }
+
     pub fn throw(self:*@This(), errorKind:CompileError, location:Pair(u32, u32), str:[]const u8) CompileError!void {
         try self.register(errorKind, location, str);
         return errorKind;
@@ -1008,29 +1048,58 @@ const Diag =  struct{
         try self.msgs.append(.{.kind = Msg.Kind{.Warning = {}}, .location = location, .str = str});
     }
 
-    pub fn printAll(self:*const @This(), writer:anytype, source:[]const u8) !void {
+    pub fn printAll(self:*@This(), writer:anytype, source:[]const u8) !void {
+        // all the offsets in the messages are indices into the token array, not the source string -> to save time and memory in the non-error case don't save those offsets, recompute them here. Doesn't really matter that this takes some time in the non-error case
+
+        // tokenize again, produce a mapping from source index to token index
+        const inputToTokenIndex:[]u32 = try cAllocer.alloc(u32, source.len);
+        {
+            var unused = Diag.init(cAllocer);
+            defer unused.deinit();
+
+            // initialize with one past the last index, so that if we end permaturely, the array is still sorted
+            for(0..source.len) |i| {
+                inputToTokenIndex[i] = @intCast(source.len);
+            }
+
+            _ = Tokenizer.tokenizeInternal(self.msgs.allocator, source, &unused, true, inputToTokenIndex) catch |e| {
+                if(e == error.OutofMemory)
+                    return e;
+            };
+            // unmatched char group bracket, or premature end are ignored here, because they'll be handled below
+        }
+
         for (self.msgs.items) |msg| {
             // all messages print the message, the whole source string, and then highlight the location
-            const start = msg.location[0];
-            const startInside = @min(start, source.len -| 1);
-            const end = msg.location[1];
-            const endInside = @min(end, source.len -| 1);
+            const startTokens       = msg.location[0];
+            const endTokens         = msg.location[1];
 
-            
-            const errorColor, const errorName = switch(msg.kind){
-                Msg.Kind.Error => .{Termcolor.Error, "Error"},
+            const compare = struct {
+                fn f(_:@TypeOf(.{}), a:u32, b:u32) bool {
+                    return makeOrder(u32)(a,b).compare(std.math.CompareOperator.lt);
+                }
+            }.f;
+
+            const startSource       = std.sort.lowerBound(u32, startTokens,       inputToTokenIndex, .{}, compare);
+            const startSourceInside = @min(startSource, source.len-|1);
+            const endSource         = std.sort.upperBound(u32, endTokens,         inputToTokenIndex, .{}, compare);
+
+            assert(startSourceInside <= endSource, "startSource has to be <= endSource", .{});
+
+            const messageColor, const message = switch(msg.kind){
+                Msg.Kind.Error   => .{Termcolor.Error,   "Error"},
                 Msg.Kind.Warning => .{Termcolor.Warning, "Warning"},
             };
 
             // these could all be one statement, but this is more readable
 
-            try writer.print("{s}{s}: " ++ Termcolor.Reset ++ "{s}\n", .{errorColor, errorName, msg.str});
+            try writer.print("{s}{s}: " ++ Termcolor.Reset ++ "{s}\n", .{messageColor, message, msg.str});
 
-            try writer.print("{s}{s}{s}{s}{s}\n", .{source[0..startInside], errorColor, source[startInside..endInside], Termcolor.Reset, source[endInside..source.len]});
+            try writer.print("{s}{s}{s}{s}{s}\n", .{source[0..startSourceInside], messageColor, source[startSourceInside..endSource], Termcolor.Reset, source[endSource..source.len]});
             
-            try writer.writeByteNTimes(' ', start);
-            try writer.print("{s}^", .{errorColor});
-            try writer.writeByteNTimes('~', end-start-|1);
+            try writer.writeByteNTimes(' ', startSource);
+            try writer.print("{s}^", .{messageColor});
+            try writer.writeByteNTimes('~', endSource-startSource-|1);
             try writer.print(Termcolor.Reset ++ "\n", .{} );
         }
     }
@@ -1043,14 +1112,29 @@ const Tokenizer = struct {
     diag:*Diag,
 
     // can be used without Tokenizer, but tokenizer is more convenient
-    fn tokenize(allocer:Allocator, input:[]const u8) error{OutOfMemory, PrematureEnd}![]Token {
+    fn tokenizeInternal(allocer:Allocator, input:[]const u8, diag:*Diag, comptime shouldProduceInputToTokenIndex:bool, inputToTokenIndex:?[]u32) error{OutOfMemory, PrematureEnd, UnmatchedCharGroupBracket}![]Token {
+        // check that the options make sense
+        if(shouldProduceInputToTokenIndex){
+            assert(inputToTokenIndex != null, "if shouldProduceInputToTokenIndex is true, inputToTokenIndex must be non-null", .{});
+            assert(inputToTokenIndex.?.len == input.len, "inputToTokenIndex must have the same length as the input", .{});
+        }
+
         // we need to fill in concat tokens, as they are implicit in the input
         var tokens:[]Token = try allocer.alloc(Token, input.len << 1); // multiply by 2 to account for concat tokens
         errdefer allocer.free(tokens);
+
         var tokenI:u32 = 0;
         var inputI:u32 = 0;
+
+        errdefer |e| {
+            diag.registerErrorInferred(e, tokenI, tokens);
+        }
+
         var isInCharGroupingSquareBrack = false;
         while(inputI < input.len) : (inputI += 1) {
+            if(shouldProduceInputToTokenIndex)
+                inputToTokenIndex.?[inputI] = tokenI;
+
             const char = input[inputI];
 
             var curTokenInit:Token = undefined;
@@ -1058,7 +1142,10 @@ const Tokenizer = struct {
             if(char == '\\'){
                 inputI += 1;
                 if(inputI >= input.len)
-                    return SyntaxError.PrematureEnd;
+                    return error.PrematureEnd;
+
+                if(shouldProduceInputToTokenIndex)
+                    inputToTokenIndex.?[inputI] = tokenI;
 
                 curTokenInit = Token{.char = input[inputI], .kind = Token.Kind.Char};
             }else if(isInCharGroupingSquareBrack){
@@ -1079,14 +1166,25 @@ const Tokenizer = struct {
                 tokens[tokenI] = curToken;
             }
 
+            if(shouldProduceInputToTokenIndex)
+                inputToTokenIndex.?[inputI] = tokenI;
+
             isInCharGroupingSquareBrack = (isInCharGroupingSquareBrack or (!isInCharGroupingSquareBrack and curToken.kind == Token.Kind.LSquareBrack)) and !(isInCharGroupingSquareBrack and curToken.kind == Token.Kind.RSquareBrack);
             tokenI+=1;
+        }
+        if(isInCharGroupingSquareBrack){
+            tokenI -= 1;
+            return error.UnmatchedCharGroupBracket;
         }
         return try allocer.realloc(tokens, tokenI);
     }
 
+    fn tokenize(allocer:Allocator, input:[]const u8, diag:*Diag) error{OutOfMemory, PrematureEnd, UnmatchedCharGroupBracket}![]Token {
+        return tokenizeInternal(allocer, input, diag, false, null);
+    }
+
     pub fn init(allocer:Allocator, input:[]const u8, diag:*Diag) !@This(){
-        const tokens = try tokenize(allocer, input);
+        const tokens = try tokenize(allocer, input, diag);
         return Tokenizer{
             .tokens = tokens,
             .cur = 0,
@@ -1179,28 +1277,7 @@ const Parser = struct{
     }
 
     pub fn logError(self:*@This(), errorKind:ParseError) void {
-        const msgStr:[:0]const u8 = switch(errorKind){
-            error.OutOfMemory => "out of memory",
-            error.RootExpressionInvalid => "root expression invalid, could not continue parsing",
-            error.InvalidToken => "invalid token",
-            error.PrematureEnd => "input ended prematurely",
-            error.SemanticallyInvalidRange => "semantically invalid range in char group",
-        };
-        var location:Pair(u32, u32) = .{self.tok.cur, self.tok.cur+1};
-        // try to get a better location depending on the error
-        if(errorKind == error.SemanticallyInvalidRange){
-            // can find the exact range to highlight: from the token before the last RangeMinus to the one after
-            var rangeMinusIndex:u32 = self.tok.cur - 1;
-            while(rangeMinusIndex > 0 and self.tok.tokens[rangeMinusIndex].kind != Token.Kind.RangeMinus){
-                rangeMinusIndex -= 1;
-            }
-            location = .{rangeMinusIndex-|1, rangeMinusIndex+2};
-        }
-        self.diag.registerError(errorKind,  location, msgStr) 
-            // if this is an error (has to be out of memory) we try to say 'help, something's going very wrong, we can't even register errors anymore'
-            catch {
-                std.io.getStdErr().writer().print("ran out of memory registering error: {} ({s})\n", .{errorKind, "a"}) catch {};
-            };
+        self.diag.registerErrorInferred(errorKind, self.tok.cur, self.tok.tokens);
     }
 
     pub fn parse(allocator:Allocator, regex:[]const u8) Tuple(&[_]type{ParseError!*RegEx, Diag}) {
@@ -1943,8 +2020,8 @@ const RegExDFA = struct{
 
     // for now, requires that the self-DFA has been allocated with an arena (and this arena has been passed), to be able to ensure the total code size will be < 2 GiB
     // for now, requires the original DFA to be live for the lifetime of the compiled DFA, because it needs to be able to access the final states
-    // TODO there has to be a better way to do this comptime bool thing. A nullable profile info wouldn't generate a different function per bool value, i.e. cost runtime performance (I think)
-    pub fn compile(self:@This(), arena:*std.heap.ArenaAllocator, comptime hasProfileInfo:bool, opts:struct{profileInfo:ProfilingInformation = undefined, comptime stopOnFinalState:bool = true}) CompilationError!CompiledRegExDFA{
+    // TODO there has to be a better way to do this comptime bool thing. A nullable profile info wouldn't generate a different function per bool value, i.e. cost a tiny bit of runtime performance (I think. Well actually one branch miss, maybe this was premature optimisation)
+    pub fn compile(self:@This(), arena:*std.heap.ArenaAllocator, comptime hasProfileInfo:bool, opts:struct{profileInfo:ProfilingInformation = undefined, comptime stopOnFinalState:bool = false}) CompilationError!CompiledRegExDFA{
         // there are different options for implementing the jumps to the next state, equivalent to the approaches for lowering switch statements:
         // let's try a linear if-else chain first (could later order this by estimated frequency of each transition, by profiling this on the interpreted version). Should be fastest for a low number of transitions per state 
         // - binary search based switching might be fastest, if the number of transitions per state is medium to high
@@ -2952,21 +3029,18 @@ const RegExNFA = struct {
 };
 
 pub fn compileInputStringAnyWriter(arena:*std.heap.ArenaAllocator, input: []const u8, writer:anytype) !RegExDFA.CompiledRegExDFA {
-    // TODO resource management of the diag doesn't work properly
     var diag = Diag.init(arena.allocator());
     defer diag.deinit();
 
-    var tok = try Tokenizer.init(arena.allocator(), input, &diag);
+    var tok = Tokenizer.init(arena.allocator(), input, &diag) catch |e| {
+        try diag.printAll(writer, input);
+        return e;
+    };
     defer tok.deinit();
 
     var parser = Parser.init(arena.allocator(), &tok);
 
     const regex = parser.parseExpr(0) catch |e| {
-        // rethrow out of memory
-        if(e == error.OutOfMemory){
-            return error.OutOfMemory;
-        }
-
         try diag.printAll(writer, input);
         return e;
     };
@@ -3150,6 +3224,8 @@ test "parsing edge cases" {
     try expect(regex7.kind == Token.Kind.Char);
     try expect(regex7.chars[0] == RegExNFA.epsilon);
     try expect(regex7.chars[1] == RegExNFA.epsilon);
+
+    // 
 }
 
 test "parsing error messages" {
@@ -3163,42 +3239,71 @@ test "parsing error messages" {
       try expect(std.mem.containsAtLeast(u8, l.items, 1, "\n" ++ " " ** position));
       try expect(std.mem.count(u8, l.items, "\n" ++ " " ** (position + 1)) == 0);
       try expect(std.mem.containsAtLeast(u8, l.items, 1, "^" ++ "~" ** (length-1)));
+      // afterwards, clear the list, to prepare for the next test
+      l.clearRetainingCapacity();
     }
   }.f;
 
   const input1 = "a|||";
   try expectAnyError(compileInputStringAnyWriter(&arena, input1, list.writer()));
-
   // assert that the error message contains the correct message and indentation/position
   try expect(std.mem.containsAtLeast(u8, list.items, 1, "invalid token"));
-  try expectErrorCaretPosition(list, 2, 1);
-
-  list.clearRetainingCapacity();
+  try expectErrorCaretPosition(&list, 2, 1);
 
   const input2 = "a|";
   try expectAnyError(compileInputStringAnyWriter(&arena, input2, list.writer()));
-
   try expect(std.mem.containsAtLeast(u8, list.items, 1, "premature"));
-  try expectErrorCaretPosition(list, 2, 1);
+  try expectErrorCaretPosition(&list, 2, 1);
 
   const input3 = "a|b|";
   try expectAnyError(compileInputStringAnyWriter(&arena, input3, list.writer()));
-
   try expect(std.mem.containsAtLeast(u8, list.items, 1, "premature"));
-  try expectErrorCaretPosition(list, 4, 1);
+  try expectErrorCaretPosition(&list, 4, 1);
 
-  list.clearRetainingCapacity();
-  const input4 = "[z-y]"; // missing closing bracket
+  const input4 = "[z-y]";
   try expectAnyError(compileInputStringAnyWriter(&arena, input4, list.writer()));
-
   try expect(std.mem.containsAtLeast(u8, list.items, 1, "semantically invalid range"));
-  try expectErrorCaretPosition(list, 1, 3);
+  try expectErrorCaretPosition(&list, 1, 3);
 
-  list.clearRetainingCapacity();
-  const input5 = ""; // empty input
+  const input5 = "[][";
   try expectAnyError(compileInputStringAnyWriter(&arena, input5, list.writer()));
+  try expect(std.mem.containsAtLeast(u8, list.items, 1, "unmatched"));
+  try expectErrorCaretPosition(&list, 2, 1);
 
+  const input5a = "[a[";
+  try expectAnyError(compileInputStringAnyWriter(&arena, input5a, list.writer()));
+  try expect(std.mem.containsAtLeast(u8, list.items, 1, "unmatched"));
+  try expectErrorCaretPosition(&list, 0, 3);
+
+  const input6 = ""; // empty input
+  try expectAnyError(compileInputStringAnyWriter(&arena, input6, list.writer()));
   try expect(std.mem.containsAtLeast(u8, list.items, 1, "premature"));
+  try expectErrorCaretPosition(&list, 0, 1);
+
+  // escapes nothing -> invalid
+  const input7 = "\\";
+  try expectAnyError(compileInputStringAnyWriter(&arena, input7, list.writer()));
+  try expect(std.mem.containsAtLeast(u8, list.items, 1, "premature"));
+  try expectErrorCaretPosition(&list, 1, 1);
+
+  // now with escaping and concatenations to mess up the token indices and see that the syntax error is still at teh correct position
+  // double escape (\\\\) is for a literal \ in the matching. But the regex source still has two \, so keep that in mind for the caret position
+  const input2a = "\\\\a|";
+  try expectAnyError(compileInputStringAnyWriter(&arena, input2a, list.writer()));
+  try expectErrorCaretPosition(&list, 4, 1);
+
+  const input3a = "abc\\\\a|\\\\|";
+  try expectAnyError(compileInputStringAnyWriter(&arena, input3a, list.writer()));
+  try expectErrorCaretPosition(&list, 10, 1);
+
+  const input4a = "[\\\\z-yabc]xyz";
+  try expectAnyError(compileInputStringAnyWriter(&arena, input4a, list.writer()));
+  try expectErrorCaretPosition(&list, 3, 3);
+  
+  // this is essentially the same as [xabc[
+  const input5b = "[\\]abc[";
+  try expectAnyError(compileInputStringAnyWriter(&arena, input5b, list.writer()));
+  try expectErrorCaretPosition(&list, 0, 6);
 }
 
 
@@ -3293,7 +3398,7 @@ test "parsing char groups" {
         }
     }
 
-    const input5 = "[a-d]|e|[b-falzxk]";
+    const input5 = "[a-d]|e|[b-fal\\[\\]\\-\\\\zx|()k]";
     const regex5 = try Parser.parseNoDiagnostic(std.testing.allocator, input5);
     defer regex5.deinit();
     try regex5.traverse(isOnlyCharGroup);
