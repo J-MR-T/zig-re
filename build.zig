@@ -37,6 +37,9 @@ pub fn build(b: *std.Build) !void {
     const run_fresh_step = std.Build.Step.Run.create(b, "run fresh");
     run_fresh_step.addArtifactArg(exe);
 
+    if(b.args) |args|
+        run_fresh_step.addArgs(args);
+
     b.step("run", "runs zig-re's main (currently just for testing purposes)").dependOn(&run_fresh_step.step);
 
     const test_step = b.step("test", "Run unit tests");

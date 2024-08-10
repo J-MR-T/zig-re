@@ -4052,12 +4052,88 @@ test "fadec basic functionality and abstractions" {
     try expect(std.mem.eql(u8, buf[0..length], buf[length..2*length]));
 }
 
+pub fn performanceEvaluationCLI(regexPattern:[]const u8, stringToMatch:[:0]const u8) !void {
+    const compileIterations = 1_000;
+    const runIterations = 1_000;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+
+    const writer = std.io.getStdOut().writer();
+
+    var compileTimeStart = std.os.linux.timespec{.tv_sec = undefined, .tv_nsec = undefined};
+    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &compileTimeStart);
+
+    for(0..compileIterations) |_|
+        _ = try compileInputString(&arena, regexPattern, .{});
+
+    var compileTimeEnd = std.os.linux.timespec{.tv_sec = undefined, .tv_nsec = undefined};
+    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &compileTimeEnd);
+
+    const compiledDFA = try compileInputString(&arena, regexPattern, .{});
+
+    try writer.print("Compiled successfully...\r", .{});
+
+    var runTimeStart = std.os.linux.timespec{.tv_sec = undefined, .tv_nsec = undefined};
+    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &runTimeStart);
+    for(0..runIterations) |_|
+        _ = compiledDFA.isInLanguageCompiled(stringToMatch);
+    var runTimeEnd = std.os.linux.timespec{.tv_sec = undefined, .tv_nsec = undefined};
+    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &runTimeEnd);
+
+    const result = compiledDFA.isInLanguageCompiled(stringToMatch);
+
+    try writer.print("Does \'{s}\' match the regex '{s}'? {}\n", .{stringToMatch, regexPattern, result});
+
+    const compileTime:f64 = (@as(f64, @floatFromInt(compileTimeEnd.tv_sec - compileTimeStart.tv_sec)) + 1e-9*@as(f64, @floatFromInt(compileTimeEnd.tv_nsec - compileTimeStart.tv_nsec)))/@as(f64, compileIterations);
+    const runTime:f64 = (@as(f64, @floatFromInt(runTimeEnd.tv_sec - runTimeStart.tv_sec)) + 1e-9*@as(f64, @floatFromInt(runTimeEnd.tv_nsec - runTimeStart.tv_nsec)))/@as(f64, runIterations);
+    try writer.print("average compile-time over {} compiles: {d:10.12}\n", .{compileIterations, compileTime});
+    try writer.print("average run-time over {} runs: {d:10.12}\n", .{runIterations, runTime});
+}
+
+fn performanceEvaluationMain() !void {
+    // read from args, call performanceEvaluationCLI
+
+    const printUsage = struct {
+        fn f(invocation:[]const u8) noreturn {
+            const stderr = std.io.getStdErr().writer();
+            stderr.print("Usage: {s} <regex> <file or string>\n", .{invocation}) catch {};
+            std.os.linux.exit(1);
+        }
+    }.f;
+
+    var args = std.process.args();
+    
+    const invocation = args.next() orelse printUsage("zig-re");
+    const regexPattern = args.next() orelse printUsage(invocation);
+    const fileOrStringToMatch = args.next() orelse printUsage(invocation);
+    if(args.next() != null)
+        printUsage(invocation);
+
+    const file = std.fs.cwd().openFile(fileOrStringToMatch, .{}) catch {
+        // in this case its a normal string
+        try performanceEvaluationCLI(regexPattern, fileOrStringToMatch);
+        return;
+    };
+    defer file.close();
+
+    var buf = try file.readToEndAlloc(cAllocer, 1 << 31);
+    defer cAllocer.free(buf);
+
+    buf = try cAllocer.realloc(buf, buf.len + 1);
+    buf[buf.len - 1] = 0;
+
+    try performanceEvaluationCLI(regexPattern, @as([:0]const u8, @ptrCast(buf)));
+}
+
 pub fn main() !void {
+    try performanceEvaluationMain();
+
     //const writer = std.io.getStdOut().writer();
     //_ = writer;
 
-    var arena = std.heap.ArenaAllocator.init(cAllocer);
-    defer arena.deinit();
+    //var arena = std.heap.ArenaAllocator.init(cAllocer);
+    //defer arena.deinit();
 
     //const input = "xyz|w*(abc)*de*f";
     //
@@ -4083,14 +4159,14 @@ pub fn main() !void {
     //try fa.printDOT(std.io.getStdOut().writer());
 
 
-    const input = "[z-a]";
+    //const input = "[z-a]";
     //var tok = try Tokenizer.init(cAllocer, input);
     //defer tok.deinit();
     //const regex = try Parser.init(cAllocer, &tok);
     //try regex.printDOTRoot(writer);
 
 
-    _ = compileInputString(&arena, input, .{}) catch {};
+    //_ = compileInputString(&arena, input, .{}) catch {};
 
 
     //var fa = FiniteAutomaton{.dfa = &dfa};
