@@ -2021,7 +2021,7 @@ const RegExDFA = struct{
     // for now, requires that the self-DFA has been allocated with an arena (and this arena has been passed), to be able to ensure the total code size will be < 2 GiB
     // for now, requires the original DFA to be live for the lifetime of the compiled DFA, because it needs to be able to access the final states
     // TODO there has to be a better way to do this comptime bool thing. A nullable profile info wouldn't generate a different function per bool value, i.e. cost a tiny bit of runtime performance (I think. Well actually one branch miss, maybe this was premature optimisation)
-    pub fn compile(self:@This(), arena:*std.heap.ArenaAllocator, comptime hasProfileInfo:bool, opts:struct{profileInfo:ProfilingInformation = undefined, comptime stopOnFinalState:bool = false}) CompilationError!CompiledRegExDFA{
+    pub fn compile(self:@This(), arena:*std.heap.ArenaAllocator, comptime hasProfileInfo:bool, opts:struct{profileInfo:ProfilingInformation = undefined}) CompilationError!CompiledRegExDFA{
         // there are different options for implementing the jumps to the next state, equivalent to the approaches for lowering switch statements:
         // let's try a linear if-else chain first (could later order this by estimated frequency of each transition, by profiling this on the interpreted version). Should be fastest for a low number of transitions per state 
         // - binary search based switching might be fastest, if the number of transitions per state is medium to high
