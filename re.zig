@@ -1,14 +1,20 @@
 const std = @import("std");
+const buildMode = @import("mode");
 const cAllocer = std.heap.c_allocator;
 const Allocator = std.mem.Allocator;
 fn assert(condition:bool, comptime message:[]const u8, args:anytype) void {
-    if (!condition) {
-        std.debug.print("\n-----------------------\nAssertion failed: " ++ message ++ "\n-----------------------\nTrace:\n", args);
-        unreachable;
+    if(buildMode.debug){
+        if (!condition) {
+            std.debug.print("\n-----------------------\nAssertion failed: " ++ message ++ "\n-----------------------\nTrace:\n", args);
+            unreachable;
+        }
     }
 }
 fn debugLog(comptime message:[]const u8, args:anytype) void {
     std.debug.print(message ++ "\n", args);
+}
+fn debugLogColor(comptime color:Termcolor, comptime message:[]const u8, args:anytype) void {
+    debugLog(color ++ message ++ Termcolors.Reset, args);
 }
 fn structFieldType(comptime T:type, comptime fieldIndex:comptime_int) type{
     return @typeInfo(T).Struct.fields[fieldIndex].type;
@@ -90,11 +96,14 @@ fn makeOrder(comptime T:type) fn (T, T) Order {
     }.f;
 }
 
-const Termcolor = struct{
+const Termcolor = [:0]const u8;
+const Termcolors = struct{
     const Reset = "\x1b[0m";
     // use the defaults from GCC
-    const Error = "\x1b[01;31m";
-    const Warning = "\x1b[01;35m";
+    const Red = "\x1b[01;31m";
+    const Error = Red;
+    const Magenta = "\x1b[01;35m";
+    const Warning = Magenta;
 };
 
 // sorted array set. Should not be used if removal is important, try to treat it as an insert-only set
@@ -1087,20 +1096,20 @@ const Diag =  struct{
             assert(startSourceInside <= endSource, "startSource has to be <= endSource", .{});
 
             const messageColor, const message = switch(msg.kind){
-                Msg.Kind.Error   => .{Termcolor.Error,   "Error"},
-                Msg.Kind.Warning => .{Termcolor.Warning, "Warning"},
+                Msg.Kind.Error   => .{Termcolors.Error,   "Error"},
+                Msg.Kind.Warning => .{Termcolors.Warning, "Warning"},
             };
 
             // these could all be one statement, but this is more readable
 
-            try writer.print("{s}{s}: " ++ Termcolor.Reset ++ "{s}\n", .{messageColor, message, msg.str});
+            try writer.print("{s}{s}: " ++ Termcolors.Reset ++ "{s}\n", .{messageColor, message, msg.str});
 
-            try writer.print("{s}{s}{s}{s}{s}\n", .{source[0..startSourceInside], messageColor, source[startSourceInside..endSource], Termcolor.Reset, source[endSource..source.len]});
+            try writer.print("{s}{s}{s}{s}{s}\n", .{source[0..startSourceInside], messageColor, source[startSourceInside..endSource], Termcolors.Reset, source[endSource..source.len]});
             
             try writer.writeByteNTimes(' ', startSource);
             try writer.print("{s}^", .{messageColor});
             try writer.writeByteNTimes('~', endSource-startSource-|1);
-            try writer.print(Termcolor.Reset ++ "\n", .{} );
+            try writer.print(Termcolors.Reset ++ "\n", .{} );
         }
     }
 };
@@ -1948,18 +1957,21 @@ const RegExDFA = struct{
     const CompilationError = error{DFATooLargeError, NotYetImplemented} || FeError || std.posix.MMapError;
 
     const CompiledRegExDFA = struct{
+        dfa:*const RegExDFA,
         jitBuf:[]u8,
-        finalStates:*const UniqueStateSet,
         recognize:*fn(*const UniqueStateSet, word:[:0] const u8) bool,
+        // TODO also assumes all states are reachable
+        onlyAvailableInDebugModeStartOfState:[]?*u8,
 
         pub fn isInLanguageCompiled(self:@This(), word:[:0] const u8) bool{
-            return self.recognize(self.finalStates, word);
+            return self.recognize(&self.dfa.finalStates, word);
         }
 
-        // finalStates obviously needs to have a lifetime that is at least as long as the compiled DFA
-        pub fn init(finalStates:*const UniqueStateSet) std.posix.MMapError!@This() {
+        // dfa obviously needs to have a lifetime that is at least as long as the compiled DFA
+        pub fn init(dfa:*const RegExDFA) std.posix.MMapError!@This() {
             // we just map 2 GiB by default, and mremap it later to the actual size
             return CompiledRegExDFA{
+                .dfa = dfa,
                 .jitBuf = try std.posix.mmap(
                     null,
                     1 << 31,
@@ -1968,8 +1980,8 @@ const RegExDFA = struct{
                     -1,
                     0,
                 ),
-                .finalStates = finalStates,
                 .recognize = undefined,
+                .onlyAvailableInDebugModeStartOfState = undefined,
             };
         } 
 
@@ -1977,33 +1989,75 @@ const RegExDFA = struct{
             self.jitBuf.len = shrunkSize;
             // call mremap through direct syscall, no zig bindings yet :(
             // (page align length first)
-            const alignedLen = std.mem.alignForward(usize, self.jitBuf.len, std.mem.page_size); // TODO this is just a 'minimum page size'
+            const alignedLen = std.mem.alignForward(usize, self.jitBuf.len, std.mem.page_size); // TODO std.mem.page_size is just a 'minimum page size'
 
             const ret = std.os.linux.syscall4(.mremap, @intFromPtr(self.jitBuf.ptr), 1 << 31, alignedLen, 0);
             if(ret < 0)
                 return error.MMapError;
 
             assert(ret == @intFromPtr(self.jitBuf.ptr), "mremap returned a different pointer than the one we passed, even though we should only be shrinking", .{});
-            //self.jitBuf.ptr = @ptrFromInt(ret);
         }
 
         pub fn deinit(self:@This()) void {
+            const allocer = self.dfa.internalAllocator;
             std.os.munmap(self.jitBuf.ptr, self.jitBuf.len);
+            if(hasStartOfState()){
+                debugLog("hoho", .{});
+                allocer.free(self.onlyAvailableInDebugModeStartOfState);
+            }
+            self.dfa.deinit();
+            allocer.free(self.dfa);
+        }
+
+        pub fn hasStartOfState() bool{
+            return buildMode.debug;
         }
 
         pub fn debugPrint(self:@This()) void {
-            debugLog("compiled DFA:", .{});
+            comptime if(!buildMode.debug)
+                @compileError("debugPrint called in non-debug mode");
+            // to output where each state in the DFA starts, we need to know the start of each state
+            // this is what self.onlyAvailableInDebugModeStartOfState is for
+            // so sort it by address, for more efficient access
+
+            const compare = keyCompare(Pair(*u8, u32), struct{
+                fn f(a:*u8, b:*u8) std.math.Order{
+                    return makeOrder(usize)(@intFromPtr(a), @intFromPtr(b));
+                }
+            }.f);
+            var startOfState = ArraySet(Pair(*u8, u32), compare).init(self.dfa.internalAllocator) catch unreachable;
+            defer startOfState.deinit();
+
+            // fill it
+            for(self.onlyAvailableInDebugModeStartOfState, 0..) |maybeStart, i| {
+                if(maybeStart) |start|
+                    startOfState.insert(.{start, @intCast(i)}, .{}) catch unreachable;
+            }
+
+            startOfState.sort();
+
+            assert(startOfState.items.len <= self.dfa.numStates, "startOfState contains too many states", .{});
+
+            debugLogColor(Termcolors.Magenta, "compiled DFA:", .{});
+
+            var startOfStateIndex:usize = 0;
 
             var cur = self.jitBuf.ptr;
             while(@intFromPtr(cur) < @intFromPtr(self.jitBuf.ptr) + self.jitBuf.len) {
                 if(@intFromPtr(cur) == @intFromPtr(self.recognize))
-                    debugLog("start of regognize:", .{});
+                    debugLogColor(Termcolors.Magenta, "start of recognize:", .{});
+
+                // if this is the start of a state, print the state number
+                if(startOfStateIndex < startOfState.items.len and startOfState.items[startOfStateIndex][0] == @as(*u8, @ptrCast(cur)) ) {
+                    debugLogColor(Termcolors.Magenta, "state {}:", .{startOfState.items[startOfStateIndex][1]});
+                    startOfStateIndex += 1;
+                }
 
                 var instr:fadec.FdInstr = undefined;
 
                 const numBytes = fadec.fd_decode(cur, self.jitBuf.len, 64, 0, &instr);
                 if(numBytes < 0){
-                    debugLog("error decoding instruction at byte: {}", .{numBytes});
+                    debugLogColor(Termcolors.Error, "error decoding instruction at byte: {}", .{numBytes});
                     return;
                 }
                 cur += oldIntCast(numBytes, usize);
@@ -2019,11 +2073,12 @@ const RegExDFA = struct{
     // TODO could the compilation somehow be SIMD-d? doing all the comparisons at once might be faster, but the branching and scalar/vector mixing might make it slower than normal
 
     // for now, requires that the self-DFA has been allocated with an arena (and this arena has been passed), to be able to ensure the total code size will be < 2 GiB
-    // for now, requires the original DFA to be live for the lifetime of the compiled DFA, because it needs to be able to access the final states
+    // this "consumes" the self dfa, in the sense that the compiled dfa now owns the self dfa, and will deinit it when it is deinitialized
     // TODO there has to be a better way to do this comptime bool thing. A nullable profile info wouldn't generate a different function per bool value, i.e. cost a tiny bit of runtime performance (I think. Well actually one branch miss, maybe this was premature optimisation)
-    pub fn compile(self:@This(), arena:*std.heap.ArenaAllocator, comptime hasProfileInfo:bool, opts:struct{profileInfo:ProfilingInformation = undefined}) CompilationError!CompiledRegExDFA{
+    // TODO add SIGSEGV signal handler when compiling in debug mode. This handler gives some info about where a crash happen
+    pub fn compile(self:*const @This(), arena:*std.heap.ArenaAllocator, comptime comptimeOpts:struct{checkFinalStatesAtCompileTime:bool = true, hasProfileInfo:bool = false}, opts:struct{profileInfo:ProfilingInformation = undefined}) CompilationError!CompiledRegExDFA{
         // there are different options for implementing the jumps to the next state, equivalent to the approaches for lowering switch statements:
-        // let's try a linear if-else chain first (could later order this by estimated frequency of each transition, by profiling this on the interpreted version). Should be fastest for a low number of transitions per state 
+        // let's try a linear if-else chain first (can later order this by estimated frequency of each transition, by profiling this on the interpreted version). Should be fastest for a low number of transitions per state 
         // - binary search based switching might be fastest, if the number of transitions per state is medium to high
         // - indirect jumps using hashtables might be fastest, if branch target buffer overflows aren't too common, or if the number of transitions per state is very high
 
@@ -2067,10 +2122,25 @@ const RegExDFA = struct{
             return error.DFATooLargeError;
 
 
-        var compiledDFA = try CompiledRegExDFA.init(&self.finalStates);
+        var compiledDFA = try CompiledRegExDFA.init(self);
 
         const buf = compiledDFA.jitBuf;
         var cur:[*]u8 = buf.ptr;
+
+        // some 'closures'
+        const encodeStackCleanup = struct{
+            fn f(curPtr:*[*]u8) !void {
+                try encode(curPtr, fadec.FE_ADD64ri, .{fadec.FE_SP, 8});
+            }
+        }.f;
+
+        const encodeStackCleanupReturnWithValue = struct{
+            fn f(curPtr:*[*]u8, value:bool) !void {
+                try encodeStackCleanup(curPtr);
+                try encode(curPtr, fadec.FE_MOV64ri, .{fadec.FE_AX, @intFromBool(value)});
+                try encode(curPtr, fadec.FE_RET, .{});
+            }
+        }.f;
 
         // setup
         // register layout (at the start, rsi contains the pointer to the word, but that is overridden immediately):
@@ -2083,27 +2153,58 @@ const RegExDFA = struct{
         // trap state -> return false
         const trapStatePtr = cur; 
 
-        try encode(&cur, fadec.FE_ADD64ri, .{fadec.FE_SP, 8});
-        try encode(&cur, fadec.FE_MOV64ri, .{fadec.FE_AX, @intFromBool(false)});
-        try encode(&cur, fadec.FE_RET, .{});
+        try encodeStackCleanupReturnWithValue(&cur, false);
 
         // same idea for the code for reaching the end of the word
         const checkFinalStatePtr = cur;
-        
-        // we basically need to do:
-        // return finalStates.contains(curState);
-        // so just call that function, and pass on its return value to the caller of our function
-        // we can do this even quicker by not even using a call, but just cleaning up our whole stackframe and jumping there immediately. Our return address will then be used by finalStates.contains to return to the proper place. Also keeps the CPU shadow call stack in tact.
 
-        // stack cleanup and "return" (by jumping to finalStates.contains)
-        try encode(&cur, fadec.FE_ADD64ri, .{fadec.FE_SP, 8});
-        // finalStates self arg is already in RDI, stays there from the call to this function
-        // real arg (the state to check) is implicitly already in RSI, the states that branch to this code segment put their own state number in RSI
+        if(!comptimeOpts.checkFinalStatesAtCompileTime){
+            // if we check the final states at run-time, we basically need to do:
+            // return finalStates.contains(curState);
+            // so just call that function, and pass on its return value to the caller of our function
+            // we can do this even quicker by not even using a call, but just cleaning up our whole stackframe and jumping there immediately. Our return address will then be used by finalStates.contains to return to the proper place. Also keeps the CPU shadow call stack in tact.
 
-        // mov rax, finalStates.contains
-        try encode(&cur, fadec.FE_MOV64ri, .{fadec.FE_AX, oldIntCast(@intFromPtr(&UniqueStateSet.contains), fadec.FeOp)});
-        // jmp rax
-        try encode(&cur, fadec.FE_JMPr, .{fadec.FE_AX});
+            // stack cleanup and "return" (by jumping to finalStates.contains)
+            try encodeStackCleanup(&cur);
+            // finalStates self arg is already in RDI, stays there from the call to this function
+            // real arg (the state to check) is implicitly already in RSI, the states that branch to this code segment put their own state number in RSI
+
+            // mov rax, finalStates.contains
+            try encode(&cur, fadec.FE_MOV64ri, .{fadec.FE_AX, oldIntCast(@intFromPtr(&UniqueStateSet.contains), fadec.FeOp)});
+            // jmp rax
+            try encode(&cur, fadec.FE_JMPr, .{fadec.FE_AX});
+        }
+
+        const encodeJumpToCheckFinalState = struct{
+            fn f(comptime jumpKind:FeMnem,
+                // everything after here is just closure stuff...
+                curPtr:*[*]u8, curState:u32, checkFinalStatePtr_:[*]u8, finalStates:UniqueStateSet) !void {
+                if(!comptimeOpts.checkFinalStatesAtCompileTime){
+                    // jump to the checkFinalStatePtr and move the current state into RSI
+                    // TODO instruction scheduling-wise: might make sense to put the mov at the start of the function (for better out of order execution), although it would cost a bit of decoding performance even if its not executed, which is not the case here. Test this
+                    try encode(curPtr, fadec.FE_MOV64ri, .{fadec.FE_SI, curState});
+                    try encode(curPtr, jumpKind, .{oldIntCast(@intFromPtr(checkFinalStatePtr_), fadec.FeOp)});
+                }else{
+                    const isFinal = finalStates.contains(curState);
+                    if(jumpKind == fadec.FE_JMP){
+                        // we're sure we've reached the end of the word, so we can just return the result of the final state check
+                        try encodeStackCleanupReturnWithValue(curPtr, isFinal);
+                    }else{
+                        // TODO this doesn't even make that much sense, because rn we're jumping to another jump with the patched conditional jump, we could just as well jump to the traps tate immediately
+
+                        // we're not sure, so we need to check
+                        const invertedJumpKind = comptime fadecInvertJumpKind(jumpKind);
+
+                        var jumpToPatch = curPtr.*;
+                        // no need for JMPL, we know the jump target is super close
+                        try encode(curPtr, invertedJumpKind, .{oldIntCast(@intFromPtr(curPtr.*), fadec.FeOp)});
+                        try encodeStackCleanupReturnWithValue(curPtr, isFinal);
+                        // patch the jump
+                        try encode(&jumpToPatch, invertedJumpKind, .{oldIntCast(@intFromPtr(curPtr.*), fadec.FeOp)});
+                    }
+                }
+            }
+        }.f;
 
         const recognizerFunctionEntryPtr = cur;
 
@@ -2126,14 +2227,21 @@ const RegExDFA = struct{
         @memset(scheduledForVisit, false);
         scheduledForVisit[self.startState] = true;
 
-        var startOfState = try self.internalAllocator.alloc(?*u8, self.numStates);
-        defer self.internalAllocator.free(startOfState);
+        var startOfState:[]?*u8 = try self.internalAllocator.alloc(?*u8, self.numStates);
+        // only free if its not in debug mode, otherwise, set the appropriate field in the compiled DFA
+        // cant set it inside the defer, because we've already returned at that point
+        defer if(!CompiledRegExDFA.hasStartOfState())
+                self.internalAllocator.free(startOfState);
+        if(CompiledRegExDFA.hasStartOfState())
+            compiledDFA.onlyAvailableInDebugModeStartOfState = startOfState;
+
         @memset(startOfState, null);
 
         var jumpsToPatch = try std.ArrayList(struct{instrToPatch:*u8, opcode:FeMnem, targetState:u32}).initCapacity(self.internalAllocator, self.numStates);
         defer jumpsToPatch.deinit();
 
         var worklistI:usize = 0;
+        assert(startOfState.len == self.numStates, "startOfState.len != self.numStates", .{});
         while(worklistI < self.numStates) : (worklistI += 1) {
             // TODO if there are any unreachable states, this will panic. unreachable states are impossible if generated from powerset construction, but still, this should be handled more gracefully
             const curState = worklist.items[worklistI];
@@ -2147,10 +2255,10 @@ const RegExDFA = struct{
 
 
             var curTransitionsOrdered:EntireTransitionMapOfAState = undefined;
-            defer if(hasProfileInfo) curTransitionsOrdered.deinit();
+            defer if(comptimeOpts.hasProfileInfo) curTransitionsOrdered.deinit();
 
             // if there is any - use the profiling info to sort the transitions
-            if(hasProfileInfo) {
+            if(comptimeOpts.hasProfileInfo) {
                 // TODO this functionality is probably quite slow overall in terms of compile-time, because of the cloning, sorting, etc.
                 curTransitionsOrdered = try self.transitions[curState].clone();
 
@@ -2209,12 +2317,8 @@ const RegExDFA = struct{
                     // if not zero: jump to target state 
                     // je targetState
                     try encodeMinimizedJump(&cur, &jumpsToPatch, startOfState, targetState, fadec.FE_JNZ);
-                    // otherwise it's zero, i.e. the end of the word (basically the same code as after the for loop, just without the trap state, and with an unconditional jump. Again @Zig, this is why you need local lambdas)
-                    // if we have, jump to the checkFinalStatePtr and move the current state into RSI
-                    // TODO instruction scheduling-wise: might make sense to put the mov at the start (for better out of order execution), although it would cost a bit of decoding performance even if its not executed, which is not the case here. Test this
-                    try encode(&cur, fadec.FE_MOV64ri, .{fadec.FE_SI, curState});
-                    try encode(&cur, fadec.FE_JMP, .{oldIntCast(@intFromPtr(checkFinalStatePtr), fadec.FeOp)});
-
+                    // otherwise it's zero, i.e. we have reached the end of the word (basically the same code as after the for loop, just without the trap state, and with an unconditional jump)
+                    try encodeJumpToCheckFinalState(fadec.FE_JMP, &cur, curState, checkFinalStatePtr, self.finalStates);
                     continue;
                 }
             }
@@ -2268,10 +2372,9 @@ const RegExDFA = struct{
 
             // check if we have reached the end of the word
             try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, 0});
-            // if we have, jump to the checkFinalStatePtr and move the current state into RSI
-            // TODO instruction scheduling-wise: might make sense to put the mov at the start (for better out of order execution), although it would cost a bit of decoding performance even if its not executed, which is not the case here. Test this
-            try encode(&cur, fadec.FE_MOV64ri, .{fadec.FE_SI, curState});
-            try encode(&cur, fadec.FE_JZ, .{oldIntCast(@intFromPtr(checkFinalStatePtr), fadec.FeOp)});
+
+            // if we have, check whether its a final state
+            try encodeJumpToCheckFinalState(fadec.FE_JZ, &cur, curState, checkFinalStatePtr, self.finalStates);
 
             // trap state
             try encode(&cur, fadec.FE_JMP, .{oldIntCast(@intFromPtr(trapStatePtr), fadec.FeOp)});
@@ -2288,11 +2391,13 @@ const RegExDFA = struct{
 
         return compiledDFA;
     }
+
+    const ComptimeCompileOpts = @typeInfo(@TypeOf(RegExDFA.compile)).Fn.params[2].type.?;
 };
 
 const FiniteAutomaton = union(enum){
-    dfa:*RegExDFA,
-    nfa:*RegExNFA,
+    dfa:*const RegExDFA,
+    nfa:*const RegExNFA,
 
     pub fn printDOT(self:FiniteAutomaton, writer:anytype) !void {
         try writer.print("digraph ", .{});
@@ -3028,7 +3133,7 @@ const RegExNFA = struct {
     }
 };
 
-pub fn compileInputStringAnyWriter(arena:*std.heap.ArenaAllocator, input: []const u8, writer:anytype) !RegExDFA.CompiledRegExDFA {
+pub fn compileInputStringAnyWriter(arena:*std.heap.ArenaAllocator, input: []const u8, comptime compileOpts:RegExDFA.ComptimeCompileOpts, writer:anytype) !RegExDFA.CompiledRegExDFA {
     var diag = Diag.init(arena.allocator());
     defer diag.deinit();
 
@@ -3040,18 +3145,21 @@ pub fn compileInputStringAnyWriter(arena:*std.heap.ArenaAllocator, input: []cons
 
     var parser = Parser.init(arena.allocator(), &tok);
 
-    const regex = parser.parseExpr(0) catch |e| {
+    var regex = parser.parseExpr(0) catch |e| {
         try diag.printAll(writer, input);
         return e;
     };
+    defer regex.deinit();
 
-    var dfa = try regex.toDFA(.{});
+    var dfa = try arena.allocator().create(RegExDFA);
+    dfa.* = try regex.toDFA(.{});
 
-    return dfa.compile(arena, false, .{});
+    return dfa.compile(arena, compileOpts, .{});
 }
 
-pub fn compileInputString(arena:*std.heap.ArenaAllocator, input: []const u8, comptime comptime_opts:struct{printErrors:bool = true}) !RegExDFA.CompiledRegExDFA {
-    return compileInputStringAnyWriter(arena, input, if(comptime_opts.printErrors) std.io.getStdErr().writer() else std.io.null_writer());
+// TODO would be nice to have a separate test for this, that checks that everything gets deinit-ed properly (not easy to do, because of the arena). Or, just remove all deinits, if we require an arena anyway?
+pub fn compileInputString(arena:*std.heap.ArenaAllocator, input: []const u8, comptime compileOpts:RegExDFA.ComptimeCompileOpts, comptime comptimeOpts:struct{printErrors:bool = true}) !RegExDFA.CompiledRegExDFA {
+    return compileInputStringAnyWriter(arena, input, compileOpts, comptime if(comptimeOpts.printErrors) std.io.getStdErr().writer() else std.io.null_writer());
 }
 
 fn eqlPairU8(a: Pair(u8,u8), b: Pair(u8,u8)) bool {
@@ -3060,6 +3168,7 @@ fn eqlPairU8(a: Pair(u8,u8), b: Pair(u8,u8)) bool {
 
 var emptyTestingDiag = Diag.init(std.heap.c_allocator);
 const emptyTestingDiagPtr = &emptyTestingDiag;
+const allPossibleCompileOpts = [_]RegExDFA.ComptimeCompileOpts{.{}, .{.checkFinalStatesAtCompileTime = true}};
 
 test "tokenizer" {
     const input = "xyz|w*(abc)*de*f";
@@ -3245,64 +3354,64 @@ test "parsing error messages" {
   }.f;
 
   const input1 = "a|||";
-  try expectAnyError(compileInputStringAnyWriter(&arena, input1, list.writer()));
+  try expectAnyError(compileInputStringAnyWriter(&arena, input1, .{}, list.writer()));
   // assert that the error message contains the correct message and indentation/position
   try expect(std.mem.containsAtLeast(u8, list.items, 1, "invalid token"));
   try expectErrorCaretPosition(&list, 2, 1);
 
   const input2 = "a|";
-  try expectAnyError(compileInputStringAnyWriter(&arena, input2, list.writer()));
+  try expectAnyError(compileInputStringAnyWriter(&arena, input2, .{}, list.writer()));
   try expect(std.mem.containsAtLeast(u8, list.items, 1, "premature"));
   try expectErrorCaretPosition(&list, 2, 1);
 
   const input3 = "a|b|";
-  try expectAnyError(compileInputStringAnyWriter(&arena, input3, list.writer()));
+  try expectAnyError(compileInputStringAnyWriter(&arena, input3, .{}, list.writer()));
   try expect(std.mem.containsAtLeast(u8, list.items, 1, "premature"));
   try expectErrorCaretPosition(&list, 4, 1);
 
   const input4 = "[z-y]";
-  try expectAnyError(compileInputStringAnyWriter(&arena, input4, list.writer()));
+  try expectAnyError(compileInputStringAnyWriter(&arena, input4, .{}, list.writer()));
   try expect(std.mem.containsAtLeast(u8, list.items, 1, "semantically invalid range"));
   try expectErrorCaretPosition(&list, 1, 3);
 
   const input5 = "[][";
-  try expectAnyError(compileInputStringAnyWriter(&arena, input5, list.writer()));
+  try expectAnyError(compileInputStringAnyWriter(&arena, input5, .{}, list.writer()));
   try expect(std.mem.containsAtLeast(u8, list.items, 1, "unmatched"));
   try expectErrorCaretPosition(&list, 2, 1);
 
   const input5a = "[a[";
-  try expectAnyError(compileInputStringAnyWriter(&arena, input5a, list.writer()));
+  try expectAnyError(compileInputStringAnyWriter(&arena, input5a, .{}, list.writer()));
   try expect(std.mem.containsAtLeast(u8, list.items, 1, "unmatched"));
   try expectErrorCaretPosition(&list, 0, 3);
 
   const input6 = ""; // empty input
-  try expectAnyError(compileInputStringAnyWriter(&arena, input6, list.writer()));
+  try expectAnyError(compileInputStringAnyWriter(&arena, input6, .{}, list.writer()));
   try expect(std.mem.containsAtLeast(u8, list.items, 1, "premature"));
   try expectErrorCaretPosition(&list, 0, 1);
 
   // escapes nothing -> invalid
   const input7 = "\\";
-  try expectAnyError(compileInputStringAnyWriter(&arena, input7, list.writer()));
+  try expectAnyError(compileInputStringAnyWriter(&arena, input7, .{}, list.writer()));
   try expect(std.mem.containsAtLeast(u8, list.items, 1, "premature"));
   try expectErrorCaretPosition(&list, 1, 1);
 
   // now with escaping and concatenations to mess up the token indices and see that the syntax error is still at teh correct position
   // double escape (\\\\) is for a literal \ in the matching. But the regex source still has two \, so keep that in mind for the caret position
   const input2a = "\\\\a|";
-  try expectAnyError(compileInputStringAnyWriter(&arena, input2a, list.writer()));
+  try expectAnyError(compileInputStringAnyWriter(&arena, input2a, .{}, list.writer()));
   try expectErrorCaretPosition(&list, 4, 1);
 
   const input3a = "abc\\\\a|\\\\|";
-  try expectAnyError(compileInputStringAnyWriter(&arena, input3a, list.writer()));
+  try expectAnyError(compileInputStringAnyWriter(&arena, input3a, .{}, list.writer()));
   try expectErrorCaretPosition(&list, 10, 1);
 
   const input4a = "[\\\\z-yabc]xyz";
-  try expectAnyError(compileInputStringAnyWriter(&arena, input4a, list.writer()));
+  try expectAnyError(compileInputStringAnyWriter(&arena, input4a, .{}, list.writer()));
   try expectErrorCaretPosition(&list, 3, 3);
   
   // this is essentially the same as [xabc[
   const input5b = "[\\]abc[";
-  try expectAnyError(compileInputStringAnyWriter(&arena, input5b, list.writer()));
+  try expectAnyError(compileInputStringAnyWriter(&arena, input5b, .{}, list.writer()));
   try expectErrorCaretPosition(&list, 0, 6);
 }
 
@@ -3592,34 +3701,36 @@ test "xyz|w*(abc)*de*f regex to dfa compiled" {
     var dfa = try regex.toDFA(.{});
     try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
 
-    const compiledDFA = try dfa.compile(&arena, false, .{});
+    inline for (allPossibleCompileOpts) |compileOpts| {
+        const compiledDFA = try dfa.compile(&arena, compileOpts, .{});
 
-    const xyzTestCases = struct{
-        fn xyzTestCases(ddfa:anytype, checkFn:anytype) !void {
-            try expect(checkFn(ddfa, "xyz"));
+        const xyzTestCases = struct{
+            fn xyzTestCases(ddfa:anytype, checkFn:anytype) !void {
+                try expect(checkFn(ddfa, "xyz"));
 
-            try expect(!checkFn(ddfa, "xz"));
-            try expect(!checkFn(ddfa, "xy"));
-            try expect(!checkFn(ddfa, "x"));
-            try expect(!checkFn(ddfa, "y"));
-            try expect(!checkFn(ddfa, "z"));
+                try expect(!checkFn(ddfa, "xz"));
+                try expect(!checkFn(ddfa, "xy"));
+                try expect(!checkFn(ddfa, "x"));
+                try expect(!checkFn(ddfa, "y"));
+                try expect(!checkFn(ddfa, "z"));
 
-            try expect(checkFn(ddfa, "wwwwwwwwdf"));
-            try expect(checkFn(ddfa, "df"));
-            try expect(checkFn(ddfa, "deef"));
-            try expect(checkFn(ddfa, "wabcabcdeeef"));
-            try expect(checkFn(ddfa, "wwwwabcabcabcdeeef"));
+                try expect(checkFn(ddfa, "wwwwwwwwdf"));
+                try expect(checkFn(ddfa, "df"));
+                try expect(checkFn(ddfa, "deef"));
+                try expect(checkFn(ddfa, "wabcabcdeeef"));
+                try expect(checkFn(ddfa, "wwwwabcabcabcdeeef"));
 
-            try expect(!checkFn(ddfa, "wwwwacabcabcdeeef"));
-            try expect(!checkFn(ddfa, "xyz" ++ "wwwwwwwwdf"));
-            try expect(!checkFn(ddfa, "xyz" ++ "df"));
-            try expect(!checkFn(ddfa, "xyz" ++ "wabcabcdeeef"));
-            try expect(!checkFn(ddfa, "xyz" ++ "wwwwabcabcabcdeeef"));
-        }
-    }.xyzTestCases;
+                try expect(!checkFn(ddfa, "wwwwacabcabcdeeef"));
+                try expect(!checkFn(ddfa, "xyz" ++ "wwwwwwwwdf"));
+                try expect(!checkFn(ddfa, "xyz" ++ "df"));
+                try expect(!checkFn(ddfa, "xyz" ++ "wabcabcdeeef"));
+                try expect(!checkFn(ddfa, "xyz" ++ "wwwwabcabcabcdeeef"));
+            }
+        }.xyzTestCases;
 
-    try xyzTestCases(dfa, RegExDFA.isInLanguageInterpreted);
-    try xyzTestCases(compiledDFA, RegExDFA.CompiledRegExDFA.isInLanguageCompiled);
+        try xyzTestCases(dfa, RegExDFA.isInLanguageInterpreted);
+        try xyzTestCases(compiledDFA, RegExDFA.CompiledRegExDFA.isInLanguageCompiled);
+    }
 }
 
 test "x[yz]|[.]w*([a-c])*de*[f-i] regex to dfa compiled" {
@@ -3634,21 +3745,22 @@ test "x[yz]|[.]w*([a-c])*de*[f-i] regex to dfa compiled" {
     var dfa = try regex.toDFA(.{});
     try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
 
-    var compiledDFA = try dfa.compile(&arena, false, .{});
+    inline for (allPossibleCompileOpts) |compileOpts| {
+        var compiledDFA = try dfa.compile(&arena, compileOpts, .{});
 
-    
-    try expect(compiledDFA.isInLanguageCompiled("xz"));
-    try expect(compiledDFA.isInLanguageCompiled("xy"));
-    try expect(!compiledDFA.isInLanguageCompiled("xyz"));
-    try expect(!compiledDFA.isInLanguageCompiled("y"));
-    try expect(!compiledDFA.isInLanguageCompiled("z"));
-    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdg"));
-    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeeg"));
-    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeei"));
-    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeef"));
-    try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeefi"));
-    try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeefig"));
-    try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdfig"));
+        try expect(compiledDFA.isInLanguageCompiled("xz"));
+        try expect(compiledDFA.isInLanguageCompiled("xy"));
+        try expect(!compiledDFA.isInLanguageCompiled("xyz"));
+        try expect(!compiledDFA.isInLanguageCompiled("y"));
+        try expect(!compiledDFA.isInLanguageCompiled("z"));
+        try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdg"));
+        try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeeg"));
+        try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeei"));
+        try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeef"));
+        try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeefi"));
+        try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeefig"));
+        try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdfig"));
+    }
 }
 
 test "simple anychar" {
@@ -3661,42 +3773,44 @@ test "simple anychar" {
 
     var dfa = try regex.toDFA(.{});
 
-    var compiledDFA = try dfa.compile(&arena, false, .{});
+    inline for (allPossibleCompileOpts) |compileOpts| {
+        var compiledDFA = try dfa.compile(&arena, compileOpts, .{});
 
-    for(1..255) |c| {
-        const input:[:0]const u8 = &[1:0]u8{@intCast(c)};
-        try expect(compiledDFA.isInLanguageCompiled(input));
-        try expect(dfa.isInLanguageInterpreted(input));
-    }
-
-    const input2 = ".a|..";
-
-    const regex2 = try Parser.parseNoDiagnostic(arena.allocator(), input2);
-
-    var dfa2 = try regex2.toDFA(.{});
-
-    var compiledDFA2 = try dfa2.compile(&arena, false, .{});
-
-    for(1..255) |c1| {
-        for(1..255) |c2| {
-            const input:[:0]const u8 = &[2:0]u8{@intCast(c1), @intCast(c2)};
-            try expect(compiledDFA2.isInLanguageCompiled(input));
-            try expect(dfa2.isInLanguageInterpreted(input));
+        for(1..255) |c| {
+            const input:[:0]const u8 = &[1:0]u8{@intCast(c)};
+            try expect(compiledDFA.isInLanguageCompiled(input));
+            try expect(dfa.isInLanguageInterpreted(input));
         }
-    }
 
-    const input3 = "a|.|[b-f]";
+        const input2 = ".a|..";
 
-    const regex3 = try Parser.parseNoDiagnostic(arena.allocator(), input3);
+        const regex2 = try Parser.parseNoDiagnostic(arena.allocator(), input2);
 
-    var dfa3 = try regex3.toDFA(.{});
+        var dfa2 = try regex2.toDFA(.{});
 
-    var compiledDFA3 = try dfa3.compile(&arena, false, .{});
+        var compiledDFA2 = try dfa2.compile(&arena, compileOpts, .{});
 
-    for(1..255) |c| {
-        const input:[:0]const u8 = &[1:0]u8{@intCast(c)};
-        try expect(compiledDFA3.isInLanguageCompiled(input));
-        try expect(dfa3.isInLanguageInterpreted(input));
+        for(1..255) |c1| {
+            for(1..255) |c2| {
+                const input:[:0]const u8 = &[2:0]u8{@intCast(c1), @intCast(c2)};
+                try expect(compiledDFA2.isInLanguageCompiled(input));
+                try expect(dfa2.isInLanguageInterpreted(input));
+            }
+        }
+
+        const input3 = "a|.|[b-f]";
+
+        const regex3 = try Parser.parseNoDiagnostic(arena.allocator(), input3);
+
+        var dfa3 = try regex3.toDFA(.{});
+
+        var compiledDFA3 = try dfa3.compile(&arena, compileOpts, .{});
+
+        for(1..255) |c| {
+            const input:[:0]const u8 = &[1:0]u8{@intCast(c)};
+            try expect(compiledDFA3.isInLanguageCompiled(input));
+            try expect(dfa3.isInLanguageInterpreted(input));
+        }
     }
 }
 
@@ -3712,24 +3826,25 @@ test "x[yz]|.w*([a-c])*.e*[f-i] regex to dfa compiled" {
     var dfa = try regex.toDFA(.{});
     try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
 
-    var compiledDFA = try dfa.compile(&arena, false, .{});
+    inline for (allPossibleCompileOpts) |compileOpts| {
+        var compiledDFA = try dfa.compile(&arena, compileOpts, .{});
 
-
-    try expect(compiledDFA.isInLanguageCompiled("xz"));
-    try expect(compiledDFA.isInLanguageCompiled("xy"));
-    try expect(!compiledDFA.isInLanguageCompiled("xyz"));
-    try expect(!compiledDFA.isInLanguageCompiled("y"));
-    try expect(!compiledDFA.isInLanguageCompiled("z"));
-    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdg"));
-    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeeg"));
-    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeei"));
-    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeef"));
-    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabeeef"));
-    try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabf"));
-    try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcafe"));
-    try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeefi"));
-    try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeefig"));
-    try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdfig"));
+        try expect(compiledDFA.isInLanguageCompiled("xz"));
+        try expect(compiledDFA.isInLanguageCompiled("xy"));
+        try expect(!compiledDFA.isInLanguageCompiled("xyz"));
+        try expect(!compiledDFA.isInLanguageCompiled("y"));
+        try expect(!compiledDFA.isInLanguageCompiled("z"));
+        try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdg"));
+        try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeeg"));
+        try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeei"));
+        try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeef"));
+        try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabeeef"));
+        try expect(compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabf"));
+        try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcafe"));
+        try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeefi"));
+        try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdeefig"));
+        try expect(!compiledDFA.isInLanguageCompiled(".abcaaaaccbbcabccbabbcabcabacbbcabdfig"));
+    }
 }
 
 test "x?[yz]+|.?w+ regex to dfa compiled" {
@@ -3744,21 +3859,23 @@ test "x?[yz]+|.?w+ regex to dfa compiled" {
     var dfa = try regex.toDFA(.{});
     try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
 
-    var compiledDFA = try dfa.compile(&arena, false, .{});
+    inline for (allPossibleCompileOpts) |compileOpts| {
+        var compiledDFA = try dfa.compile(&arena, compileOpts, .{});
 
 
-    try expect(compiledDFA.isInLanguageCompiled("xz"));
-    try expect(compiledDFA.isInLanguageCompiled("xy"));
-    try expect(compiledDFA.isInLanguageCompiled("y"));
-    try expect(compiledDFA.isInLanguageCompiled("z"));
-    try expect(compiledDFA.isInLanguageCompiled("xyz"));
-    try expect(!compiledDFA.isInLanguageCompiled("x"));
+        try expect(compiledDFA.isInLanguageCompiled("xz"));
+        try expect(compiledDFA.isInLanguageCompiled("xy"));
+        try expect(compiledDFA.isInLanguageCompiled("y"));
+        try expect(compiledDFA.isInLanguageCompiled("z"));
+        try expect(compiledDFA.isInLanguageCompiled("xyz"));
+        try expect(!compiledDFA.isInLanguageCompiled("x"));
 
-    try expect(!compiledDFA.isInLanguageCompiled(""));
+        try expect(!compiledDFA.isInLanguageCompiled(""));
 
-    try expect(compiledDFA.isInLanguageCompiled("\x02wwww"));
-    try expect(compiledDFA.isInLanguageCompiled("aw"));
-    try expect(compiledDFA.isInLanguageCompiled("w"));
+        try expect(compiledDFA.isInLanguageCompiled("\x02wwww"));
+        try expect(compiledDFA.isInLanguageCompiled("aw"));
+        try expect(compiledDFA.isInLanguageCompiled("w"));
+    }
 }
 
 test "eps-only/empty string regex" {
@@ -3777,18 +3894,20 @@ test "eps-only/empty string regex" {
     var dfa = try regex.toDFA(.{});
     try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
 
-    var compiledDFA = try dfa.compile(&arena, false, .{});
+    inline for (allPossibleCompileOpts) |compileOpts| {
+        var compiledDFA = try dfa.compile(&arena, compileOpts, .{});
 
-    try expect(dfa.isInLanguageInterpreted(""));
-    try expect(compiledDFA.isInLanguageCompiled(""));
-    for(1..255) |c| {
-        const str:[:0]const u8 = &[_:0]u8{@intCast(c)};
-        try expect(!dfa.isInLanguageInterpreted(str));
-        try expect(!compiledDFA.isInLanguageCompiled(str));
+        try expect(dfa.isInLanguageInterpreted(""));
+        try expect(compiledDFA.isInLanguageCompiled(""));
+        for(1..255) |c| {
+            const str:[:0]const u8 = &[_:0]u8{@intCast(c)};
+            try expect(!dfa.isInLanguageInterpreted(str));
+            try expect(!compiledDFA.isInLanguageCompiled(str));
+        }
     }
 }
 
-test "single char regex to dfa" {
+test "single char regexes to dfa" {
     const input1 = "x";
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3797,52 +3916,50 @@ test "single char regex to dfa" {
     const regex = try Parser.parseNoDiagnostic(arena.allocator(), input1);
     try expect(regex.internalAllocator.ptr == arena.allocator().ptr);
 
-    var dfa = try regex.toDFA(.{});
-    try expect(dfa.internalAllocator.ptr == arena.allocator().ptr);
+    inline for (allPossibleCompileOpts) |compileOpts| {
+        var compiledDFA = try compileInputString(&arena, input1, compileOpts, .{});
+        const dfa = compiledDFA.dfa;
 
-    var compiledDFA = try dfa.compile(&arena, false, .{});
+        try expect(compiledDFA.isInLanguageCompiled("x"));
+        try expect(dfa.isInLanguageInterpreted("x"));
 
-    try expect(compiledDFA.isInLanguageCompiled("x"));
-    try expect(dfa.isInLanguageInterpreted("x"));
+        try expect(!compiledDFA.isInLanguageCompiled(""));
+        try expect(!dfa.isInLanguageInterpreted(""));
+        try expect(!compiledDFA.isInLanguageCompiled("y"));
+        try expect(!dfa.isInLanguageInterpreted("y"));
+        try expect(!compiledDFA.isInLanguageCompiled("w"));
+        try expect(!dfa.isInLanguageInterpreted("w"));
 
-    try expect(!compiledDFA.isInLanguageCompiled(""));
-    try expect(!dfa.isInLanguageInterpreted(""));
-    try expect(!compiledDFA.isInLanguageCompiled("y"));
-    try expect(!dfa.isInLanguageInterpreted("y"));
-    try expect(!compiledDFA.isInLanguageCompiled("w"));
-    try expect(!dfa.isInLanguageInterpreted("w"));
+        // now with ranges
+        const input2 = "[b-f]";
+        compiledDFA = try compileInputString(&arena, input2, compileOpts, .{});
 
-    // now with ranges
-    const input2 = "[b-f]";
-    compiledDFA = try compileInputString(&arena, input2, .{});
+        try expect(!compiledDFA.isInLanguageCompiled("a"));
+        try expect(compiledDFA.isInLanguageCompiled("b"));
+        try expect(compiledDFA.isInLanguageCompiled("c"));
+        try expect(compiledDFA.isInLanguageCompiled("d"));
+        try expect(compiledDFA.isInLanguageCompiled("e"));
+        try expect(compiledDFA.isInLanguageCompiled("f"));
+        try expect(!compiledDFA.isInLanguageCompiled("g"));
 
-    try expect(!compiledDFA.isInLanguageCompiled("a"));
-    try expect(compiledDFA.isInLanguageCompiled("b"));
-    try expect(compiledDFA.isInLanguageCompiled("c"));
-    try expect(compiledDFA.isInLanguageCompiled("d"));
-    try expect(compiledDFA.isInLanguageCompiled("e"));
-    try expect(compiledDFA.isInLanguageCompiled("f"));
-    try expect(!compiledDFA.isInLanguageCompiled("g"));
-
-    // now with ranges that include eps
-    const input3 = "[\x00-x]";
-    dfa = try (try Parser.parseNoDiagnostic(arena.allocator(), input3)).toDFA(.{});
-
-    // compile anew
-    compiledDFA = try dfa.compile(&arena, false, .{});
-    try expect(compiledDFA.isInLanguageCompiled(""));
-    for(1..'x') |c| {
-        const str:[:0]const u8 = &[_:0]u8{@intCast(c)};
-        try expect(compiledDFA.isInLanguageCompiled(str));
-    }
-    for('y'..255) |c| {
-        const str:[:0]const u8 = &[_:0]u8{@intCast(c)};
-        try expect(!compiledDFA.isInLanguageCompiled(str));
-    }
-    for(1..255) |c1| {
-        for(1..255) |c2| {
-            const str:[:0]const u8 = &[_:0]u8{@intCast(c1), @intCast(c2)};
+        // now with ranges that include eps
+        const input3 = "[\x00-x]";
+        // compile anew
+        compiledDFA = try compileInputString(&arena, input3, compileOpts, .{});
+        try expect(compiledDFA.isInLanguageCompiled(""));
+        for(1..'x') |c| {
+            const str:[:0]const u8 = &[_:0]u8{@intCast(c)};
+            try expect(compiledDFA.isInLanguageCompiled(str));
+        }
+        for('y'..255) |c| {
+            const str:[:0]const u8 = &[_:0]u8{@intCast(c)};
             try expect(!compiledDFA.isInLanguageCompiled(str));
+        }
+        for(1..255) |c1| {
+            for(1..255) |c2| {
+                const str:[:0]const u8 = &[_:0]u8{@intCast(c1), @intCast(c2)};
+                try expect(!compiledDFA.isInLanguageCompiled(str));
+            }
         }
     }
 }
@@ -3868,50 +3985,51 @@ test "nfas with ranges compiled" {
     _ =try nfa.designateStatesFinal(&[_]u32{3});
 
     try nfa.backUpEpsTransitions(); // technically unnecessary, but just to test it
-    var dfa = try nfa.toPowersetConstructedDFA(.{});
+    const dfa = try nfa.toPowersetConstructedDFA(.{});
 
     //const fa = FiniteAutomaton{.dfa = &dfa};
     //try fa.printDOT(std.io.getStdOut().writer());
 
-    var compiled = try dfa.compile(&arena, false, .{});
-    
+    inline for (allPossibleCompileOpts) |compileOpts| {
+        var compiled = try dfa.compile(&arena, compileOpts, .{});
 
-    // tests
-    for(1..'z') |c| {
-        // holy shit is that an annoying way to initialize 'c', '\0' ...
-        const str:[:0]const u8 = &[_:0]u8{@intCast(c)};
-        try expect(!dfa.isInLanguageInterpreted(str));
-        try expect(!compiled.isInLanguageCompiled(str));
-    }
+        // tests
+        for(1..'z') |c| {
+            // holy shit is that an annoying way to initialize 'c', '\0' ...
+            const str:[:0]const u8 = &[_:0]u8{@intCast(c)};
+            try expect(!dfa.isInLanguageInterpreted(str));
+            try expect(!compiled.isInLanguageCompiled(str));
+        }
 
-    for('a'..'z') |c1| {
-        for('0'..'5') |c2| {
-            const str:[:0]const u8 = &[_:0]u8{@intCast(c1), @intCast(c2)};
-            if(c1 == 'a'){
-                try expect(!dfa.isInLanguageInterpreted(str));
-                try expect(!compiled.isInLanguageCompiled(str));
-            }else{
+        for('a'..'z') |c1| {
+            for('0'..'5') |c2| {
+                const str:[:0]const u8 = &[_:0]u8{@intCast(c1), @intCast(c2)};
+                if(c1 == 'a'){
+                    try expect(!dfa.isInLanguageInterpreted(str));
+                    try expect(!compiled.isInLanguageCompiled(str));
+                }else{
+                    try expect(dfa.isInLanguageInterpreted(str));
+                    try expect(compiled.isInLanguageCompiled(str));
+                }
+            }
+            for('5'..('9'+1)) |c2| {
+                const str:[:0]const u8 = &[_:0]u8{@intCast(c1), @intCast(c2)};
                 try expect(dfa.isInLanguageInterpreted(str));
                 try expect(compiled.isInLanguageCompiled(str));
             }
         }
-        for('5'..('9'+1)) |c2| {
-            const str:[:0]const u8 = &[_:0]u8{@intCast(c1), @intCast(c2)};
-            try expect(dfa.isInLanguageInterpreted(str));
-            try expect(compiled.isInLanguageCompiled(str));
-        }
-    }
 
-    for('A'..'Z') |c1| {
-        for('0'..'5') |c2| {
-            const str:[:0]const u8 = &[_:0]u8{@intCast(c1), @intCast(c2)};
-            try expect(!dfa.isInLanguageInterpreted(str));
-            try expect(!compiled.isInLanguageCompiled(str));
-        }
-        for('5'..('9'+1)) |c2| {
-            const str:[:0]const u8 = &[_:0]u8{@intCast(c1), @intCast(c2)};
-            try expect(dfa.isInLanguageInterpreted(str));
-            try expect(compiled.isInLanguageCompiled(str));
+        for('A'..'Z') |c1| {
+            for('0'..'5') |c2| {
+                const str:[:0]const u8 = &[_:0]u8{@intCast(c1), @intCast(c2)};
+                try expect(!dfa.isInLanguageInterpreted(str));
+                try expect(!compiled.isInLanguageCompiled(str));
+            }
+            for('5'..('9'+1)) |c2| {
+                const str:[:0]const u8 = &[_:0]u8{@intCast(c1), @intCast(c2)};
+                try expect(dfa.isInLanguageInterpreted(str));
+                try expect(compiled.isInLanguageCompiled(str));
+            }
         }
     }
 }
@@ -3951,16 +4069,18 @@ test "regex dfa profiling" {
         }
     }
 
-    const compiled = try dfa.compile(&arena, true, .{.profileInfo = profileInfo});
-    const startOfRecognize:[*]u8 = @ptrCast(compiled.recognize);
-    // if the profiling has worked right, the first comparison should be comparing to x, i.e. the start of the recognize function should be:
-    // sub rsp, 0x8
-    // mov rax, rsi
-    // mov cl, byte ptr [rax]
-    // add rax, 0x1
-    // cmp cl, 0x78; this compares to 'x'
-    // -> check this
-    try expect(std.mem.eql(u8, startOfRecognize[0..16], "\x48\x83\xEC\x08\x48\x89\xF0\x8A\x08\x48\x83\xC0\x01\x80\xF9\x78"));
+    inline for ([_]RegExDFA.ComptimeCompileOpts{.{.checkFinalStatesAtCompileTime = true, .hasProfileInfo = true}, .{.checkFinalStatesAtCompileTime = false, .hasProfileInfo = true}}) |compileOpts| {
+        const compiled = try dfa.compile(&arena, compileOpts, .{.profileInfo = profileInfo});
+        const startOfRecognize:[*]u8 = @ptrCast(compiled.recognize);
+        // if the profiling has worked right, the first comparison should be comparing to x, i.e. the start of the recognize function should be:
+        // sub rsp, 0x8
+        // mov rax, rsi
+        // mov cl, byte ptr [rax]
+        // add rax, 0x1
+        // cmp cl, 0x78; this compares to 'x'
+        // -> check this
+        try expect(std.mem.eql(u8, startOfRecognize[0..16], "\x48\x83\xEC\x08\x48\x89\xF0\x8A\x08\x48\x83\xC0\x01\x80\xF9\x78"));
+    }
 }
 
 test "regex range dfa profiling" {
@@ -3998,16 +4118,18 @@ test "regex range dfa profiling" {
         }
     }
 
-    const compiled = try dfa.compile(&arena, true, .{.profileInfo = profileInfo});
-    const startOfRecognize:[*]u8 = @ptrCast(compiled.recognize);
-    // if the profiling has worked right, the first comparison should be comparing to x, i.e. the start of the recognize function should be:
-    // sub rsp, 0x8
-    // mov rax, rsi
-    // mov cl, byte ptr [rax]
-    // add rax, 0x1
-    // cmp cl, 0x78; this compares to 'x'
-    // -> check this
-    try expect(std.mem.eql(u8, startOfRecognize[0..16], "\x48\x83\xEC\x08\x48\x89\xF0\x8A\x08\x48\x83\xC0\x01\x80\xF9\x78"));
+    inline for ([_]RegExDFA.ComptimeCompileOpts{.{.checkFinalStatesAtCompileTime = true, .hasProfileInfo = true}, .{.checkFinalStatesAtCompileTime = false, .hasProfileInfo = true}}) |compileOpts| {
+        const compiled = try dfa.compile(&arena, compileOpts, .{.profileInfo = profileInfo});
+        const startOfRecognize:[*]u8 = @ptrCast(compiled.recognize);
+        // if the profiling has worked right, the first comparison should be comparing to x, i.e. the start of the recognize function should be:
+        // sub rsp, 0x8
+        // mov rax, rsi
+        // mov cl, byte ptr [rax]
+        // add rax, 0x1
+        // cmp cl, 0x78; this compares to 'x'
+        // -> check this
+        try expect(std.mem.eql(u8, startOfRecognize[0..16], "\x48\x83\xEC\x08\x48\x89\xF0\x8A\x08\x48\x83\xC0\x01\x80\xF9\x78"));
+    }
 }
 
 const fadec = @cImport({
@@ -4038,6 +4160,21 @@ fn encode(bufPtr:*[*]u8, mnem:FeMnem, args:ForceTuple(struct{@"0":fadec.FeOp = 0
         return FeError.EncodeError;
 }
 
+fn fadecInvertJumpKind(jumpKind:FeMnem) FeMnem {
+    return switch(jumpKind) {
+        fadec.FE_JMP => fadec.FE_JMP,
+        fadec.FE_JZ  => fadec.FE_JNZ,
+        fadec.FE_JNZ => fadec.FE_JZ,
+        fadec.FE_JL  => fadec.FE_JGE,
+        fadec.FE_JGE => fadec.FE_JL,
+        fadec.FE_JLE => fadec.FE_JG,
+        fadec.FE_JG  => fadec.FE_JLE,
+        fadec.FE_JA  => fadec.FE_JBE,
+        fadec.FE_JC  => fadec.FE_JNC,
+        else         => assert(false, "unknown jump kind")
+    };
+}
+
 test "fadec basic functionality and abstractions" {
     const buf:[]u8 = try cAllocer.alloc(u8, 256);
     var cur:[*]u8 = buf.ptr;
@@ -4065,12 +4202,12 @@ pub fn performanceEvaluationCLI(regexPattern:[]const u8, stringToMatch:[:0]const
     _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &compileTimeStart);
 
     for(0..compileIterations) |_|
-        _ = try compileInputString(&arena, regexPattern, .{});
+        _ = try compileInputString(&arena, regexPattern, .{}, .{});
 
     var compileTimeEnd = std.os.linux.timespec{.tv_sec = undefined, .tv_nsec = undefined};
     _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &compileTimeEnd);
 
-    const compiledDFA = try compileInputString(&arena, regexPattern, .{});
+    const compiledDFA = try compileInputString(&arena, regexPattern, .{}, .{});
 
     try writer.print("Compiled successfully...\r", .{});
 
@@ -4088,7 +4225,11 @@ pub fn performanceEvaluationCLI(regexPattern:[]const u8, stringToMatch:[:0]const
     const compileTime:f64 = (@as(f64, @floatFromInt(compileTimeEnd.tv_sec - compileTimeStart.tv_sec)) + 1e-9*@as(f64, @floatFromInt(compileTimeEnd.tv_nsec - compileTimeStart.tv_nsec)))/@as(f64, compileIterations);
     const runTime:f64 = (@as(f64, @floatFromInt(runTimeEnd.tv_sec - runTimeStart.tv_sec)) + 1e-9*@as(f64, @floatFromInt(runTimeEnd.tv_nsec - runTimeStart.tv_nsec)))/@as(f64, runIterations);
     try writer.print("average compile-time over {} compiles: {d:10.12}\n", .{compileIterations, compileTime});
+    if(compileTime * @as(f64, compileIterations) < 1.0)
+        try writer.print("Warning: time between compile-time measurements is less than 1 second, consider increasing compileIterations (only possible in the code for now)\n", .{});
     try writer.print("average run-time over {} runs: {d:10.12}\n", .{runIterations, runTime});
+    if(runTime * @as(f64, runIterations) < 1.0)
+        try writer.print("Warning: time between run-time measurements is less than 1 second, consider increasing runIterations (only possible in the code for now)\n", .{});
 }
 
 fn performanceEvaluationMain() !void {
@@ -4127,13 +4268,13 @@ fn performanceEvaluationMain() !void {
 }
 
 pub fn main() !void {
-    try performanceEvaluationMain();
+    //try performanceEvaluationMain();
 
     //const writer = std.io.getStdOut().writer();
     //_ = writer;
 
-    //var arena = std.heap.ArenaAllocator.init(cAllocer);
-    //defer arena.deinit();
+    var arena = std.heap.ArenaAllocator.init(cAllocer);
+    defer arena.deinit();
 
     //const input = "xyz|w*(abc)*de*f";
     //
@@ -4146,7 +4287,7 @@ pub fn main() !void {
     //
     //assert(dfa.internalAllocator.ptr == arena.allocator().ptr, "dfa should use the same allocator as the regex", .{});
     //
-    ////var compiled = try dfa.compile(&arena, false, .{});
+    ////var compiled = try dfa.compile(&arena, .{}, .{});
     ////debugLog("{}", .{compiled.isInLanguageCompiled("xyz")});
     ////compiled.debugPrint();
     //
@@ -4166,7 +4307,8 @@ pub fn main() !void {
     //try regex.printDOTRoot(writer);
 
 
-    //_ = compileInputString(&arena, input, .{}) catch {};
+    const cdfa = compileInputString(&arena, "[a-z]b|c*a?", .{}, .{}) catch unreachable;
+    cdfa.debugPrint();
 
 
     //var fa = FiniteAutomaton{.dfa = &dfa};
