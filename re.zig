@@ -2176,9 +2176,11 @@ const RegExDFA = struct{
         }
 
         const encodeJumpToCheckFinalState = struct{
-            fn f(comptime jumpKind:FeMnem,
+            fn f(comptime jumpKind:FeMnem, whereToJumpOtherwise:?[*]u8,
                 // everything after here is just closure stuff...
                 curPtr:*[*]u8, curState:u32, checkFinalStatePtr_:[*]u8, finalStates:UniqueStateSet) !void {
+                assert(whereToJumpOtherwise == null or @intFromPtr(whereToJumpOtherwise.?) <= @intFromPtr(curPtr.*), "Trying to create jump to unencoded memory area, I don't know where {?*} is! (I'm currently at {*})", .{whereToJumpOtherwise, curPtr} );
+
                 if(!comptimeOpts.checkFinalStatesAtCompileTime){
                     // jump to the checkFinalStatePtr and move the current state into RSI
                     // TODO instruction scheduling-wise: might make sense to put the mov at the start of the function (for better out of order execution), although it would cost a bit of decoding performance even if its not executed, which is not the case here. Test this
@@ -2190,17 +2192,24 @@ const RegExDFA = struct{
                         // we're sure we've reached the end of the word, so we can just return the result of the final state check
                         try encodeStackCleanupReturnWithValue(curPtr, isFinal);
                     }else{
-                        // TODO this doesn't even make that much sense, because rn we're jumping to another jump with the patched conditional jump, we could just as well jump to the traps tate immediately
-
                         // we're not sure, so we need to check
-                        const invertedJumpKind = comptime fadecInvertJumpKind(jumpKind);
 
-                        var jumpToPatch = curPtr.*;
-                        // no need for JMPL, we know the jump target is super close
-                        try encode(curPtr, invertedJumpKind, .{oldIntCast(@intFromPtr(curPtr.*), fadec.FeOp)});
-                        try encodeStackCleanupReturnWithValue(curPtr, isFinal);
-                        // patch the jump
-                        try encode(&jumpToPatch, invertedJumpKind, .{oldIntCast(@intFromPtr(curPtr.*), fadec.FeOp)});
+                        const invertedJumpKind = comptime fadecInvertJumpKind(jumpKind);
+                        // TODO
+                        // if we know where to jump otherwise (if we don't return), jump there with the inverted jump kind
+                        // otherwise, lets just jump to after the return (needs a patch, because we don't know that address yet)
+
+                        if(whereToJumpOtherwise) |otherwiseJumpTarget| {
+                            try encode(curPtr, invertedJumpKind, .{oldIntCast(@intFromPtr(otherwiseJumpTarget), fadec.FeOp)});
+                            try encodeStackCleanupReturnWithValue(curPtr, isFinal);
+                        }else{
+                            var jumpToPatch = curPtr.*;
+                            // no need for JMPL, we know the jump target is super close
+                            try encode(curPtr, invertedJumpKind, .{oldIntCast(@intFromPtr(curPtr.*), fadec.FeOp)});
+                            try encodeStackCleanupReturnWithValue(curPtr, isFinal);
+                            // patch the jump
+                            try encode(&jumpToPatch, invertedJumpKind, .{oldIntCast(@intFromPtr(curPtr.*), fadec.FeOp)});
+                        }
                     }
                 }
             }
@@ -2318,7 +2327,7 @@ const RegExDFA = struct{
                     // je targetState
                     try encodeMinimizedJump(&cur, &jumpsToPatch, startOfState, targetState, fadec.FE_JNZ);
                     // otherwise it's zero, i.e. we have reached the end of the word (basically the same code as after the for loop, just without the trap state, and with an unconditional jump)
-                    try encodeJumpToCheckFinalState(fadec.FE_JMP, &cur, curState, checkFinalStatePtr, self.finalStates);
+                    try encodeJumpToCheckFinalState(fadec.FE_JMP, null,  &cur, curState, checkFinalStatePtr, self.finalStates);
                     continue;
                 }
             }
@@ -2374,7 +2383,8 @@ const RegExDFA = struct{
             try encode(&cur, fadec.FE_CMP8ri, .{fadec.FE_CX, 0});
 
             // if we have, check whether its a final state
-            try encodeJumpToCheckFinalState(fadec.FE_JZ, &cur, curState, checkFinalStatePtr, self.finalStates);
+            try encodeJumpToCheckFinalState(fadec.FE_JZ, trapStatePtr, // jump to trap state if you dont jump to checking the final state
+                &cur, curState, checkFinalStatePtr, self.finalStates);
 
             // trap state
             try encode(&cur, fadec.FE_JMP, .{oldIntCast(@intFromPtr(trapStatePtr), fadec.FeOp)});
