@@ -3168,6 +3168,7 @@ pub fn compileInputStringAnyWriter(arena:*std.heap.ArenaAllocator, input: []cons
 }
 
 // TODO would be nice to have a separate test for this, that checks that everything gets deinit-ed properly (not easy to do, because of the arena). Or, just remove all deinits, if we require an arena anyway?
+/// outputs errors in regex to stderr
 pub fn compileInputString(arena:*std.heap.ArenaAllocator, input: []const u8, comptime compileOpts:RegExDFA.ComptimeCompileOpts, comptime comptimeOpts:struct{printErrors:bool = true}) !RegExDFA.CompiledRegExDFA {
     return compileInputStringAnyWriter(arena, input, compileOpts, comptime if(comptimeOpts.printErrors) std.io.getStdErr().writer() else std.io.null_writer());
 }
@@ -4199,92 +4200,298 @@ test "fadec basic functionality and abstractions" {
     try expect(std.mem.eql(u8, buf[0..length], buf[length..2*length]));
 }
 
-pub fn performanceEvaluationCLI(regexPattern:[]const u8, stringToMatch:[:0]const u8) !void {
-    const compileIterations = 1_000;
-    const runIterations = 1_000;
+const timespec = std.os.linux.timespec;
 
+pub fn diffInSecs(start:timespec, end:timespec) f64 {
+    return @as(f64, @floatFromInt(end.tv_sec - start.tv_sec)) + 1e-9*@as(f64, @floatFromInt(end.tv_nsec - start.tv_nsec));
+}
+
+/// scales times in seconds to be pretty-printed with a neat SI postfix - only works on stuff smaller than a second (kiloseconds sadly not used much), and only up to picoseconds
+pub fn scaleTimeUpToSIUnit(timeInSeconds:f64) Pair(f64, []const u8) {
+    var scaled = timeInSeconds;
+    var siPostfix:[]const u8 = "s";
+    while(scaled < 1.0) {
+        scaled *= 1000.0;
+        if(std.mem.eql(u8, siPostfix, "s"))
+            siPostfix = "ms"
+        else if(std.mem.eql(u8, siPostfix, "ms"))
+            siPostfix = "µs"
+        else if(std.mem.eql(u8, siPostfix, "µs"))
+            siPostfix = "ns"
+        else if(std.mem.eql(u8, siPostfix, "ns"))
+            siPostfix = "ps"
+        else
+            return .{timeInSeconds, "s"};
+    }
+    return .{scaled, siPostfix};
+}
+
+/// if compile/run iterations are 0, the compiler tries to find a number of iterations ensuring at least 1s between measurements
+pub fn performanceEvaluationCLI(regexPattern:[]const u8, stringToMatch:[:0]const u8, compileIterationsIn:u64, runIterationsIn:u64, comptime opts:struct{interpreted:bool = false}) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
 
     const writer = std.io.getStdOut().writer();
 
-    var compileTimeStart = std.os.linux.timespec{.tv_sec = undefined, .tv_nsec = undefined};
+    var compileTimeStart = timespec{.tv_sec = undefined, .tv_nsec = undefined};
+    var compileTimeEnd = timespec{.tv_sec = undefined, .tv_nsec = undefined};
+
     _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &compileTimeStart);
+    
+    const compileIterations:u64 = b: {
+        if(opts.interpreted)
+            break :b 0
+        else if(compileIterationsIn != 0)
+            break :b compileIterationsIn
+        else{
+            // try to find a number of iterations ensuring at least 1s between measurements
+            var increasingIterations:u64 = 1;
+            // if its under 1 second, we still need to increase it
+            // if its over 1 second, we stop here (which means double the last iterations that were measured, to account for all of the ones we've previously measured, because only the end time gets increased)
+            while(diffInSecs(compileTimeStart, compileTimeEnd) < 1.0){
+                for(0..increasingIterations) |_|
+                    _ = try compileInputString(&arena, regexPattern, .{}, .{});
 
-    for(0..compileIterations) |_|
-        _ = try compileInputString(&arena, regexPattern, .{}, .{});
+                _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &compileTimeEnd);
+                increasingIterations <<= 1;
+            }
+            break :b increasingIterations;
+        }
+    };
 
-    var compileTimeEnd = std.os.linux.timespec{.tv_sec = undefined, .tv_nsec = undefined};
-    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &compileTimeEnd);
+    if(!opts.interpreted){
+        _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &compileTimeStart);
+
+        for(0..compileIterations) |_|
+            _ = try compileInputString(&arena, regexPattern, .{}, .{});
+
+        _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &compileTimeEnd);
+    }
 
     const compiledDFA = try compileInputString(&arena, regexPattern, .{}, .{});
 
     try writer.print("Compiled successfully...\r", .{});
 
-    var runTimeStart = std.os.linux.timespec{.tv_sec = undefined, .tv_nsec = undefined};
+    var runTimeStart = timespec{.tv_sec = undefined, .tv_nsec = undefined};
+    var runTimeEnd = timespec{.tv_sec = undefined, .tv_nsec = undefined};
+
     _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &runTimeStart);
-    for(0..runIterations) |_|
-        _ = compiledDFA.isInLanguageCompiled(stringToMatch);
-    var runTimeEnd = std.os.linux.timespec{.tv_sec = undefined, .tv_nsec = undefined};
+
+    // try to find a number of iterations ensuring at least 1s between measurements
+    const runIterations = b: {
+        if(runIterationsIn != 0)
+            break :b runIterationsIn
+        else{
+            // try to find a number of iterations ensuring at least 1s between measurements (see above for explanation)
+            var increasingIterations:u64 = 1;
+            while(diffInSecs(runTimeStart, runTimeEnd) < 1.0){
+                for(0..increasingIterations) |_|{
+                    if(opts.interpreted)
+                        _ = compiledDFA.dfa.isInLanguageInterpreted(stringToMatch)
+                    else
+                        _ = compiledDFA.isInLanguageCompiled(stringToMatch);
+                }
+
+                _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &runTimeEnd);
+                increasingIterations <<= 1;
+            }
+            break :b increasingIterations;
+        }
+    };
+    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &runTimeStart);
+
+    for(0..runIterations) |_|{
+        if(opts.interpreted)
+            _ = compiledDFA.dfa.isInLanguageInterpreted(stringToMatch)
+        else
+            _ = compiledDFA.isInLanguageCompiled(stringToMatch);
+    }
     _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &runTimeEnd);
 
     const result = compiledDFA.isInLanguageCompiled(stringToMatch);
 
-    try writer.print("Does \'{s}\' match the regex '{s}'? {}\n", .{stringToMatch, regexPattern, result});
+    try writer.print("Does \'{s}\' match the regex '{s}'? {}\n", .{if(stringToMatch.len < 100) stringToMatch else "<too long to display>", regexPattern, result});
 
-    const compileTime:f64 = (@as(f64, @floatFromInt(compileTimeEnd.tv_sec - compileTimeStart.tv_sec)) + 1e-9*@as(f64, @floatFromInt(compileTimeEnd.tv_nsec - compileTimeStart.tv_nsec)))/@as(f64, compileIterations);
-    const runTime:f64 = (@as(f64, @floatFromInt(runTimeEnd.tv_sec - runTimeStart.tv_sec)) + 1e-9*@as(f64, @floatFromInt(runTimeEnd.tv_nsec - runTimeStart.tv_nsec)))/@as(f64, runIterations);
-    try writer.print("average compile-time over {} compiles: {d:10.12}\n", .{compileIterations, compileTime});
-    if(compileTime * @as(f64, compileIterations) < 1.0)
-        try writer.print("Warning: time between compile-time measurements is less than 1 second, consider increasing compileIterations (only possible in the code for now)\n", .{});
-    try writer.print("average run-time over {} runs: {d:10.12}\n", .{runIterations, runTime});
-    if(runTime * @as(f64, runIterations) < 1.0)
-        try writer.print("Warning: time between run-time measurements is less than 1 second, consider increasing runIterations (only possible in the code for now)\n", .{});
+    const compileTimeTotal:f64                                       = diffInSecs(compileTimeStart, compileTimeEnd);
+    const compileTime:f64                                            = compileTimeTotal/@as(f64, @floatFromInt(compileIterations));
+    const scaledCompileTime:f64, const compileTimePostfix:[]const u8 = scaleTimeUpToSIUnit(compileTime);
+    const runTimeTotal:f64                                           = diffInSecs(runTimeStart,     runTimeEnd);
+    const runTime:f64                                                = runTimeTotal/@as(f64, @floatFromInt(runIterations));
+    const scaledRunTime:f64, const runTimePostfix:[]const u8         = scaleTimeUpToSIUnit(runTime);
+    if(!opts.interpreted){
+        try writer.print("average compile-time over {} compiles: {d:10.3}{s}\n", .{compileIterations, scaledCompileTime, compileTimePostfix});
+
+        if(compileIterationsIn > 0 and compileTimeTotal < 1.0)
+            try writer.print(Termcolors.Warning ++ "Warning: time between compile-time measurements is less than 1 second, consider increasing compileIterations" ++ Termcolors.Reset ++ "\n", .{});
+    }
+    try writer.print("average run-time over {} runs: {d:10.3}{s}\n", .{runIterations, scaledRunTime, runTimePostfix});
+    if(runIterationsIn > 0 and runTimeTotal < 1.0)
+        try writer.print(Termcolors.Warning ++ "Warning: time between run-time measurements is less than 1 second, consider increasing runIterations" ++ Termcolors.Reset ++ "\n", .{});
 }
 
-fn performanceEvaluationMain() !void {
-    // read from args, call performanceEvaluationCLI
-
+fn cliMain() !void {
     const printUsage = struct {
-        fn f(invocation:[]const u8) noreturn {
+        fn f(invocation:[]const u8, e:?anyerror) noreturn {
             const stderr = std.io.getStdErr().writer();
-            stderr.print("Usage: {s} <regex> <file or string>\n", .{invocation}) catch {};
+            stderr.print("Usage: {s} <options>\nAvailable options:\n", .{invocation}) catch unreachable;
+            stderr.print("[MANDATORY] --regex=<regex to use for matching>\n", .{}) catch unreachable;
+            stderr.print("[MANDATORY]\n  EITHER: --match-string=<string to match the regex against>\nOR:     --match-file=<read this file and match the regex against that>\n", .{}) catch unreachable;
+            stderr.print("[optional][flag] --interpreted (use interpreted matching instead of compiling to machine code)\n\n", .{}) catch unreachable;
+            stderr.print("[optional][flag] --benchmark (Mutually exclusive with --print. Do benchmarking. Implied by both --compile-iterations and --run-iterations\n", .{}) catch unreachable;
+            stderr.print("[optional] --compile-iterations=<how often to run the compilation in between measurements, try to ensure 1s between measurements. If this is not given, the compiler tries to find a number of iterations ensuring this>\n", .{}) catch unreachable;
+            stderr.print("[optional] --run-iterations=<how often to run the matching in between measurements, see --compile-iterations for details>\n", .{}) catch unreachable;
+            stderr.print("[optional] --print=<Mutually exclusive with --benchmark. Which IR/program representation to print, options are: dfa;nfa;enfa;mc (enfa: epsilon nfa; mc: machine code), can print multiple using comma separation, e.g. --print=dfa,nfa>\n", .{}) catch unreachable;
+            stderr.print("IMPORTANT: for options with values, space separation is now allowed, you have to use '='\n", .{}) catch unreachable;
+
+            if(e != null)
+                stderr.print("Error: {}\n", .{e.?}) catch unreachable;
+            
             std.os.linux.exit(1);
         }
     }.f;
 
     var args = std.process.args();
+
+    const invocation = args.next() orelse printUsage("zig-re", null);
+    errdefer |e| printUsage(invocation, e);
+
     
-    const invocation = args.next() orelse printUsage("zig-re");
-    const regexPattern = args.next() orelse printUsage(invocation);
-    const fileOrStringToMatch = args.next() orelse printUsage(invocation);
-    if(args.next() != null)
-        printUsage(invocation);
+    // basic argparsing, using my own regex matching (how's that for dogfooding!)
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
 
-    const file = std.fs.cwd().openFile(fileOrStringToMatch, .{}) catch {
-        // in this case its a normal string
-        try performanceEvaluationCLI(regexPattern, fileOrStringToMatch);
-        return;
+    const matchOption = try compileInputString(&arena, "--[\\-a-z]+=.+", .{}, .{});
+    const matchFlag = try compileInputString(&arena, "--[\\-a-z]+", .{}, .{});
+
+    var regexPattern:?[]u8       = null;
+    var matchString:?[]u8 = null;
+    var matchFile:?[]u8   = null;
+    var benchmark:bool          = false;
+    var interpreted:bool        = false;
+    var compileIterations:u64   = 0;
+    var runIterations:u64       = 0;
+    var printOpts = packed struct{
+        DFA:bool  = false,
+        NFA:bool  = false,
+        eNFA:bool = false,
+        MC:bool   = false,
+    }{};
+    var printingAny:bool = false;
+
+    while(args.next()) |arg| {
+        const optionName, const maybeOptionValue = b: {
+            if(matchOption.isInLanguageCompiled(arg)) {
+                const index = std.mem.indexOf(u8, arg, "=") orelse unreachable;
+                assert(arg[index+1..].len > 1, "value of option empty", .{});
+                break :b .{arg[0..index], arg[index+1..]};
+            }else if(matchFlag.isInLanguageCompiled(arg)) {
+                break :b .{arg, null};
+            }else{
+                debugLog("WUHU: {s}", .{arg});
+                return error.InvalidCommandLineOption;
+            }
+        };
+
+        if(std.mem.eql(u8, optionName, "--regex")){
+            const optionValue = maybeOptionValue.?;
+            regexPattern = try cAllocer.alloc(u8, optionValue.len);
+            @memcpy(regexPattern.?, optionValue);
+        }else if (std.mem.eql(u8, optionName, "--match-string")){
+            const optionValue = maybeOptionValue.?;
+            matchString = try cAllocer.alloc(u8, optionValue.len);
+            @memcpy(matchString.?, optionValue);
+        }else if (std.mem.eql(u8, optionName, "--match-file")){
+            const optionValue = maybeOptionValue.?;
+            matchFile = try cAllocer.alloc(u8, optionValue.len);
+            @memcpy(matchFile.?, optionValue);
+        }else if (std.mem.eql(u8, optionName, "--benchmark")){
+            benchmark = true;
+        }else if (std.mem.eql(u8, optionName, "--interpreted")){
+            interpreted = true;
+        }else if (std.mem.eql(u8, optionName, "--compile-iterations")){
+            compileIterations = @intCast(try std.fmt.parseInt(u64, maybeOptionValue.?, 10));
+        }else if (std.mem.eql(u8, optionName, "--run-iterations")){
+            runIterations = @intCast(try std.fmt.parseInt(u64, maybeOptionValue.?, 10));
+        }else if (std.mem.eql(u8, optionName, "--print")){
+            var it = std.mem.splitScalar(u8, maybeOptionValue.?, ',');
+            while(it.next()) |printOpt| {
+                if(std.mem.eql(u8, printOpt, "dfa"))
+                    printOpts.DFA = true
+                else if(std.mem.eql(u8, printOpt, "nfa"))
+                    printOpts.NFA = true
+                else if(std.mem.eql(u8, printOpt, "enfa"))
+                    printOpts.eNFA = true
+                else if(std.mem.eql(u8, printOpt, "mc"))
+                    printOpts.MC = true
+                else
+                    return error.InvalidCommandLineOption;
+            }
+            printingAny = true;
+        }else{
+            return error.UnknownCommandLineOption;
+        }
+    }
+
+    // implications
+    if(compileIterations > 0 or runIterations > 0)
+        benchmark = true;
+
+    // sanity checks
+    // TODO obv implement
+    if(printingAny)
+        return error.PrintingNotImplemented;
+    if(regexPattern == null)
+        return error.MandatoryCommandLineOptionMissing;
+    if(matchString == null and matchFile == null)
+        return error.MandatoryCommandLineOptionMissing;
+    if(matchString != null and matchFile != null)
+        return error.ConflitingCommandLineOptions;
+    if(printingAny and benchmark)
+        return error.ConflitingCommandLineOptions;
+
+    var buf, const shouldFree = b: {
+        if(matchFile) |filePath| {
+            const file = std.fs.cwd().openFile(filePath, .{}) catch return error.FileCouldNotBeFound;
+            defer file.close();
+
+            break :b .{try file.readToEndAlloc(cAllocer, 1 << 31), true};
+        } else {
+            break :b .{matchString.?, false};
+        }
     };
-    defer file.close();
+    defer if(shouldFree) cAllocer.free(buf);
 
-    var buf = try file.readToEndAlloc(cAllocer, 1 << 31);
-    defer cAllocer.free(buf);
-
+    // zero-terminate the string
     buf = try cAllocer.realloc(buf, buf.len + 1);
     buf[buf.len - 1] = 0;
 
-    try performanceEvaluationCLI(regexPattern, @as([:0]const u8, @ptrCast(buf)));
+    if(benchmark){
+        // the if here might look stupid, but its there to "convert" it to a compiletime const. I just don't trust Zig to do constant propagation right on its own, but TODO check this properly in the future at some point
+        if(interpreted)
+            try performanceEvaluationCLI(regexPattern.?, @as([:0]const u8, @ptrCast(buf)), compileIterations, runIterations, .{.interpreted = true})
+        else
+            try performanceEvaluationCLI(regexPattern.?, @as([:0]const u8, @ptrCast(buf)), compileIterations, runIterations, .{.interpreted = false});
+    }else{
+        // normal execution
+        const compiledDFA = try compileInputString(&arena, regexPattern.?, .{}, .{});
+        const result = if(interpreted)
+            compiledDFA.dfa.isInLanguageInterpreted(@as([:0]const u8, @ptrCast(buf)))
+        else
+            compiledDFA.isInLanguageCompiled(@as([:0]const u8, @ptrCast(buf)));
+        try std.io.getStdOut().writer().print("Does \'{s}\' match the regex '{s}'? {}\n", .{if(buf.len < 100) buf else "<too long to display>", regexPattern.?, result});
+    }
+
+
 }
 
 pub fn main() !void {
-    //try performanceEvaluationMain();
+    try cliMain();
 
     //const writer = std.io.getStdOut().writer();
     //_ = writer;
 
-    var arena = std.heap.ArenaAllocator.init(cAllocer);
-    defer arena.deinit();
+    //var arena = std.heap.ArenaAllocator.init(cAllocer);
+    //defer arena.deinit();
 
     //const input = "xyz|w*(abc)*de*f";
     //
@@ -4317,8 +4524,8 @@ pub fn main() !void {
     //try regex.printDOTRoot(writer);
 
 
-    const cdfa = compileInputString(&arena, "[a-z]b|c*a?", .{}, .{}) catch unreachable;
-    cdfa.debugPrint();
+    //const cdfa = compileInputString(&arena, "[a-z]b|c*a?", .{}, .{}) catch unreachable;
+    //cdfa.debugPrint();
 
 
     //var fa = FiniteAutomaton{.dfa = &dfa};
